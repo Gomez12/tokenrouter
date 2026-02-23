@@ -169,12 +169,14 @@ function adminApp() {
     },
     handleRealtimeRefresh(forceStats) {
       if (!this.isRealtimeActive()) return;
-      if (this.activeTab === 'status' || this.activeTab === 'quota' || this.activeTab === 'configure') {
+      if (this.activeTab === 'status' || this.activeTab === 'quota' || this.activeTab === 'access') {
         this.loadStats(!!forceStats);
       }
-      if (this.activeTab === 'configure') {
+      if (this.activeTab === 'providers') {
         this.loadProviders();
+      } else if (this.activeTab === 'access') {
         this.loadAccessTokens();
+        this.loadSecuritySettings();
       } else if (this.activeTab === 'models') {
         this.loadModelsCatalog(false);
       }
@@ -205,12 +207,17 @@ function adminApp() {
         this.loadModelsCatalog(true);
       } else if (tab === 'quota') {
         this.loadStats(false);
+      } else if (tab === 'providers') {
+        this.loadProviders();
+      } else if (tab === 'access') {
+        this.loadAccessTokens();
+        this.loadSecuritySettings();
       }
     },
     restoreActiveTab() {
       try {
         const tab = window.localStorage.getItem(this.activeTabCacheKey);
-        if (tab === 'status' || tab === 'quota' || tab === 'configure' || tab === 'models') {
+        if (tab === 'status' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'models') {
           this.activeTab = tab;
         }
       } catch (_) {}
@@ -930,7 +937,10 @@ function adminApp() {
           if (feature) labelParts.push(feature);
           if (windowLabel) labelParts.push(windowLabel);
           const label = this.escapeHtml(labelParts.join(' · ') || 'quota');
-          return '<div class="border rounded p-2 bg-body d-flex align-items-center gap-2" style="min-width:0;width:100%;">' +
+          const tileFlex = (window.innerWidth && window.innerWidth < 768)
+            ? '1 1 100%'
+            : '0 1 calc(50% - 0.5rem)';
+          return '<div class="border rounded p-2 bg-body d-flex align-items-center gap-2" style="min-width:220px;flex:' + tileFlex + ';max-width:100%;">' +
             '<div style="width:62px;height:62px;border-radius:999px;background:conic-gradient(' + ringColor + ' ' + used + '%, rgba(128,128,128,0.25) 0);display:flex;align-items:center;justify-content:center;">' +
               '<div class="bg-body rounded-circle d-flex align-items-center justify-content-center fw-semibold" style="width:48px;height:48px;font-size:12px;">' + Math.round(left) + '%</div>' +
             '</div>' +
@@ -941,12 +951,12 @@ function adminApp() {
             '</div>' +
           '</div>';
         }).join('');
-        return '<div class="border rounded p-2 bg-body">' +
+        return '<div class="border rounded p-2 bg-body" style="min-width:320px;flex:1 1 420px;max-width:100%;">' +
           '<div class="small fw-semibold mb-2">' + name + (plan ? (' · ' + plan) : '') + '</div>' +
-          '<div class="d-grid gap-2" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));width:100%;">' + metricRows + '</div>' +
+          '<div class="d-flex flex-wrap gap-2 align-items-stretch" style="width:100%;">' + metricRows + '</div>' +
         '</div>';
       }).join('');
-      return '<div class="mt-2 d-grid gap-2" style="grid-template-columns:repeat(auto-fit,minmax(340px,1fr));width:100%;">' + cards + '</div>';
+      return '<div class="mt-2 d-flex flex-wrap gap-2 align-items-start" style="width:100%;">' + cards + '</div>';
     },
     renderUsageChart(sourceMap, title) {
       const colors = ['#0d6efd', '#198754', '#dc3545', '#fd7e14', '#20c997', '#6f42c1', '#0dcaf0', '#ffc107', '#6c757d', '#6610f2'];
@@ -1081,7 +1091,8 @@ function adminApp() {
         if (totalModels <= 0 && pricedCount > 0) totalModels = pricedCount;
         const unknownCount = Math.max(0, totalModels - pricedCount);
         const totalModelsText = totalModels + ' (' + freeCount + ' free, ' + unknownCount + ' unknown)';
-        const responseMS = (p.response_ms === undefined || p.response_ms === null) ? '' : Number(p.response_ms || 0) + 'ms';
+        const responseMSValue = Number(p.response_ms || 0);
+        const responseMS = responseMSValue > 0 ? responseMSValue + 'ms' : '';
         let status = this.escapeHtml(statusRaw);
         if (statusRaw === 'online') {
           const detail = [responseMS, ageText].filter(Boolean).join(' ');
@@ -1207,7 +1218,8 @@ function adminApp() {
         const model = this.escapeHtml(m.model || '-');
         const statusRaw = String(m.status || 'unknown');
         const ageText = this.formatAge(m.checked_at);
-        const responseMS = (m.response_ms === undefined || m.response_ms === null) ? '' : Number(m.response_ms || 0) + 'ms';
+        const responseMSValue = Number(m.response_ms || 0);
+        const responseMS = responseMSValue > 0 ? responseMSValue + 'ms' : '';
         let status = this.escapeHtml(statusRaw);
         if (statusRaw === 'online') {
           status = this.escapeHtml([responseMS, ageText].filter(Boolean).join(' ') || 'online');

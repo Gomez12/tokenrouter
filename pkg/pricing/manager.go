@@ -9,9 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -19,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lkarlslund/openai-personal-proxy/pkg/cache"
 	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
 )
 
@@ -220,15 +219,12 @@ func (m *Manager) load() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cache = Cache{ProviderStates: map[string]ProviderState{}, Entries: map[string]ModelPricing{}}
-	b, err := os.ReadFile(m.path)
+	err := cache.LoadJSON(m.path, &m.cache)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, cache.ErrNotFound) {
 			return nil
 		}
-		return fmt.Errorf("read pricing cache: %w", err)
-	}
-	if err := json.Unmarshal(b, &m.cache); err != nil {
-		return fmt.Errorf("parse pricing cache: %w", err)
+		return fmt.Errorf("load pricing cache: %w", err)
 	}
 	if m.cache.ProviderStates == nil {
 		m.cache.ProviderStates = map[string]ProviderState{}
@@ -240,19 +236,8 @@ func (m *Manager) load() error {
 }
 
 func (m *Manager) saveLocked() error {
-	if err := os.MkdirAll(filepath.Dir(m.path), 0o700); err != nil {
-		return fmt.Errorf("mkdir pricing cache dir: %w", err)
-	}
-	b, err := json.MarshalIndent(m.cache, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode pricing cache: %w", err)
-	}
-	tmp := m.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return fmt.Errorf("write pricing cache temp: %w", err)
-	}
-	if err := os.Rename(tmp, m.path); err != nil {
-		return fmt.Errorf("rename pricing cache: %w", err)
+	if err := cache.SaveJSON(m.path, m.cache); err != nil {
+		return fmt.Errorf("save pricing cache: %w", err)
 	}
 	return nil
 }

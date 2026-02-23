@@ -26,6 +26,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	"github.com/lkarlslund/openai-personal-proxy/pkg/assets"
+	"github.com/lkarlslund/openai-personal-proxy/pkg/cache"
 	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
 	"github.com/lkarlslund/openai-personal-proxy/pkg/pricing"
 )
@@ -46,9 +47,8 @@ type AdminHandler struct {
 	oauthSrv      *http.Server
 	oauthSrvAddr  string
 	quotaMu       sync.Mutex
-	quotaCache    map[string]quotaCacheEntry
-	statsMu       sync.Mutex
-	statsCache    map[int64]statsCacheEntry
+	quotaCache    *cache.TTLMap[string, quotaCacheValue]
+	statsCache    *cache.TTLMap[int64, StatsSummary]
 	wsMu          sync.Mutex
 	wsClients     map[chan []byte]struct{}
 }
@@ -71,15 +71,9 @@ type oauthSession struct {
 	BaseURL      string
 }
 
-type quotaCacheEntry struct {
+type quotaCacheValue struct {
 	Snapshot   ProviderQuotaSnapshot
-	NextCheck  time.Time
 	Refreshing bool
-}
-
-type statsCacheEntry struct {
-	Summary   StatsSummary
-	NextCheck time.Time
 }
 
 const quotaRefreshOK = 15 * time.Minute
@@ -103,8 +97,8 @@ func NewAdminHandler(store *config.ServerConfigStore, stats *StatsStore, resolve
 		instance:      instanceID,
 		oauthPending:  map[string]*oauthSession{},
 		oauthSrvAddr:  "127.0.0.1:1455",
-		quotaCache:    map[string]quotaCacheEntry{},
-		statsCache:    map[int64]statsCacheEntry{},
+		quotaCache:    cache.NewTTLMap[string, quotaCacheValue](),
+		statsCache:    cache.NewTTLMap[int64, StatsSummary](),
 		wsClients:     map[chan []byte]struct{}{},
 	}
 	go h.runRealtimeTicker()
@@ -413,11 +407,7 @@ func (h *AdminHandler) statsAPI(w http.ResponseWriter, r *http.Request) {
 	periodKey := int64(period / time.Second)
 	now := time.Now().UTC()
 	if !force {
-		h.statsMu.Lock()
-		entry, ok := h.statsCache[periodKey]
-		h.statsMu.Unlock()
-		if ok && now.Before(entry.NextCheck) {
-			summary := entry.Summary
+		if summary, ok := h.statsCache.GetFresh(periodKey, now); ok {
 			providers := h.catalogProviders()
 			names := make([]string, 0, len(providers))
 			for _, p := range providers {
@@ -446,12 +436,7 @@ func (h *AdminHandler) statsAPI(w http.ResponseWriter, r *http.Request) {
 		summary.ProvidersAvailable = len(names)
 	}
 	summary.ProviderQuotas = h.readProviderQuotas(r.Context(), providers)
-	h.statsMu.Lock()
-	h.statsCache[periodKey] = statsCacheEntry{
-		Summary:   summary,
-		NextCheck: now.Add(statsRefreshInterval),
-	}
-	h.statsMu.Unlock()
+	h.statsCache.SetWithTTL(periodKey, summary, now, statsRefreshInterval)
 	writeJSON(w, http.StatusOK, summary)
 }
 
@@ -471,11 +456,11 @@ func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []confi
 		if !ok {
 			continue
 		}
-		reader := strings.TrimSpace(preset.QuotaReader)
+		reader := quotaReaderFromPreset(preset)
 		if reader == "" {
 			continue
 		}
-		snap := h.readProviderQuotaCached(ctx, p, preset, reader)
+		snap := h.readProviderQuotaCached(ctx, p, preset)
 		out[p.Name] = snap
 	}
 	if len(out) == 0 {
@@ -484,25 +469,50 @@ func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []confi
 	return out
 }
 
-func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider, reader string) ProviderQuotaSnapshot {
+func quotaReaderFromPreset(preset assets.PopularProvider) string {
+	return strings.TrimSpace(preset.QuotaReader)
+}
+
+func (h *AdminHandler) runQuotaReader(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
+	switch quotaReaderFromPreset(preset) {
+	case "openai_codex":
+		return h.readOpenAICodexQuota(ctx, p, snap)
+	case "google_antigravity":
+		return h.readGoogleAntigravityQuota(ctx, p, snap)
+	case "groq_headers":
+		return h.readGroqQuota(ctx, p, snap)
+	case "mistral_headers":
+		return h.readMistralQuota(ctx, p, snap)
+	case "huggingface_headers":
+		return h.readHuggingFaceQuota(ctx, p, snap)
+	case "cerebras_headers":
+		return h.readCerebrasQuota(ctx, p, snap)
+	default:
+		snap.Error = "unsupported quota reader"
+		return snap
+	}
+}
+
+func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider) ProviderQuotaSnapshot {
 	now := time.Now().UTC()
+	reader := quotaReaderFromPreset(preset)
 	h.quotaMu.Lock()
-	if entry, ok := h.quotaCache[p.Name]; ok {
-		snap := entry.Snapshot
+	if val, expiry, ok := h.quotaCache.Get(p.Name); ok {
+		snap := val.Snapshot
 		if snap.Provider == "" {
 			snap = newProviderQuotaSnapshot(now, p, preset, reader)
 		}
-		if !entry.Refreshing && now.After(entry.NextCheck) {
-			entry.Refreshing = true
-			h.quotaCache[p.Name] = entry
-			go h.refreshProviderQuota(p, preset, reader)
+		if !val.Refreshing && !expiry.IsZero() && !now.Before(expiry) {
+			val.Refreshing = true
+			h.quotaCache.SetWithExpiry(p.Name, val, expiry)
+			go h.refreshProviderQuota(p, preset)
 		}
 		h.quotaMu.Unlock()
 		return snap
 	}
 	h.quotaMu.Unlock()
 	// First lookup is synchronous so callers get immediate usable data.
-	return h.computeProviderQuotaAndStore(p, preset, reader)
+	return h.computeProviderQuotaAndStore(p, preset)
 }
 
 func newProviderQuotaSnapshot(now time.Time, p config.ProviderConfig, preset assets.PopularProvider, reader string) ProviderQuotaSnapshot {
@@ -522,41 +532,97 @@ func newProviderQuotaSnapshot(now time.Time, p config.ProviderConfig, preset ass
 	return snap
 }
 
-func (h *AdminHandler) refreshProviderQuota(p config.ProviderConfig, preset assets.PopularProvider, reader string) {
-	h.computeProviderQuotaAndStore(p, preset, reader)
+func (h *AdminHandler) refreshProviderQuota(p config.ProviderConfig, preset assets.PopularProvider) {
+	h.computeProviderQuotaAndStore(p, preset)
 }
 
-func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, preset assets.PopularProvider, reader string) ProviderQuotaSnapshot {
+func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, preset assets.PopularProvider) ProviderQuotaSnapshot {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	p = h.ensureProviderOAuthTokenFresh(ctx, p, preset)
 	now := time.Now().UTC()
+	reader := quotaReaderFromPreset(preset)
 	snap := newProviderQuotaSnapshot(now, p, preset, reader)
-	switch reader {
-	case "openai_codex":
-		snap = h.readOpenAICodexQuota(ctx, p, snap)
-	case "google_antigravity":
-		snap = h.readGoogleAntigravityQuota(ctx, p, snap)
-	case "groq_headers":
-		snap = h.readGroqQuota(ctx, p, snap)
-	case "mistral_headers":
-		snap = h.readMistralQuota(ctx, p, snap)
-	default:
-		snap.Error = "unsupported quota reader"
-	}
+	snap = h.runQuotaReader(ctx, p, preset, snap)
 
 	nextDelay := quotaRefreshError
 	if snap.Status == "ok" {
 		nextDelay = quotaRefreshOK
 	}
 	h.quotaMu.Lock()
-	h.quotaCache[p.Name] = quotaCacheEntry{
+	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
 		Snapshot:   snap,
-		NextCheck:  now.Add(nextDelay),
 		Refreshing: false,
-	}
+	}, now, nextDelay)
 	h.quotaMu.Unlock()
 	return snap
+}
+
+func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header http.Header) {
+	if h == nil || len(header) == 0 {
+		return
+	}
+	popular, err := getPopularProviders()
+	if err != nil {
+		return
+	}
+	byName := make(map[string]assets.PopularProvider, len(popular))
+	for _, pp := range popular {
+		byName[pp.Name] = pp
+	}
+	preset, ok := byName[providerTypeOrName(p)]
+	if !ok {
+		return
+	}
+	reader := quotaReaderFromPreset(preset)
+	if reader == "" {
+		return
+	}
+	now := time.Now().UTC()
+	snap := newProviderQuotaSnapshot(now, p, preset, reader)
+	var metrics []ProviderQuotaMetric
+	switch reader {
+	case "groq_headers":
+		if m, ok := groqMetricFromHeaders(header, "requests", "requests/day"); ok {
+			metrics = append(metrics, m)
+		}
+		if m, ok := groqMetricFromHeaders(header, "tokens", "tokens/min"); ok {
+			metrics = append(metrics, m)
+		}
+		snap.PlanType = "groq"
+	case "mistral_headers":
+		metrics = mistralMetricsFromHeaders(header)
+		snap.PlanType = "mistral"
+	case "huggingface_headers":
+		metrics = huggingFaceMetricsFromHeaders(header)
+		snap.PlanType = "huggingface"
+	case "cerebras_headers":
+		metrics = rateLimitMetricsFromHeaders(header, "cerebras", mistralFeatureWindowFromSuffix)
+		snap.PlanType = "cerebras"
+	default:
+		return
+	}
+	if len(metrics) == 0 {
+		return
+	}
+	best := metrics[0]
+	for _, m := range metrics {
+		if strings.Contains(strings.ToLower(m.MeteredFeature), "request") {
+			best = m
+			break
+		}
+	}
+	snap.Status = "ok"
+	snap.Error = ""
+	snap.Metrics = metrics
+	snap.LeftPercent = best.LeftPercent
+	snap.ResetAt = best.ResetAt
+	h.quotaMu.Lock()
+	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
+		Snapshot:   snap,
+		Refreshing: false,
+	}, now, quotaRefreshOK)
+	h.quotaMu.Unlock()
 }
 
 func (h *AdminHandler) ensureProviderOAuthTokenFresh(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider) config.ProviderConfig {
@@ -1074,68 +1140,156 @@ func (h *AdminHandler) readMistralQuota(ctx context.Context, p config.ProviderCo
 	return snap
 }
 
-func (h *AdminHandler) readMistralQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
+func (h *AdminHandler) readHuggingFaceQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
+	token := strings.TrimSpace(p.APIKey)
+	if token == "" {
+		token = strings.TrimSpace(p.AuthToken)
+	}
+	if token == "" {
+		snap.Error = "missing api key"
+		return snap
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	if baseURL == "" {
+		baseURL = "https://router.huggingface.co/v1"
+	}
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, err
+		snap.Error = "invalid base_url"
+		return snap
 	}
-	u.Path = joinProviderPath(u.Path, "/v1/chat/completions")
-	modelID := mistralFirstModelID(modelsBody)
-	payload := map[string]any{
-		"model":       modelID,
-		"messages":    []map[string]string{{"role": "user", "content": "hi"}},
-		"max_tokens":  1,
-		"temperature": 0,
-	}
-	raw, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(raw))
+	u.Path = joinProviderPath(u.Path, "/v1/models")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, err
+		snap.Error = "failed to build request"
+		return snap
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		snap.Error = err.Error()
+		return snap
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = fmt.Sprintf("status %d", resp.StatusCode)
+		}
+		snap.Error = msg
+		return snap
+	}
+
+	metrics := huggingFaceMetricsFromHeaders(resp.Header)
+	if len(metrics) == 0 {
+		chatMetrics, chatErr := h.readHuggingFaceQuotaFromTinyChat(ctx, p, baseURL, token, body)
+		if chatErr == nil && len(chatMetrics) > 0 {
+			metrics = chatMetrics
+		}
+	}
+	if len(metrics) == 0 {
+		snap.Error = "quota headers unavailable"
+		return snap
+	}
+	best := metrics[0]
+	for _, m := range metrics {
+		if strings.Contains(strings.ToLower(m.MeteredFeature), "request") {
+			best = m
+			break
+		}
+	}
+	snap.Status = "ok"
+	snap.Error = ""
+	snap.Metrics = metrics
+	snap.LeftPercent = best.LeftPercent
+	snap.ResetAt = best.ResetAt
+	snap.PlanType = "huggingface"
+	return snap
+}
+
+func (h *AdminHandler) readCerebrasQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
+	token := strings.TrimSpace(p.APIKey)
+	if token == "" {
+		token = strings.TrimSpace(p.AuthToken)
+	}
+	if token == "" {
+		snap.Error = "missing api key"
+		return snap
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	if baseURL == "" {
+		baseURL = "https://api.cerebras.ai/v1"
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		snap.Error = "invalid base_url"
+		return snap
+	}
+	u.Path = joinProviderPath(u.Path, "/v1/models")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		snap.Error = "failed to build request"
+		return snap
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		snap.Error = err.Error()
+		return snap
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = fmt.Sprintf("status %d", resp.StatusCode)
+		}
+		snap.Error = msg
+		return snap
+	}
+
+	metrics := rateLimitMetricsFromHeaders(resp.Header, "cerebras", mistralFeatureWindowFromSuffix)
+	if len(metrics) == 0 {
+		snap.Error = "quota headers unavailable"
+		return snap
+	}
+	best := metrics[0]
+	for _, m := range metrics {
+		if strings.Contains(strings.ToLower(m.MeteredFeature), "request") {
+			best = m
+			break
+		}
+	}
+	snap.Status = "ok"
+	snap.Error = ""
+	snap.Metrics = metrics
+	snap.LeftPercent = best.LeftPercent
+	snap.ResetAt = best.ResetAt
+	snap.PlanType = "cerebras"
+	return snap
+}
+
+func (h *AdminHandler) readMistralQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
+	modelID := mistralFirstModelID(modelsBody)
+	resp, err := sendTinyChatProbe(ctx, baseURL, token, modelID)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("chat probe status %d", resp.StatusCode)
-	}
 	return mistralMetricsFromHeaders(resp.Header), nil
 }
 
 func (h *AdminHandler) readGroqQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string) ([]ProviderQuotaMetric, error) {
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return nil, err
-	}
-	u.Path = joinProviderPath(u.Path, "/v1/chat/completions")
-	payload := map[string]any{
-		"model":       "llama-3.1-8b-instant",
-		"messages":    []map[string]string{{"role": "user", "content": "hi"}},
-		"max_tokens":  1,
-		"temperature": 0,
-	}
-	raw, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(raw))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	resp, err := sendTinyChatProbe(ctx, baseURL, token, "llama-3.1-8b-instant")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("chat probe status %d", resp.StatusCode)
-	}
 	metrics := make([]ProviderQuotaMetric, 0, 4)
 	if m, ok := groqMetricFromHeaders(resp.Header, "requests", "requests/day"); ok {
 		metrics = append(metrics, m)
@@ -1146,43 +1300,85 @@ func (h *AdminHandler) readGroqQuotaFromTinyChat(ctx context.Context, p config.P
 	return metrics, nil
 }
 
-func groqMetricFromHeaders(h http.Header, feature string, windowLabel string) (ProviderQuotaMetric, bool) {
-	limitRaw := strings.TrimSpace(h.Get("x-ratelimit-limit-" + feature))
-	remainingRaw := strings.TrimSpace(h.Get("x-ratelimit-remaining-" + feature))
-	if limitRaw == "" || remainingRaw == "" {
-		return ProviderQuotaMetric{}, false
+func (h *AdminHandler) readHuggingFaceQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
+	modelID := mistralFirstModelID(modelsBody)
+	resp, err := sendTinyChatProbe(ctx, baseURL, token, modelID)
+	if err != nil {
+		return nil, err
 	}
-	limit, ok1 := strconv.ParseFloat(limitRaw, 64)
-	remaining, ok2 := strconv.ParseFloat(remainingRaw, 64)
-	if ok1 != nil || ok2 != nil || limit <= 0 {
-		return ProviderQuotaMetric{}, false
-	}
-	if remaining < 0 {
-		remaining = 0
-	}
-	if remaining > limit {
-		remaining = limit
-	}
-	leftPercent := (remaining / limit) * 100
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	return huggingFaceMetricsFromHeaders(resp.Header), nil
+}
 
-	resetAt := ""
-	resetRaw := strings.TrimSpace(h.Get("x-ratelimit-reset-" + feature))
-	if d, ok := parseDurationLike(resetRaw); ok {
-		resetAt = time.Now().UTC().Add(d).Format(time.RFC3339)
-	} else if unix, ok := asInt64(resetRaw); ok && unix > 0 {
-		resetAt = time.Unix(unix, 0).UTC().Format(time.RFC3339)
+func sendTinyChatProbe(ctx context.Context, baseURL string, token string, modelID string) (*http.Response, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, err
 	}
+	u.Path = joinProviderPath(u.Path, "/v1/chat/completions")
+	payload := map[string]any{
+		"model":       strings.TrimSpace(modelID),
+		"messages":    []map[string]string{{"role": "user", "content": "hi"}},
+		"max_tokens":  1,
+		"temperature": 0,
+	}
+	raw, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+		return nil, fmt.Errorf("chat probe status %d", resp.StatusCode)
+	}
+	return resp, nil
+}
 
-	return ProviderQuotaMetric{
-		Key:            "groq:" + feature,
-		MeteredFeature: feature,
-		Window:         windowLabel,
-		LeftPercent:    leftPercent,
-		ResetAt:        resetAt,
-	}, true
+func groqMetricFromHeaders(h http.Header, feature string, _ string) (ProviderQuotaMetric, bool) {
+	metrics := rateLimitMetricsFromHeaders(h, "groq", func(suffix string) (string, string) {
+		s := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(suffix, "_", "-")))
+		switch s {
+		case "requests":
+			return "requests", "requests/day"
+		case "tokens":
+			return "tokens", "tokens/min"
+		default:
+			return "", ""
+		}
+	})
+	for _, m := range metrics {
+		if strings.EqualFold(strings.TrimSpace(m.MeteredFeature), strings.TrimSpace(feature)) {
+			return m, true
+		}
+	}
+	return ProviderQuotaMetric{}, false
 }
 
 func mistralMetricsFromHeaders(h http.Header) []ProviderQuotaMetric {
+	return rateLimitMetricsFromHeaders(h, "mistral", mistralFeatureWindowFromSuffix)
+}
+
+func huggingFaceMetricsFromHeaders(h http.Header) []ProviderQuotaMetric {
+	metrics := rateLimitMetricsFromHeaders(h, "huggingface", mistralFeatureWindowFromSuffix)
+	if len(metrics) > 0 {
+		return metrics
+	}
+	return rateLimitStructuredMetricsFromHeaders(h, "huggingface")
+}
+
+func rateLimitMetricsFromHeaders(h http.Header, keyPrefix string, classifySuffix func(string) (string, string)) []ProviderQuotaMetric {
+	if classifySuffix == nil {
+		return nil
+	}
 	type metricParts struct {
 		limit     float64
 		hasLimit  bool
@@ -1273,7 +1469,10 @@ func mistralMetricsFromHeaders(h http.Header) []ProviderQuotaMetric {
 			remaining = mp.limit
 		}
 		leftPercent := (remaining / mp.limit) * 100
-		feature, window := mistralFeatureWindowFromSuffix(suffix)
+		feature, window := classifySuffix(suffix)
+		if strings.TrimSpace(feature) == "" || strings.TrimSpace(window) == "" {
+			continue
+		}
 		resetRaw := strings.TrimSpace(mp.resetRaw)
 		if resetRaw == "" {
 			featurePrefix := strings.Split(strings.ToLower(suffix), "-")[0]
@@ -1288,19 +1487,9 @@ func mistralMetricsFromHeaders(h http.Header) []ProviderQuotaMetric {
 		if resetRaw == "" {
 			resetRaw = strings.TrimSpace(globalReset)
 		}
-		resetAt := ""
-		if d, ok := parseDurationLike(resetRaw); ok {
-			resetAt = now.Add(d).Format(time.RFC3339)
-		} else if unix, ok := asInt64(resetRaw); ok && unix > 0 {
-			if unix > 1_000_000_000_000 {
-				unix = unix / 1000
-			}
-			resetAt = time.Unix(unix, 0).UTC().Format(time.RFC3339)
-		} else if parsed, err := time.Parse(time.RFC3339, resetRaw); err == nil {
-			resetAt = parsed.UTC().Format(time.RFC3339)
-		}
+		resetAt := parseRateLimitResetAt(now, resetRaw)
 		metrics = append(metrics, ProviderQuotaMetric{
-			Key:            "mistral:" + suffix,
+			Key:            keyPrefix + ":" + suffix,
 			MeteredFeature: feature,
 			Window:         window,
 			LeftPercent:    leftPercent,
@@ -1314,6 +1503,221 @@ func mistralMetricsFromHeaders(h http.Header) []ProviderQuotaMetric {
 		return metrics[i].Window < metrics[j].Window
 	})
 	return metrics
+}
+
+func rateLimitStructuredMetricsFromHeaders(h http.Header, keyPrefix string) []ProviderQuotaMetric {
+	now := time.Now().UTC()
+	rateLimitParts := map[string]map[string]string{}
+	policyParts := map[string]map[string]string{}
+	globalRateLimit := map[string]string{}
+	globalPolicy := map[string]string{}
+
+	for _, raw := range h.Values("RateLimit") {
+		for _, entry := range splitCSVHeader(raw) {
+			label, params := parseRateLimitEntry(entry)
+			if len(params) == 0 {
+				continue
+			}
+			if label == "" {
+				for k, v := range params {
+					globalRateLimit[k] = v
+				}
+				continue
+			}
+			rateLimitParts[label] = params
+		}
+	}
+	for _, raw := range h.Values("RateLimit-Policy") {
+		for _, entry := range splitCSVHeader(raw) {
+			label, params := parseRateLimitEntry(entry)
+			if len(params) == 0 {
+				continue
+			}
+			if label == "" {
+				for k, v := range params {
+					globalPolicy[k] = v
+				}
+				continue
+			}
+			policyParts[label] = params
+		}
+	}
+
+	labels := make([]string, 0, len(rateLimitParts)+len(policyParts))
+	seen := map[string]struct{}{}
+	for k := range rateLimitParts {
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			labels = append(labels, k)
+		}
+	}
+	for k := range policyParts {
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			labels = append(labels, k)
+		}
+	}
+	sort.Strings(labels)
+
+	metrics := make([]ProviderQuotaMetric, 0, len(labels)+1)
+	appendMetric := func(label string, rl map[string]string, pol map[string]string) {
+		if rl == nil {
+			rl = map[string]string{}
+		}
+		if pol == nil {
+			pol = map[string]string{}
+		}
+		if len(rl) == 0 && len(pol) == 0 {
+			return
+		}
+		q, okQ := asFloat(firstMapValue(castMapStringAny(pol), "q", "limit"))
+		r, okR := asFloat(firstMapValue(castMapStringAny(rl), "r", "remaining"))
+		if !okQ || !okR || q <= 0 {
+			return
+		}
+		if r < 0 {
+			r = 0
+		}
+		if r > q {
+			r = q
+		}
+		leftPercent := (r / q) * 100
+
+		resetAt := ""
+		if tRaw := strings.TrimSpace(asString(firstMapValue(castMapStringAny(rl), "t", "reset"))); tRaw != "" {
+			resetAt = parseRateLimitResetAt(now, tRaw)
+		}
+
+		windowSeconds, _ := asInt64(firstMapValue(castMapStringAny(pol), "w", "window"))
+		window := normalizeQuotaWindowLabel("", windowSeconds)
+		if window == "" {
+			window = "quota"
+		}
+		feature := strings.TrimSpace(label)
+		if feature == "" {
+			feature = "requests"
+		}
+		suffix := strings.ToLower(strings.ReplaceAll(feature, " ", "_"))
+		metrics = append(metrics, ProviderQuotaMetric{
+			Key:            keyPrefix + ":" + suffix + ":" + window,
+			MeteredFeature: feature,
+			Window:         window,
+			WindowSeconds:  windowSeconds,
+			LeftPercent:    leftPercent,
+			ResetAt:        resetAt,
+		})
+	}
+
+	for _, label := range labels {
+		appendMetric(label, rateLimitParts[label], policyParts[label])
+	}
+	if len(metrics) == 0 && (len(globalRateLimit) > 0 || len(globalPolicy) > 0) {
+		appendMetric("requests", globalRateLimit, globalPolicy)
+	}
+	sort.SliceStable(metrics, func(i, j int) bool {
+		if metrics[i].MeteredFeature != metrics[j].MeteredFeature {
+			return metrics[i].MeteredFeature < metrics[j].MeteredFeature
+		}
+		return metrics[i].Window < metrics[j].Window
+	})
+	return metrics
+}
+
+func splitCSVHeader(raw string) []string {
+	out := []string{}
+	var b strings.Builder
+	inQuote := false
+	for _, r := range raw {
+		switch r {
+		case '"':
+			inQuote = !inQuote
+			b.WriteRune(r)
+		case ',':
+			if inQuote {
+				b.WriteRune(r)
+				continue
+			}
+			part := strings.TrimSpace(b.String())
+			if part != "" {
+				out = append(out, part)
+			}
+			b.Reset()
+		default:
+			b.WriteRune(r)
+		}
+	}
+	last := strings.TrimSpace(b.String())
+	if last != "" {
+		out = append(out, last)
+	}
+	return out
+}
+
+func parseRateLimitEntry(entry string) (string, map[string]string) {
+	params := map[string]string{}
+	parts := strings.Split(entry, ";")
+	if len(parts) == 0 {
+		return "", params
+	}
+	label := strings.Trim(strings.TrimSpace(parts[0]), `"`)
+	start := 1
+	if strings.Contains(parts[0], "=") {
+		label = ""
+		start = 0
+	}
+	for i := start; i < len(parts); i++ {
+		part := strings.TrimSpace(parts[i])
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		val := strings.Trim(strings.TrimSpace(kv[1]), `"`)
+		if key == "" || val == "" {
+			continue
+		}
+		params[key] = val
+	}
+	return label, params
+}
+
+func castMapStringAny(in map[string]string) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func parseRateLimitResetAt(now time.Time, raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if d, ok := parseDurationLike(s); ok {
+		return now.Add(d).Format(time.RFC3339)
+	}
+	if parsed, err := time.Parse(time.RFC3339, s); err == nil {
+		return parsed.UTC().Format(time.RFC3339)
+	}
+	if unix, ok := asInt64(s); ok && unix > 0 {
+		// Most rate-limit headers expose relative seconds; Unix epoch values are much larger.
+		if unix < 1_000_000_000 {
+			return now.Add(time.Duration(unix) * time.Second).Format(time.RFC3339)
+		}
+		if unix > 1_000_000_000_000 {
+			unix = unix / 1000
+		}
+		return time.Unix(unix, 0).UTC().Format(time.RFC3339)
+	}
+	// Some structured headers emit plain integer seconds as string.
+	if d, ok := parseDurationLike(s + "s"); ok {
+		return now.Add(d).Format(time.RFC3339)
+	}
+	return ""
 }
 
 func mistralFeatureWindowFromSuffix(suffix string) (string, string) {

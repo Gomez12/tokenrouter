@@ -35,7 +35,7 @@ func TestForwardStreamingRequestRelaysSSEBody(t *testing.T) {
 		APIKey:         "test-key",
 		TimeoutSeconds: 10,
 	}
-	status, usage, initialLatency, err := s.forwardStreamingRequest(context.Background(), provider, "/v1/chat/completions", []byte(`{"model":"x","stream":true}`), w)
+	status, _, usage, initialLatency, err := s.forwardStreamingRequest(context.Background(), provider, "/v1/chat/completions", []byte(`{"model":"x","stream":true}`), w)
 	if err != nil {
 		t.Fatalf("forwardStreamingRequest returned error: %v", err)
 	}

@@ -29,6 +29,13 @@ type ProviderHealthChecker struct {
 	forceCh chan struct{}
 }
 
+func durationToResponseMS(d time.Duration) int64 {
+	if d <= 0 {
+		return 0
+	}
+	return d.Milliseconds()
+}
+
 func NewProviderHealthChecker(resolver *ProviderResolver, interval time.Duration) *ProviderHealthChecker {
 	if interval <= 0 {
 		interval = providerHealthCheckInterval
@@ -93,7 +100,7 @@ func (c *ProviderHealthChecker) RecordProxyResult(provider string, latency time.
 	}
 	snap := ProviderHealth{
 		Status:     "online",
-		ResponseMS: latency.Milliseconds(),
+		ResponseMS: durationToResponseMS(latency),
 		CheckedAt:  c.now().UTC(),
 	}
 	if reqErr != nil {
@@ -168,11 +175,22 @@ func (c *ProviderHealthChecker) checkOnce(parent context.Context, force bool) {
 		if parent != nil {
 			ctx, cancel = context.WithTimeout(parent, time.Duration(timeout)*time.Second)
 		}
+		prevResponseMS := int64(0)
+		c.mu.RLock()
+		if prev, ok := c.byName[p.Name]; ok {
+			prevResponseMS = prev.ResponseMS
+		}
+		c.mu.RUnlock()
 		models, err := NewProviderClient(p).ListModels(ctx)
 		cancel()
+		responseMS := durationToResponseMS(c.now().Sub(start))
+		// OpenAI/Codex model discovery is static and does not hit upstream; keep last real latency.
+		if isOpenAICodexProvider(p) {
+			responseMS = prevResponseMS
+		}
 		snap := ProviderHealth{
 			Status:     "online",
-			ResponseMS: c.now().Sub(start).Milliseconds(),
+			ResponseMS: responseMS,
 			ModelCount: len(models),
 			CheckedAt:  c.now().UTC(),
 		}

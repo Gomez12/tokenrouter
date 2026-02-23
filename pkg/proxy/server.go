@@ -20,6 +20,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/lkarlslund/openai-personal-proxy/pkg/cache"
 	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
 	"github.com/lkarlslund/openai-personal-proxy/pkg/pricing"
 	"golang.org/x/crypto/acme/autocert"
@@ -31,7 +32,9 @@ type Server struct {
 	stats                 *StatsStore
 	pricing               *pricing.Manager
 	providerHealthChecker *ProviderHealthChecker
+	adminHandler          *AdminHandler
 	httpServer            *http.Server
+	modelsCachePath       string
 	modelsCached          atomic.Pointer[[]ModelCard]
 	activeProxyRequests   atomic.Int64
 	draining              atomic.Bool
@@ -43,10 +46,12 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 	stats := NewPersistentStatsStore(10000, config.DefaultUsageStatsPath())
 
 	s := &Server{
-		store:    store,
-		resolver: resolver,
-		stats:    stats,
+		store:           store,
+		resolver:        resolver,
+		stats:           stats,
+		modelsCachePath: config.DefaultModelsCachePath(),
 	}
+	s.loadModelsCacheFromDisk()
 	pricingMgr, err := pricing.NewManager(config.DefaultPricingCachePath())
 	if err != nil {
 		return nil, fmt.Errorf("init pricing manager: %w", err)
@@ -85,6 +90,7 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 
 	instanceID := fmt.Sprintf("%d-%d", time.Now().UTC().UnixNano(), os.Getpid())
 	adminHandler := NewAdminHandler(store, stats, resolver, pricingMgr, s.providerHealthChecker, instanceID)
+	s.adminHandler = adminHandler
 	adminHandler.RegisterRoutes(r)
 
 	s.httpServer = &http.Server{
@@ -229,8 +235,34 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		s.modelsCached.Store(&models)
+		s.saveModelsCacheToDisk(models)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+}
+
+func (s *Server) loadModelsCacheFromDisk() {
+	if s == nil || strings.TrimSpace(s.modelsCachePath) == "" {
+		return
+	}
+	var models []ModelCard
+	if err := cache.LoadJSON(s.modelsCachePath, &models); err != nil {
+		return
+	}
+	if len(models) == 0 {
+		return
+	}
+	s.modelsCached.Store(&models)
+}
+
+func (s *Server) saveModelsCacheToDisk(models []ModelCard) {
+	if s == nil || strings.TrimSpace(s.modelsCachePath) == "" {
+		return
+	}
+	cp := append([]ModelCard(nil), models...)
+	if len(cp) == 0 {
+		return
+	}
+	_ = cache.SaveJSON(s.modelsCachePath, cp)
 }
 
 func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -254,7 +286,7 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	if stream {
-		statusCode, usage, initialLatency, err := s.forwardStreamingRequest(r.Context(), provider, r.URL.Path, mutatedBody, w)
+		statusCode, upstreamHeader, usage, initialLatency, err := s.forwardStreamingRequest(r.Context(), provider, r.URL.Path, mutatedBody, w)
 		latency := time.Since(start)
 		if err != nil {
 			s.providerHealthChecker.RecordProxyResult(provider.Name, latency, statusCode, err)
@@ -264,6 +296,9 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.providerHealthChecker.RecordProxyResult(provider.Name, latency, statusCode, nil)
+		if statusCode >= 200 && statusCode <= 299 && s.adminHandler != nil {
+			s.adminHandler.RecordQuotaFromResponse(provider, upstreamHeader)
+		}
 		if usage.TotalTokens == 0 {
 			usage.PromptTokens = estimatePromptTokensFromRequest(body)
 			if usage.CompletionTokens == 0 {
@@ -284,6 +319,9 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.providerHealthChecker.RecordProxyResult(provider.Name, latency, statusCode, nil)
+	if statusCode >= 200 && statusCode <= 299 && s.adminHandler != nil {
+		s.adminHandler.RecordQuotaFromResponse(provider, header)
+	}
 
 	for k, vals := range header {
 		if strings.EqualFold(k, "content-length") {
@@ -391,11 +429,11 @@ type clientUsageMeta struct {
 	APIKeyName string
 }
 
-func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.ProviderConfig, requestPath string, body []byte, w http.ResponseWriter) (int, usageTokenCounts, time.Duration, error) {
+func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.ProviderConfig, requestPath string, body []byte, w http.ResponseWriter) (int, http.Header, usageTokenCounts, time.Duration, error) {
 	provider = s.ensureOAuthTokenFresh(ctx, provider)
 	u, err := url.Parse(strings.TrimRight(provider.BaseURL, "/"))
 	if err != nil {
-		return 0, usageTokenCounts{}, 0, fmt.Errorf("invalid provider base_url: %w", err)
+		return 0, nil, usageTokenCounts{}, 0, fmt.Errorf("invalid provider base_url: %w", err)
 	}
 	if isOpenAICodexProvider(provider) && requestPath == "/v1/responses" {
 		requestPath = "/codex/responses"
@@ -403,7 +441,7 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 	u.Path = joinProviderPath(u.Path, requestPath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
 	if err != nil {
-		return 0, usageTokenCounts{}, 0, err
+		return 0, nil, usageTokenCounts{}, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if provider.APIKey != "" {
@@ -423,11 +461,12 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 	upstreamStart := time.Now()
 	resp, err := cli.Do(req)
 	if err != nil {
-		return 0, usageTokenCounts{}, 0, err
+		return 0, nil, usageTokenCounts{}, 0, err
 	}
 	defer resp.Body.Close()
 	initialLatency := time.Since(upstreamStart)
 	firstChunkLatency := time.Duration(0)
+	upstreamHeader := resp.Header.Clone()
 
 	for k, vals := range resp.Header {
 		if strings.EqualFold(k, "content-length") {
@@ -457,7 +496,7 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 				if firstChunkLatency > 0 {
 					initialLatency = firstChunkLatency
 				}
-				return resp.StatusCode, parser.Usage(), initialLatency, writeErr
+				return resp.StatusCode, upstreamHeader, parser.Usage(), initialLatency, writeErr
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -467,13 +506,13 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 			if firstChunkLatency > 0 {
 				initialLatency = firstChunkLatency
 			}
-			return resp.StatusCode, parser.Usage(), initialLatency, nil
+			return resp.StatusCode, upstreamHeader, parser.Usage(), initialLatency, nil
 		}
 		if readErr != nil {
 			if firstChunkLatency > 0 {
 				initialLatency = firstChunkLatency
 			}
-			return resp.StatusCode, parser.Usage(), initialLatency, readErr
+			return resp.StatusCode, upstreamHeader, parser.Usage(), initialLatency, readErr
 		}
 	}
 }

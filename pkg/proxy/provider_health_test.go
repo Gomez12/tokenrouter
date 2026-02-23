@@ -35,7 +35,7 @@ func TestProviderHealthCheckerCheckOnceRecordsOnlineStatusAndLatency(t *testing.
 	resolver := NewProviderResolver(store)
 	checker := NewProviderHealthChecker(resolver, time.Hour)
 
-	checker.checkOnce(context.Background(), false)
+	checker.checkOnce(context.Background(), true)
 
 	snap, ok := checker.Snapshot("demo")
 	if !ok {
@@ -76,7 +76,7 @@ func TestProviderHealthCheckerCheckOnceRecordsAuthProblem(t *testing.T) {
 	resolver := NewProviderResolver(store)
 	checker := NewProviderHealthChecker(resolver, time.Hour)
 
-	checker.checkOnce(context.Background(), false)
+	checker.checkOnce(context.Background(), true)
 
 	snap, ok := checker.Snapshot("secured")
 	if !ok {
@@ -191,5 +191,35 @@ func TestProviderHealthCheckerRetriesOfflineEvery30Seconds(t *testing.T) {
 	checker.checkOnce(context.Background(), false)
 	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Fatalf("expected retry at 30s, got %d", got)
+	}
+}
+
+func TestProviderHealthCheckerStaticCodexCheckKeepsLastMeasuredLatency(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{{
+		Name:           "openai",
+		BaseURL:        "https://chatgpt.com/backend-api",
+		Enabled:        true,
+		TimeoutSeconds: 2,
+	}}
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	resolver := NewProviderResolver(store)
+	checker := NewProviderHealthChecker(resolver, time.Hour)
+
+	checker.RecordProxyResult("openai", 480*time.Millisecond, http.StatusOK, nil)
+	checker.checkOnce(context.Background(), true)
+
+	snap, ok := checker.Snapshot("openai")
+	if !ok {
+		t.Fatal("expected provider health snapshot for openai")
+	}
+	if snap.Status != "online" {
+		t.Fatalf("expected online status, got %q", snap.Status)
+	}
+	if snap.ModelCount == 0 {
+		t.Fatal("expected static codex model count to be populated")
+	}
+	if snap.ResponseMS != 480 {
+		t.Fatalf("expected prior measured latency 480ms to be preserved, got %d", snap.ResponseMS)
 	}
 }

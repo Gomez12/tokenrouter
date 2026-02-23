@@ -88,6 +88,14 @@ func DefaultUsageStatsPath() string {
 	return filepath.Join(home, ".cache", "openai-personal-proxy", "usage-stats.json")
 }
 
+func DefaultModelsCachePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "models-cache.json"
+	}
+	return filepath.Join(home, ".cache", "openai-personal-proxy", "models-cache.json")
+}
+
 func NewDefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
 		ListenAddr:      ":8080",

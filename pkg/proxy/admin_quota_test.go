@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lkarlslund/openai-personal-proxy/pkg/assets"
+	"github.com/lkarlslund/openai-personal-proxy/pkg/cache"
 	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
 )
 
@@ -32,7 +33,7 @@ func TestReadOpenAICodexQuotaParsesUsagePayload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:      "openai-main",
 		BaseURL:   srv.URL + "/backend-api",
@@ -87,7 +88,7 @@ func TestReadOpenAICodexQuotaParsesMultipleWindowsAndFeatures(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:      "openai-main",
 		BaseURL:   srv.URL + "/backend-api",
@@ -117,7 +118,7 @@ func TestReadProviderQuotaCachedUsesTTL(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:      "openai-work",
 		BaseURL:   srv.URL,
@@ -126,9 +127,10 @@ func TestReadProviderQuotaCachedUsesTTL(t *testing.T) {
 	preset := assets.PopularProvider{
 		ProviderConfig: config.ProviderConfig{Name: "openai"},
 		DisplayName:    "OpenAI",
+		QuotaReader:    "openai_codex",
 	}
-	snap1 := h.readProviderQuotaCached(context.Background(), p, preset, "openai_codex")
-	snap2 := h.readProviderQuotaCached(context.Background(), p, preset, "openai_codex")
+	snap1 := h.readProviderQuotaCached(context.Background(), p, preset)
+	snap2 := h.readProviderQuotaCached(context.Background(), p, preset)
 	if snap1.Status != "ok" || snap2.Status != "ok" {
 		t.Fatalf("expected ok snapshots, got %+v %+v", snap1, snap2)
 	}
@@ -171,7 +173,7 @@ func TestReadGoogleAntigravityQuotaParsesMetrics(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:      "google-gemini",
 		BaseURL:   srv.URL + "/v1internal",
@@ -220,7 +222,7 @@ func TestReadGoogleAntigravityQuotaUsesRetrieveUserQuota(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:      "google-gemini",
 		BaseURL:   srv.URL + "/v1internal",
@@ -251,7 +253,7 @@ func TestReadGoogleAntigravityQuotaReturnsRetrieveErrorWhenNoQuotaFields(t *test
 		case "/v1internal:loadCodeAssist":
 			w.Header().Set("Content-Type", "application/json")
 			resp := map[string]any{
-				"currentTier": map[string]any{"id": "free-tier"},
+				"currentTier":             map[string]any{"id": "free-tier"},
 				"cloudaicompanionProject": "projects/demo-project",
 			}
 			_ = json.NewEncoder(w).Encode(resp)
@@ -263,7 +265,7 @@ func TestReadGoogleAntigravityQuotaReturnsRetrieveErrorWhenNoQuotaFields(t *test
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:      "google-gemini",
 		BaseURL:   srv.URL + "/v1internal",
@@ -333,7 +335,7 @@ func TestComputeProviderQuotaAndStoreRefreshesExpiredGoogleOAuthToken(t *testing
 	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
 	h := &AdminHandler{
 		store:      store,
-		quotaCache: map[string]quotaCacheEntry{},
+		quotaCache: cache.NewTTLMap[string, quotaCacheValue](),
 	}
 	p := cfg.Providers[0]
 	preset := assets.PopularProvider{
@@ -341,11 +343,12 @@ func TestComputeProviderQuotaAndStoreRefreshesExpiredGoogleOAuthToken(t *testing
 			Name: "google-gemini",
 		},
 		DisplayName:       "Google Gemini",
+		QuotaReader:       "google_antigravity",
 		OAuthTokenURL:     tokenSrv.URL,
 		OAuthClientID:     "client-id",
 		OAuthClientSecret: "client-secret",
 	}
-	snap := h.computeProviderQuotaAndStore(p, preset, "google_antigravity")
+	snap := h.computeProviderQuotaAndStore(p, preset)
 	if snap.Status != "ok" {
 		t.Fatalf("expected ok status, got %+v", snap)
 	}
@@ -374,7 +377,7 @@ func TestReadGroqQuotaParsesRateLimitHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:    "groq-main",
 		BaseURL: srv.URL + "/openai/v1",
@@ -419,7 +422,7 @@ func TestReadGroqQuotaFallsBackToTinyChatForHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:    "groq-main",
 		BaseURL: srv.URL + "/openai/v1",
@@ -459,7 +462,7 @@ func TestReadMistralQuotaParsesRateLimitHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:    "mistral-main",
 		BaseURL: srv.URL + "/v1",
@@ -490,7 +493,7 @@ func TestReadMistralQuotaReturnsErrorWhenHeadersMissing(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:    "mistral-main",
 		BaseURL: srv.URL + "/v1",
@@ -532,7 +535,7 @@ func TestReadMistralQuotaFallsBackToTinyChatForHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:    "mistral-main",
 		BaseURL: srv.URL + "/v1",
@@ -566,7 +569,7 @@ func TestReadMistralQuotaResetFallbackFromFeatureLevelHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := &AdminHandler{quotaCache: map[string]quotaCacheEntry{}}
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
 		Name:    "mistral-main",
 		BaseURL: srv.URL + "/v1",
@@ -587,6 +590,203 @@ func TestReadMistralQuotaResetFallbackFromFeatureLevelHeader(t *testing.T) {
 	}
 	if snap.Metrics[0].ResetAt == "" {
 		t.Fatalf("expected reset_at from feature-level fallback header, got empty metric=%+v", snap.Metrics[0])
+	}
+}
+
+func TestReadHuggingFaceQuotaParsesLegacyRateLimitHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer hf_test_token" {
+			t.Fatalf("unexpected auth header: %q", got)
+		}
+		w.Header().Set("x-ratelimit-limit-requests-minute", "600")
+		w.Header().Set("x-ratelimit-remaining-requests-minute", "450")
+		w.Header().Set("x-ratelimit-reset-requests-minute", "30s")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"meta-llama/Llama-3.1-8B-Instruct"}]}`))
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "huggingface-main",
+		BaseURL: srv.URL + "/v1",
+		APIKey:  "hf_test_token",
+	}
+	snap := h.readHuggingFaceQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "huggingface",
+		Reader:       "huggingface_headers",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if len(snap.Metrics) != 1 {
+		t.Fatalf("expected 1 metric, got %d", len(snap.Metrics))
+	}
+	if snap.LeftPercent != 75 {
+		t.Fatalf("expected left_percent 75, got %v", snap.LeftPercent)
+	}
+}
+
+func TestReadHuggingFaceQuotaParsesStructuredRateLimitHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("RateLimit", `"api";r=750;t=90`)
+		w.Header().Set("RateLimit-Policy", `"api";q=1000;w=300`)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"Qwen/Qwen3-Coder-480B-A35B-Instruct"}]}`))
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "huggingface-main",
+		BaseURL: srv.URL + "/v1",
+		APIKey:  "hf_test_token",
+	}
+	snap := h.readHuggingFaceQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "huggingface",
+		Reader:       "huggingface_headers",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if len(snap.Metrics) != 1 {
+		t.Fatalf("expected 1 structured metric, got %d (%+v)", len(snap.Metrics), snap.Metrics)
+	}
+	if snap.LeftPercent <= 0 || snap.LeftPercent > 100 {
+		t.Fatalf("unexpected left percent: %v", snap.LeftPercent)
+	}
+	if snap.Metrics[0].MeteredFeature != "api" {
+		t.Fatalf("expected metered feature api, got %q", snap.Metrics[0].MeteredFeature)
+	}
+}
+
+func TestReadHuggingFaceQuotaFallsBackToTinyChatForHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"meta-llama/Llama-3.1-8B-Instruct"}]}`))
+		case "/v1/chat/completions":
+			w.Header().Set("x-ratelimit-limit-requests-minute", "600")
+			w.Header().Set("x-ratelimit-remaining-requests-minute", "540")
+			w.Header().Set("x-ratelimit-reset-requests-minute", "20s")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "huggingface-main",
+		BaseURL: srv.URL + "/v1",
+		APIKey:  "hf_test_token",
+	}
+	snap := h.readHuggingFaceQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "huggingface",
+		Reader:       "huggingface_headers",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status after tiny chat fallback, got %+v", snap)
+	}
+	if len(snap.Metrics) != 1 {
+		t.Fatalf("expected 1 metric, got %d", len(snap.Metrics))
+	}
+}
+
+func TestReadCerebrasQuotaParsesRateLimitHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer csk-test" {
+			t.Fatalf("unexpected auth header: %q", got)
+		}
+		w.Header().Set("x-ratelimit-limit-requests-day", "250000")
+		w.Header().Set("x-ratelimit-remaining-requests-day", "200000")
+		w.Header().Set("x-ratelimit-reset-requests-day", "3600")
+		w.Header().Set("x-ratelimit-limit-tokens-minute", "1200000")
+		w.Header().Set("x-ratelimit-remaining-tokens-minute", "900000")
+		w.Header().Set("x-ratelimit-reset-tokens-minute", "45")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"llama-3.3-70b"}]}`))
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "cerebras-main",
+		BaseURL: srv.URL + "/v1",
+		APIKey:  "csk-test",
+	}
+	snap := h.readCerebrasQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "cerebras",
+		Reader:       "cerebras_headers",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if len(snap.Metrics) != 2 {
+		t.Fatalf("expected 2 metrics, got %d (%+v)", len(snap.Metrics), snap.Metrics)
+	}
+	if snap.LeftPercent <= 0 || snap.LeftPercent > 100 {
+		t.Fatalf("unexpected left percent: %v", snap.LeftPercent)
+	}
+	for _, m := range snap.Metrics {
+		if m.ResetAt == "" {
+			t.Fatalf("expected reset_at to be populated for metric %+v", m)
+		}
+	}
+}
+
+func TestRecordQuotaFromResponseUpdatesCacheForHeaderReaders(t *testing.T) {
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:         "groq-main",
+		ProviderType: "groq",
+	}
+	headers := http.Header{}
+	headers.Set("x-ratelimit-limit-requests", "1000")
+	headers.Set("x-ratelimit-remaining-requests", "800")
+	headers.Set("x-ratelimit-reset-requests", "45s")
+	headers.Set("x-ratelimit-limit-tokens", "100000")
+	headers.Set("x-ratelimit-remaining-tokens", "90000")
+	headers.Set("x-ratelimit-reset-tokens", "30s")
+
+	h.RecordQuotaFromResponse(p, headers)
+
+	entry, _, ok := h.quotaCache.Get(p.Name)
+	if !ok {
+		t.Fatal("expected quota cache entry to be populated")
+	}
+	if entry.Snapshot.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", entry.Snapshot)
+	}
+	if len(entry.Snapshot.Metrics) != 2 {
+		t.Fatalf("expected 2 metrics, got %d", len(entry.Snapshot.Metrics))
+	}
+	if entry.Snapshot.LeftPercent <= 0 || entry.Snapshot.LeftPercent > 100 {
+		t.Fatalf("unexpected left percent: %v", entry.Snapshot.LeftPercent)
 	}
 }
 

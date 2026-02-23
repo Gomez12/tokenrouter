@@ -57,7 +57,10 @@
       <button class="nav-link rounded-top" :class="activeTab==='quota' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('quota')">Quota</button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='configure' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('configure')">Configure</button>
+      <button class="nav-link rounded-top" :class="activeTab==='providers' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('providers')">Providers</button>
+    </li>
+    <li class="nav-item">
+      <button class="nav-link rounded-top" :class="activeTab==='access' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('access')">Access</button>
     </li>
     <li class="nav-item">
       <button class="nav-link rounded-top" :class="activeTab==='models' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('models')">Models</button>
@@ -97,8 +100,7 @@
     </div>
   </div>
 
-  <div x-show="activeTab==='configure'" style="display:none;">
-
+  <div x-show="activeTab==='providers'" style="display:none;">
     <div class="card shadow-sm mb-3">
       <div class="card-body">
         <div class="d-flex align-items-center justify-content-between mb-2">
@@ -110,7 +112,9 @@
         <div class="table-responsive" x-html="providersTableHtml"></div>
       </div>
     </div>
+  </div>
 
+  <div x-show="activeTab==='access'" style="display:none;">
     <div class="card shadow-sm mb-3">
       <div class="card-body">
         <div class="d-flex align-items-center justify-content-between mb-2">
