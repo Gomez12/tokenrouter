@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Admin Login</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-body-tertiary">
+  <div class="container py-5" style="max-width: 480px;">
+    <div class="card shadow-sm">
+      <div class="card-body p-4">
+        <h1 class="h4 mb-3">Proxy Admin Login</h1>
+        <p class="text-body-secondary mb-3">Enter your admin API key to access the dashboard.</p>
+        {{if .Error}}
+        <div class="alert alert-danger py-2" role="alert">{{.Error}}</div>
+        {{end}}
+        <form method="post" action="/admin/login">
+          <input type="hidden" name="next" value="{{.Next}}" />
+          <label for="api_key" class="form-label">Admin API key</label>
+          <input id="api_key" name="api_key" type="password" class="form-control mb-3" required autofocus />
+          <button class="btn btn-primary w-100" type="submit">Sign in</button>
+        </form>
+      </div>
+    </div>
+  </div>
+  <script>
+    window.addEventListener('DOMContentLoaded', function () {
+      var el = document.getElementById('api_key');
+      if (el) el.focus();
+    });
+  </script>
+</body>
+</html>

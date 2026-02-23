@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="ART_1" data-name="ART 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: #c094dd;
+      }
+
+      .cls-2 {
+        fill: none;
+        stroke: #000;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 3px;
+      }
+
+      .cls-3 {
+        fill: #e8d8f3;
+      }
+
+      .cls-4 {
+        fill: #ac71d2;
+      }
+
+      .cls-5 {
+        fill: #d4b6e8;
+      }
+    </style>
+  </defs>
+  <path class="cls-2" d="M61.8,23.8l2.2-8.2-8.2-2.2M52,66.6h12v-33h-12v33ZM40,66.6h12v-27h-12v27ZM16,66.6h12v-9h-12v9ZM28,66.6h12v-18h-12v18ZM16,45.6l48-30"/>
+  <rect class="cls-4" x="53.46" y="35.01" width="9.07" height="30.17"/>
+  <rect class="cls-1" x="41.43" y="41.02" width="9.07" height="24.15"/>
+  <rect class="cls-5" x="29.41" y="50.09" width="9.12" height="15.08"/>
+  <rect class="cls-3" x="17.43" y="58.96" width="9.07" height="6.22"/>
+</svg>
