@@ -1,0 +1,38 @@
+# Go build/test artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+*.coverprofile
+
+# Local build caches
+.gocache/
+/tmp/
+
+# Runtime/temp files
+*.log
+*.pid
+*.tmp
+*.swp
+*.swo
+
+# Local environment/config secrets
+.env
+.env.*
+config.local.toml
+server.local.toml
+
+# IDE/editor
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
