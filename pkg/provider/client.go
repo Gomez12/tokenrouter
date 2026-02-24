@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 type ModelCard struct {

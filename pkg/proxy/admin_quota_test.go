@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/assets"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/cache"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/assets"
+	"github.com/lkarlslund/tokenrouter/pkg/cache"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 func TestReadOpenAICodexQuotaParsesUsagePayload(t *testing.T) {
@@ -633,6 +634,46 @@ func TestReadHuggingFaceQuotaParsesLegacyRateLimitHeaders(t *testing.T) {
 	}
 }
 
+func TestReadHuggingFaceQuotaParsesGenericRateLimitHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("x-ratelimit-limit", "100")
+		w.Header().Set("x-ratelimit-remaining", "80")
+		w.Header().Set("x-ratelimit-reset", "30s")
+		w.Header().Set("x-ratelimit-limit-tokens", "10000")
+		w.Header().Set("x-ratelimit-remaining-tokens", "9000")
+		w.Header().Set("x-ratelimit-reset-tokens", "15s")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"meta-llama/Llama-3.1-8B-Instruct"}]}`))
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "huggingface-main",
+		BaseURL: srv.URL + "/v1",
+		APIKey:  "hf_test_token",
+	}
+	snap := h.readHuggingFaceQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "huggingface",
+		Reader:       "huggingface_headers",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if len(snap.Metrics) != 2 {
+		t.Fatalf("expected 2 metrics, got %d (%+v)", len(snap.Metrics), snap.Metrics)
+	}
+	if snap.LeftPercent != 80 {
+		t.Fatalf("expected left_percent 80, got %v", snap.LeftPercent)
+	}
+}
+
 func TestReadHuggingFaceQuotaParsesStructuredRateLimitHeaders(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
@@ -711,6 +752,55 @@ func TestReadHuggingFaceQuotaFallsBackToTinyChatForHeaders(t *testing.T) {
 	}
 }
 
+func TestReadHuggingFaceQuotaTinyChatTriesMultipleModels(t *testing.T) {
+	var chatCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"not-chat-model"},{"id":"Qwen/Qwen2.5-7B-Instruct"}]}`))
+		case "/v1/chat/completions":
+			chatCalls++
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 8*1024))
+			if strings.Contains(string(body), `"model":"not-chat-model"`) {
+				http.Error(w, `{"error":"unsupported model"}`, http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("x-ratelimit-limit", "100")
+			w.Header().Set("x-ratelimit-remaining", "70")
+			w.Header().Set("x-ratelimit-reset", "20s")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "huggingface-main",
+		BaseURL: srv.URL + "/v1",
+		APIKey:  "hf_test_token",
+	}
+	snap := h.readHuggingFaceQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "huggingface",
+		Reader:       "huggingface_headers",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status after trying multiple models, got %+v", snap)
+	}
+	if chatCalls < 2 {
+		t.Fatalf("expected at least 2 chat attempts, got %d", chatCalls)
+	}
+	if len(snap.Metrics) == 0 {
+		t.Fatalf("expected quota metrics, got none")
+	}
+}
+
 func TestReadCerebrasQuotaParsesRateLimitHeaders(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
@@ -759,6 +849,48 @@ func TestReadCerebrasQuotaParsesRateLimitHeaders(t *testing.T) {
 	}
 }
 
+func TestReadCerebrasQuotaFallsBackToTinyChatForHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"llama-3.3-70b"}]}`))
+		case "/v1/chat/completions":
+			w.Header().Set("x-ratelimit-limit-requests-day", "250000")
+			w.Header().Set("x-ratelimit-remaining-requests-day", "245000")
+			w.Header().Set("x-ratelimit-reset-requests-day", "3600")
+			w.Header().Set("x-ratelimit-limit-tokens-minute", "1200000")
+			w.Header().Set("x-ratelimit-remaining-tokens-minute", "1100000")
+			w.Header().Set("x-ratelimit-reset-tokens-minute", "45")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "cerebras-main",
+		BaseURL: srv.URL + "/v1",
+		APIKey:  "csk-test",
+	}
+	snap := h.readCerebrasQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "cerebras",
+		Reader:       "cerebras_headers",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status after tiny chat fallback, got %+v", snap)
+	}
+	if len(snap.Metrics) != 2 {
+		t.Fatalf("expected 2 metrics, got %d (%+v)", len(snap.Metrics), snap.Metrics)
+	}
+}
+
 func TestRecordQuotaFromResponseUpdatesCacheForHeaderReaders(t *testing.T) {
 	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
@@ -787,6 +919,54 @@ func TestRecordQuotaFromResponseUpdatesCacheForHeaderReaders(t *testing.T) {
 	}
 	if entry.Snapshot.LeftPercent <= 0 || entry.Snapshot.LeftPercent > 100 {
 		t.Fatalf("unexpected left percent: %v", entry.Snapshot.LeftPercent)
+	}
+}
+
+func TestComputeProviderQuotaAndStorePreservesLastGoodSnapshotOnRefreshError(t *testing.T) {
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:         "mistral-main",
+		ProviderType: "mistral",
+		BaseURL:      "http://127.0.0.1:0/v1",
+		APIKey:       "mistral-key",
+	}
+	preset := assets.PopularProvider{
+		ProviderConfig: config.ProviderConfig{Name: "mistral"},
+		DisplayName:    "Mistral",
+		QuotaReader:    "mistral_headers",
+	}
+	now := time.Now().UTC()
+	lastGood := ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "mistral",
+		DisplayName:  "Mistral",
+		Reader:       "mistral_headers",
+		Status:       "ok",
+		CheckedAt:    now.Add(-2 * time.Hour).Format(time.RFC3339),
+		PlanType:     "mistral",
+		LeftPercent:  88,
+		Metrics: []ProviderQuotaMetric{
+			{Key: "mistral:requests-minute", MeteredFeature: "requests", Window: "1m", LeftPercent: 88},
+		},
+	}
+	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
+		Snapshot:   lastGood,
+		Refreshing: false,
+	}, now.Add(-2*time.Hour), quotaRefreshOK)
+
+	got := h.computeProviderQuotaAndStore(p, preset)
+	if got.Status != "ok" {
+		t.Fatalf("expected preserved ok snapshot, got %+v", got)
+	}
+	if got.LeftPercent != 88 {
+		t.Fatalf("expected preserved left percent 88, got %v", got.LeftPercent)
+	}
+	cached, _, ok := h.quotaCache.Get(p.Name)
+	if !ok {
+		t.Fatal("expected quota cache entry")
+	}
+	if cached.Snapshot.Status != "ok" || cached.Snapshot.LeftPercent != 88 {
+		t.Fatalf("expected preserved cached snapshot, got %+v", cached.Snapshot)
 	}
 }
 

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/wizard"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/wizard"
 	"github.com/spf13/cobra"
 )
 

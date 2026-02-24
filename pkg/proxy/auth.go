@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 var lookupHost = net.LookupHost
@@ -32,29 +32,58 @@ func bearerToken(h http.Header) string {
 	return strings.TrimSpace(parts[1])
 }
 
-func keyAllowed(token string, tokens []config.IncomingAPIToken, allowed []string) bool {
+func keyAllowed(token string, tokens []config.IncomingAPIToken) bool {
+	_, ok := resolveIncomingToken(token, tokens)
+	return ok
+}
+
+type tokenAuthIdentity struct {
+	Token   config.IncomingAPIToken
+	Role    string
+	IsAdmin bool
+}
+
+func resolveAuthIdentity(token string, cfg config.ServerConfig) (tokenAuthIdentity, bool) {
+	token = strings.TrimSpace(token)
 	if token == "" {
-		return false
+		return tokenAuthIdentity{}, false
+	}
+	tok, ok := resolveIncomingToken(token, cfg.IncomingTokens)
+	if !ok {
+		return tokenAuthIdentity{}, false
+	}
+	role := config.NormalizeIncomingTokenRole(tok.Role)
+	if role == "" {
+		role = config.TokenRoleInferrer
+	}
+	return tokenAuthIdentity{
+		Token:   tok,
+		Role:    role,
+		IsAdmin: role == config.TokenRoleAdmin,
+	}, true
+}
+
+func resolveIncomingToken(token string, tokens []config.IncomingAPIToken) (config.IncomingAPIToken, bool) {
+	if token == "" {
+		return config.IncomingAPIToken{}, false
 	}
 	for _, t := range tokens {
-		if token != t.Key {
+		if token != strings.TrimSpace(t.Key) {
 			continue
 		}
-		if strings.TrimSpace(t.ExpiresAt) == "" {
-			return true
+		if strings.TrimSpace(t.ExpiresAt) != "" {
+			expiresAt, err := parseRFC3339(t.ExpiresAt)
+			if err != nil || !nowUTC().Before(expiresAt) {
+				return config.IncomingAPIToken{}, false
+			}
 		}
-		expiresAt, err := parseRFC3339(t.ExpiresAt)
-		if err != nil {
-			continue
+		t.Role = config.NormalizeIncomingTokenRole(t.Role)
+		if t.Role == "" {
+			t.Role = config.TokenRoleInferrer
 		}
-		return nowUTC().Before(expiresAt)
+		return t, true
 	}
-	for _, k := range allowed {
-		if token == k {
-			return true
-		}
-	}
-	return false
+	return config.IncomingAPIToken{}, false
 }
 
 func requestIsLoopback(r *http.Request) bool {

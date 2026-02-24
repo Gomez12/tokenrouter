@@ -5,7 +5,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/assets"
+	"github.com/lkarlslund/tokenrouter/pkg/assets"
 )
 
 var (

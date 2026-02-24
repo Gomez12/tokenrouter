@@ -17,7 +17,7 @@ import (
 
 	openai "github.com/sashabaranov/go-openai"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 func testRepoRoot(t *testing.T) string {
@@ -179,7 +179,10 @@ func TestCLIOverridesModelsFlow(t *testing.T) {
 	addr := findFreeAddr(t)
 	cfg := config.NewDefaultServerConfig()
 	cfg.ListenAddr = "127.0.0.1:1"
-	cfg.AdminAPIKey = "admin-test-key"
+	adminKey := "admin-test-key"
+	cfg.IncomingTokens = []config.IncomingAPIToken{
+		{ID: "admin-1", Name: "Admin", Role: config.TokenRoleAdmin, Key: adminKey},
+	}
 	cfg.AllowLocalhostNoAuth = false
 	cfg.AutoEnablePublicFreeModels = false
 	cfg.Providers = []config.ProviderConfig{
@@ -199,7 +202,7 @@ func TestCLIOverridesModelsFlow(t *testing.T) {
 
 	cmd := exec.CommandContext(
 		runCtx,
-		"go", "run", "./cmd/openai-personal-proxy", "serve",
+		"go", "run", "./cmd/torod", "serve",
 		"--config", cfgPath,
 		"--listen-addr", addr,
 		"--allow-localhost-no-auth=true",
@@ -255,7 +258,7 @@ func TestCLIOverridesModelsFlow(t *testing.T) {
 		t.Fatal("expected non-empty chat response content")
 	}
 
-	sec := getSecuritySettings(t, baseURL, cfg.AdminAPIKey)
+	sec := getSecuritySettings(t, baseURL, adminKey)
 	if !strings.Contains(sec, `"allow_localhost_no_auth":true`) {
 		t.Fatalf("expected allow_localhost_no_auth override in %s", sec)
 	}

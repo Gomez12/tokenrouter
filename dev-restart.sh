@@ -9,7 +9,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-BIN_PATH="${BIN_PATH:-/tmp/openai-personal-proxy-dev}"
+BIN_PATH="${BIN_PATH:-/tmp/tokenrouter-dev}"
 POLL_SECONDS="${POLL_SECONDS:-1}"
 SERVE_ARGS=("$@")
 
@@ -71,7 +71,7 @@ rebuild() {
   GOCACHE="$GOCACHE_VALUE" \
   GOMODCACHE="$GOMODCACHE_VALUE" \
   GOPATH="$GOPATH_VALUE" \
-  go build -o "$BIN_PATH" ./cmd/openai-personal-proxy
+  go build -o "$BIN_PATH" ./cmd/torod
 }
 
 cleanup() {

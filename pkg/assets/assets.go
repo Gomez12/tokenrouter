@@ -8,7 +8,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 //go:embed files/templates/*.html files/popular-providers.json files/static/*
@@ -27,8 +27,10 @@ type PopularProvider struct {
 	AuthPortalURL            string              `json:"auth_portal_url,omitempty"`
 	DeviceBindingURL         string              `json:"device_binding_url,omitempty"`
 	DeviceCodeURL            string              `json:"device_code_url,omitempty"`
+	DeviceTokenURL           string              `json:"device_token_url,omitempty"`
 	DeviceClientID           string              `json:"device_client_id,omitempty"`
 	DeviceScope              string              `json:"device_scope,omitempty"`
+	DeviceGrantType          string              `json:"device_grant_type,omitempty"`
 	DeviceCodeParam          string              `json:"device_code_param,omitempty"`
 	OAuthAuthorizeURL        string              `json:"oauth_authorize_url,omitempty"`
 	OAuthTokenURL            string              `json:"oauth_token_url,omitempty"`

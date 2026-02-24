@@ -16,8 +16,11 @@ import (
 )
 
 const (
-	defaultConfigFileName = "config.toml"
-	legacyConfigFileName  = "server.toml"
+	defaultConfigFileName = "torod.toml"
+
+	TokenRoleAdmin     = "admin"
+	TokenRoleKeymaster = "keymaster"
+	TokenRoleInferrer  = "inferrer"
 )
 
 type ProviderConfig struct {
@@ -45,6 +48,8 @@ type TLSConfig struct {
 type IncomingAPIToken struct {
 	ID        string `toml:"id"`
 	Name      string `toml:"name"`
+	Role      string `toml:"role,omitempty"`
+	ParentID  string `toml:"parent_id,omitempty"`
 	Comment   string `toml:"comment,omitempty"`
 	Key       string `toml:"key"`
 	ExpiresAt string `toml:"expires_at,omitempty"`
@@ -53,15 +58,18 @@ type IncomingAPIToken struct {
 
 type ServerConfig struct {
 	ListenAddr                    string             `toml:"listen_addr"`
-	IncomingAPIKeys               []string           `toml:"incoming_api_keys"`
 	IncomingTokens                []IncomingAPIToken `toml:"incoming_tokens"`
 	AllowLocalhostNoAuth          bool               `toml:"allow_localhost_no_auth"`
 	AllowHostDockerInternalNoAuth bool               `toml:"allow_host_docker_internal_no_auth"`
 	AutoEnablePublicFreeModels    bool               `toml:"auto_enable_public_free_models"`
-	AdminAPIKey                   string             `toml:"admin_api_key"`
 	DefaultProvider               string             `toml:"default_provider"`
 	Providers                     []ProviderConfig   `toml:"providers"`
 	TLS                           TLSConfig          `toml:"tls"`
+}
+
+type ClientConfig struct {
+	ServerURL string `toml:"server_url"`
+	APIKey    string `toml:"api_key,omitempty"`
 }
 
 func DefaultServerConfigPath() string {
@@ -69,7 +77,15 @@ func DefaultServerConfigPath() string {
 	if err != nil {
 		return defaultConfigFileName
 	}
-	return filepath.Join(home, ".config", "openai-personal-proxy", defaultConfigFileName)
+	return filepath.Join(home, ".config", "tokenrouter", defaultConfigFileName)
+}
+
+func DefaultClientConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "toro.toml"
+	}
+	return filepath.Join(home, ".config", "tokenrouter", "toro.toml")
 }
 
 func DefaultPricingCachePath() string {
@@ -77,7 +93,7 @@ func DefaultPricingCachePath() string {
 	if err != nil {
 		return "pricing-cache.json"
 	}
-	return filepath.Join(home, ".cache", "openai-personal-proxy", "pricing-cache.json")
+	return filepath.Join(home, ".cache", "tokenrouter", "pricing-cache.json")
 }
 
 func DefaultUsageStatsPath() string {
@@ -85,7 +101,7 @@ func DefaultUsageStatsPath() string {
 	if err != nil {
 		return "usage-stats.json"
 	}
-	return filepath.Join(home, ".cache", "openai-personal-proxy", "usage-stats.json")
+	return filepath.Join(home, ".cache", "tokenrouter", "usage-stats.json")
 }
 
 func DefaultModelsCachePath() string {
@@ -93,45 +109,82 @@ func DefaultModelsCachePath() string {
 	if err != nil {
 		return "models-cache.json"
 	}
-	return filepath.Join(home, ".cache", "openai-personal-proxy", "models-cache.json")
+	return filepath.Join(home, ".cache", "tokenrouter", "models-cache.json")
 }
 
 func NewDefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
 		ListenAddr:      ":8080",
-		IncomingAPIKeys: []string{"change-me"},
-		IncomingTokens: []IncomingAPIToken{
-			{
-				ID:   "default-change-me",
-				Name: "Default Token",
-				Key:  "change-me",
-			},
-		},
-		AdminAPIKey:     "change-admin-key",
+		IncomingTokens:  []IncomingAPIToken{},
 		DefaultProvider: "",
 		Providers:       []ProviderConfig{},
 		TLS: TLSConfig{
 			Enabled:  false,
 			Domain:   "",
 			Email:    "",
-			CacheDir: filepath.Join(os.TempDir(), "openai-personal-proxy-autocert"),
+			CacheDir: filepath.Join(os.TempDir(), "tokenrouter-autocert"),
 		},
 	}
 }
 
+func HasAdminToken(tokens []IncomingAPIToken) bool {
+	now := time.Now().UTC()
+	for _, t := range tokens {
+		if NormalizeIncomingTokenRole(t.Role) != TokenRoleAdmin {
+			continue
+		}
+		if strings.TrimSpace(t.Key) == "" {
+			continue
+		}
+		if exp := strings.TrimSpace(t.ExpiresAt); exp != "" {
+			ts, err := time.Parse(time.RFC3339, exp)
+			if err != nil || !now.Before(ts) {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func NewDefaultClientConfig() *ClientConfig {
+	return &ClientConfig{
+		ServerURL: "http://127.0.0.1:8080/v1",
+	}
+}
+
+func LoadClientConfig(path string) (*ClientConfig, error) {
+	cfg := NewDefaultClientConfig()
+	if err := load(path, cfg); err != nil {
+		return nil, err
+	}
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func LoadOrCreateClientConfig(path string) (*ClientConfig, error) {
+	cfg := NewDefaultClientConfig()
+	if err := loadOrCreate(path, cfg); err != nil {
+		return nil, err
+	}
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
 func LoadServerConfig(path string) (*ServerConfig, error) {
 	cfg := NewDefaultServerConfig()
-	sourcePath, err := resolveConfigReadPath(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read config: %w", err)
 	}
-	if err := load(sourcePath, cfg); err != nil {
+	if err := unmarshalServerConfigTOML(b, cfg); err != nil {
 		return nil, err
-	}
-	if sourcePath != path {
-		if err := Save(path, cfg); err != nil {
-			return nil, fmt.Errorf("migrate legacy config: %w", err)
-		}
 	}
 	cfg.Normalize()
 	if err := cfg.Validate(); err != nil {
@@ -156,11 +209,7 @@ func loadOrCreate(path string, v any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}
-	readPath, err := resolveConfigReadPath(path)
-	if err != nil {
-		return err
-	}
-	_, err = os.Stat(readPath)
+	_, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := writeAtomic(path, v); err != nil {
 			return fmt.Errorf("write default config: %w", err)
@@ -170,17 +219,12 @@ func loadOrCreate(path string, v any) error {
 	if err != nil {
 		return fmt.Errorf("stat config: %w", err)
 	}
-	b, err := os.ReadFile(readPath)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
 	}
 	if err := toml.Unmarshal(b, v); err != nil {
 		return fmt.Errorf("parse toml: %w", err)
-	}
-	if readPath != path {
-		if err := writeAtomic(path, v); err != nil {
-			return fmt.Errorf("migrate legacy config: %w", err)
-		}
 	}
 	return nil
 }
@@ -192,6 +236,57 @@ func load(path string, v any) error {
 	}
 	if err := toml.Unmarshal(b, v); err != nil {
 		return fmt.Errorf("parse toml: %w", err)
+	}
+	return nil
+}
+
+func unmarshalServerConfigTOML(b []byte, cfg *ServerConfig) error {
+	type legacyServerConfig struct {
+		ServerConfig
+		IncomingAPIKeys []string `toml:"incoming_api_keys"`
+		AdminAPIKey     string   `toml:"admin_api_key"`
+	}
+	var raw legacyServerConfig
+	if err := toml.Unmarshal(b, &raw); err != nil {
+		return fmt.Errorf("parse toml: %w", err)
+	}
+	*cfg = raw.ServerConfig
+	if len(cfg.IncomingTokens) == 0 && len(raw.IncomingAPIKeys) > 0 {
+		cfg.IncomingTokens = make([]IncomingAPIToken, 0, len(raw.IncomingAPIKeys))
+		for i, k := range raw.IncomingAPIKeys {
+			k = strings.TrimSpace(k)
+			if k == "" {
+				continue
+			}
+			cfg.IncomingTokens = append(cfg.IncomingTokens, IncomingAPIToken{
+				ID:   tokenID(k, i),
+				Name: fmt.Sprintf("Token %d", len(cfg.IncomingTokens)+1),
+				Role: TokenRoleInferrer,
+				Key:  k,
+			})
+		}
+	}
+	legacyAdminKey := strings.TrimSpace(raw.AdminAPIKey)
+	if legacyAdminKey != "" {
+		matched := false
+		for i := range cfg.IncomingTokens {
+			if strings.TrimSpace(cfg.IncomingTokens[i].Key) != legacyAdminKey {
+				continue
+			}
+			cfg.IncomingTokens[i].Role = TokenRoleAdmin
+			if strings.TrimSpace(cfg.IncomingTokens[i].Name) == "" {
+				cfg.IncomingTokens[i].Name = "Admin"
+			}
+			matched = true
+		}
+		if !matched {
+			cfg.IncomingTokens = append(cfg.IncomingTokens, IncomingAPIToken{
+				ID:   tokenID(legacyAdminKey, len(cfg.IncomingTokens)),
+				Name: "Admin",
+				Role: TokenRoleAdmin,
+				Key:  legacyAdminKey,
+			})
+		}
 	}
 	return nil
 }
@@ -232,63 +327,20 @@ func marshalTOML(v any) ([]byte, error) {
 	return out, nil
 }
 
-func resolveConfigReadPath(path string) (string, error) {
-	if path == "" {
-		return "", os.ErrNotExist
-	}
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("stat config: %w", err)
-	}
-	if filepath.Base(path) != defaultConfigFileName {
-		return path, nil
-	}
-	legacyPath := filepath.Join(filepath.Dir(path), legacyConfigFileName)
-	if _, err := os.Stat(legacyPath); err == nil {
-		return legacyPath, nil
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("stat legacy config: %w", err)
-	}
-	return path, nil
-}
-
 func (c *ServerConfig) Normalize() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = ":8080"
 	}
 	if c.TLS.CacheDir == "" {
-		c.TLS.CacheDir = filepath.Join(os.TempDir(), "openai-personal-proxy-autocert")
-	}
-	seen := map[string]struct{}{}
-	keys := c.IncomingAPIKeys[:0]
-	for _, k := range c.IncomingAPIKeys {
-		k = strings.TrimSpace(k)
-		if k == "" {
-			continue
-		}
-		if _, ok := seen[k]; ok {
-			continue
-		}
-		seen[k] = struct{}{}
-		keys = append(keys, k)
-	}
-	c.IncomingAPIKeys = keys
-	if len(c.IncomingTokens) == 0 && len(c.IncomingAPIKeys) > 0 {
-		c.IncomingTokens = make([]IncomingAPIToken, 0, len(c.IncomingAPIKeys))
-		for i, k := range c.IncomingAPIKeys {
-			c.IncomingTokens = append(c.IncomingTokens, IncomingAPIToken{
-				ID:   tokenID(k, i),
-				Name: fmt.Sprintf("Token %d", i+1),
-				Key:  k,
-			})
-		}
+		c.TLS.CacheDir = filepath.Join(os.TempDir(), "tokenrouter-autocert")
 	}
 	tokenSeen := map[string]struct{}{}
 	tokens := make([]IncomingAPIToken, 0, len(c.IncomingTokens))
 	for i, t := range c.IncomingTokens {
 		t.ID = strings.TrimSpace(t.ID)
 		t.Name = strings.TrimSpace(t.Name)
+		t.Role = NormalizeIncomingTokenRole(t.Role)
+		t.ParentID = strings.TrimSpace(t.ParentID)
 		t.Comment = strings.TrimSpace(t.Comment)
 		t.Key = strings.TrimSpace(t.Key)
 		t.ExpiresAt = strings.TrimSpace(t.ExpiresAt)
@@ -309,10 +361,6 @@ func (c *ServerConfig) Normalize() {
 		tokens = append(tokens, t)
 	}
 	c.IncomingTokens = tokens
-	c.IncomingAPIKeys = c.IncomingAPIKeys[:0]
-	for _, t := range c.IncomingTokens {
-		c.IncomingAPIKeys = append(c.IncomingAPIKeys, t.Key)
-	}
 	for i := range c.Providers {
 		c.Providers[i].Name = strings.TrimSpace(c.Providers[i].Name)
 		c.Providers[i].ProviderType = strings.TrimSpace(c.Providers[i].ProviderType)
@@ -332,9 +380,6 @@ func (c *ServerConfig) Normalize() {
 }
 
 func (c *ServerConfig) Validate() error {
-	if len(c.IncomingTokens) == 0 {
-		return errors.New("incoming_tokens must contain at least one token")
-	}
 	idSeen := map[string]struct{}{}
 	for _, t := range c.IncomingTokens {
 		if t.ID == "" {
@@ -346,6 +391,10 @@ func (c *ServerConfig) Validate() error {
 		idSeen[t.ID] = struct{}{}
 		if t.Name == "" {
 			return fmt.Errorf("incoming token %q name cannot be empty", t.ID)
+		}
+		t.Role = NormalizeIncomingTokenRole(t.Role)
+		if t.Role == "" {
+			return fmt.Errorf("incoming token %q has invalid role", t.ID)
 		}
 		if t.Key == "" {
 			return fmt.Errorf("incoming token %q key cannot be empty", t.ID)
@@ -382,6 +431,21 @@ func (c *ServerConfig) Validate() error {
 	return nil
 }
 
+func (c *ClientConfig) Normalize() {
+	c.ServerURL = strings.TrimSpace(c.ServerURL)
+	c.APIKey = strings.TrimSpace(c.APIKey)
+	if c.ServerURL == "" {
+		c.ServerURL = "http://127.0.0.1:8080/v1"
+	}
+}
+
+func (c *ClientConfig) Validate() error {
+	if strings.TrimSpace(c.ServerURL) == "" {
+		return errors.New("server_url cannot be empty")
+	}
+	return nil
+}
+
 type ServerConfigStore struct {
 	mu   sync.RWMutex
 	path string
@@ -396,7 +460,6 @@ func (s *ServerConfigStore) Snapshot() ServerConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	cp := *s.cfg
-	cp.IncomingAPIKeys = append([]string(nil), s.cfg.IncomingAPIKeys...)
 	cp.IncomingTokens = append([]IncomingAPIToken(nil), s.cfg.IncomingTokens...)
 	cp.Providers = append([]ProviderConfig(nil), s.cfg.Providers...)
 	return cp
@@ -406,7 +469,6 @@ func (s *ServerConfigStore) Update(mutator func(*ServerConfig) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := *s.cfg
-	cp.IncomingAPIKeys = append([]string(nil), s.cfg.IncomingAPIKeys...)
 	cp.IncomingTokens = append([]IncomingAPIToken(nil), s.cfg.IncomingTokens...)
 	cp.Providers = append([]ProviderConfig(nil), s.cfg.Providers...)
 	if err := mutator(&cp); err != nil {
@@ -427,4 +489,17 @@ func tokenID(key string, idx int) string {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(key))
 	return fmt.Sprintf("tok-%d-%x", idx+1, h.Sum64())
+}
+
+func NormalizeIncomingTokenRole(role string) string {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "", TokenRoleInferrer:
+		return TokenRoleInferrer
+	case TokenRoleAdmin:
+		return TokenRoleAdmin
+	case TokenRoleKeymaster:
+		return TokenRoleKeymaster
+	default:
+		return ""
+	}
 }

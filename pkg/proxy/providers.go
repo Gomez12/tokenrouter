@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/provider"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/provider"
 )
 
 type ModelCard = provider.ModelCard

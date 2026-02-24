@@ -1,4 +1,4 @@
-module github.com/lkarlslund/openai-personal-proxy
+module github.com/lkarlslund/tokenrouter
 
 go 1.25.7
 

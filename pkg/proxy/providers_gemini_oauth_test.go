@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 func TestProviderClientListModelsGoogleGeminiOAuth(t *testing.T) {

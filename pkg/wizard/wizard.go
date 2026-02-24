@@ -7,16 +7,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 func RunServerWizard(path string, cfg *config.ServerConfig) error {
 	in := bufio.NewScanner(os.Stdin)
 	fmt.Println("Server configuration wizard")
 	cfg.ListenAddr = ask(in, "Public listen address", cfg.ListenAddr)
-	keys := ask(in, "Incoming API keys (comma-separated)", strings.Join(cfg.IncomingAPIKeys, ","))
-	cfg.IncomingAPIKeys = splitCSV(keys)
-	cfg.AdminAPIKey = ask(in, "Admin API key", cfg.AdminAPIKey)
 	cfg.DefaultProvider = ask(in, "Default provider name", cfg.DefaultProvider)
 
 	tlsEnabled := ask(in, "Enable Let's Encrypt TLS? (y/N)", boolStr(cfg.TLS.Enabled))
@@ -72,24 +69,6 @@ func ask(in *bufio.Scanner, label, def string) string {
 		return def
 	}
 	return txt
-}
-
-func splitCSV(v string) []string {
-	parts := strings.Split(v, ",")
-	out := make([]string, 0, len(parts))
-	seen := map[string]struct{}{}
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
-	}
-	return out
 }
 
 func boolStr(v bool) string {

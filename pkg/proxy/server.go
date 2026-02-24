@@ -20,9 +20,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/cache"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/pricing"
+	"github.com/lkarlslund/tokenrouter/pkg/cache"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/pricing"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -216,8 +216,13 @@ func (s *Server) authAPIMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if !keyAllowed(bearerToken(r.Header), cfg.IncomingTokens, cfg.IncomingAPIKeys) {
+		identity, ok := resolveAuthIdentity(bearerToken(r.Header), cfg)
+		if !ok {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if identity.Role != config.TokenRoleAdmin && identity.Role != config.TokenRoleInferrer {
+			http.Error(w, "forbidden: token role cannot use inference api", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -306,8 +311,22 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		}
-		promptTPS, genTPS := computePromptAndGenerationTPS(usage.PromptTokens, usage.CompletionTokens, initialLatency, latency)
-		s.recordUsageMeasured(provider.Name, model, upstreamModel, statusCode, latency, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, promptTPS, genTPS, clientMeta)
+		promptTPS := usage.PromptTPS
+		genTPS := usage.GenTPS
+		if !usage.HasPromptTPS || !usage.HasGenTPS {
+			fallbackPromptTPS, fallbackGenTPS := computePromptAndGenerationTPS(usage.PromptTokens, usage.CompletionTokens, initialLatency, latency)
+			if !usage.HasPromptTPS {
+				promptTPS = fallbackPromptTPS
+			}
+			if !usage.HasGenTPS {
+				genTPS = fallbackGenTPS
+			}
+		}
+		usageLatency := latency
+		if usage.HasProviderTotalSeconds && usage.ProviderTotalSeconds > 0 {
+			usageLatency = durationFromProviderSeconds(usage.ProviderTotalSeconds)
+		}
+		s.recordUsageMeasured(provider.Name, model, upstreamModel, statusCode, usageLatency, usage.PromptTokens, usage.PromptCachedTokens, usage.CompletionTokens, usage.TotalTokens, promptTPS, genTPS, clientMeta)
 		return
 	}
 
@@ -335,13 +354,28 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(respBody)
 
 	promptTokens, completionTokens, totalTokens := parseUsageTokens(respBody)
+	metrics := parseProviderUsageMetrics(respBody)
 	if totalTokens == 0 {
 		promptTokens = estimatePromptTokensFromRequest(body)
 		completionTokens = estimateCompletionTokensFromResponse(respBody)
 		totalTokens = promptTokens + completionTokens
 	}
-	promptTPS, genTPS := computePromptAndGenerationTPS(promptTokens, completionTokens, initialLatency, latency)
-	s.recordUsageMeasured(provider.Name, model, upstreamModel, statusCode, latency, promptTokens, completionTokens, totalTokens, promptTPS, genTPS, clientMeta)
+	promptTPS := metrics.PromptTPS
+	genTPS := metrics.GenTPS
+	if !metrics.HasPromptTPS || !metrics.HasGenTPS {
+		fallbackPromptTPS, fallbackGenTPS := computePromptAndGenerationTPS(promptTokens, completionTokens, initialLatency, latency)
+		if !metrics.HasPromptTPS {
+			promptTPS = fallbackPromptTPS
+		}
+		if !metrics.HasGenTPS {
+			genTPS = fallbackGenTPS
+		}
+	}
+	usageLatency := latency
+	if metrics.HasTotalSeconds && metrics.TotalSeconds > 0 {
+		usageLatency = durationFromProviderSeconds(metrics.TotalSeconds)
+	}
+	s.recordUsageMeasured(provider.Name, model, upstreamModel, statusCode, usageLatency, promptTokens, metrics.PromptCachedTokens, completionTokens, totalTokens, promptTPS, genTPS, clientMeta)
 }
 
 func (s *Server) prepareUpstreamRequest(body []byte) (incomingModel string, outBody []byte, provider config.ProviderConfig, upstreamModel string, stream bool, err error) {
@@ -418,13 +452,22 @@ func (s *Server) forwardRequest(ctx context.Context, provider config.ProviderCon
 
 type usageTokenCounts struct {
 	PromptTokens              int
+	PromptCachedTokens        int
 	CompletionTokens          int
 	TotalTokens               int
 	EstimatedCompletionTokens int
+	PromptTPS                 float64
+	GenTPS                    float64
+	HasPromptTPS              bool
+	HasGenTPS                 bool
+	ProviderQueueSeconds      float64
+	ProviderTotalSeconds      float64
+	HasProviderTotalSeconds   bool
 }
 
 type clientUsageMeta struct {
 	ClientType string
+	UserAgent  string
 	ClientIP   string
 	APIKeyName string
 }
@@ -546,10 +589,10 @@ func (s *Server) recordUsage(providerName, incomingModel, upstreamModel string, 
 
 func (s *Server) recordUsageWithTokens(providerName, incomingModel, upstreamModel string, status int, latency time.Duration, promptTokens int, completionTokens int, totalTokens int) {
 	promptTPS, genTPS := computePromptAndGenerationTPS(promptTokens, completionTokens, latency, latency)
-	s.recordUsageMeasured(providerName, incomingModel, upstreamModel, status, latency, promptTokens, completionTokens, totalTokens, promptTPS, genTPS, clientUsageMeta{})
+	s.recordUsageMeasured(providerName, incomingModel, upstreamModel, status, latency, promptTokens, 0, completionTokens, totalTokens, promptTPS, genTPS, clientUsageMeta{})
 }
 
-func (s *Server) recordUsageMeasured(providerName, incomingModel, upstreamModel string, status int, latency time.Duration, promptTokens int, completionTokens int, totalTokens int, promptTPS float64, genTPS float64, meta clientUsageMeta) {
+func (s *Server) recordUsageMeasured(providerName, incomingModel, upstreamModel string, status int, latency time.Duration, promptTokens int, promptCachedTokens int, completionTokens int, totalTokens int, promptTPS float64, genTPS float64, meta clientUsageMeta) {
 	if status < 200 || status > 299 {
 		return
 	}
@@ -558,9 +601,11 @@ func (s *Server) recordUsageMeasured(providerName, incomingModel, upstreamModel 
 		Provider:       providerName,
 		Model:          incomingModel,
 		ClientType:     strings.TrimSpace(meta.ClientType),
+		UserAgent:      strings.TrimSpace(meta.UserAgent),
 		ClientIP:       strings.TrimSpace(meta.ClientIP),
 		APIKeyName:     strings.TrimSpace(meta.APIKeyName),
 		PromptTokens:   promptTokens,
+		PromptCached:   promptCachedTokens,
 		CompletionToks: completionTokens,
 		TotalTokens:    totalTokens,
 		LatencyMS:      latency.Milliseconds(),
@@ -579,6 +624,96 @@ func parseUsageTokens(responseBody []byte) (promptTokens int, completionTokens i
 		return 0, 0, 0
 	}
 	return findUsageTokens(payload)
+}
+
+type providerUsageMetrics struct {
+	PromptCachedTokens int
+	PromptTPS          float64
+	GenTPS             float64
+	HasPromptTPS       bool
+	HasGenTPS          bool
+	QueueSeconds       float64
+	TotalSeconds       float64
+	HasTotalSeconds    bool
+}
+
+func parseProviderUsageMetrics(responseBody []byte) providerUsageMetrics {
+	if len(responseBody) == 0 {
+		return providerUsageMetrics{}
+	}
+	var payload any
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return providerUsageMetrics{}
+	}
+	return findProviderUsageMetrics(payload)
+}
+
+func findProviderUsageMetrics(payload any) providerUsageMetrics {
+	out := providerUsageMetrics{}
+	bestCached := 0
+	bestTotalSeconds := 0.0
+	var walk func(v any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			cached := 0
+			if usageMap, ok := x["usage"].(map[string]any); ok {
+				if detailsMap, ok2 := usageMap["prompt_tokens_details"].(map[string]any); ok2 {
+					cached = int(firstFloat(detailsMap, "cached_tokens"))
+				}
+				promptTime := firstFloat(usageMap, "prompt_time")
+				completionTime := firstFloat(usageMap, "completion_time")
+				queueTime := firstFloat(usageMap, "queue_time")
+				totalTime := firstFloat(usageMap, "total_time")
+				if ti, ok2 := x["time_info"].(map[string]any); ok2 {
+					if promptTime <= 0 {
+						promptTime = firstFloat(ti, "prompt_time")
+					}
+					if completionTime <= 0 {
+						completionTime = firstFloat(ti, "completion_time")
+					}
+					if queueTime <= 0 {
+						queueTime = firstFloat(ti, "queue_time")
+					}
+					if totalTime <= 0 {
+						totalTime = firstFloat(ti, "total_time")
+					}
+				}
+				promptTokens := firstFloat(usageMap, "prompt_tokens", "input_tokens")
+				completionTokens := firstFloat(usageMap, "completion_tokens", "output_tokens")
+				if promptTime > 0 && promptTokens > 0 {
+					out.PromptTPS = promptTokens / promptTime
+					out.HasPromptTPS = true
+				}
+				if completionTime > 0 && completionTokens > 0 {
+					out.GenTPS = completionTokens / completionTime
+					out.HasGenTPS = true
+				}
+				if totalTime <= 0 {
+					totalTime = queueTime + promptTime + completionTime
+				}
+				if totalTime > bestTotalSeconds {
+					bestTotalSeconds = totalTime
+					out.QueueSeconds = queueTime
+					out.TotalSeconds = totalTime
+					out.HasTotalSeconds = totalTime > 0
+				}
+			}
+			if cached > bestCached {
+				bestCached = cached
+				out.PromptCachedTokens = cached
+			}
+			for _, vv := range x {
+				walk(vv)
+			}
+		case []any:
+			for _, vv := range x {
+				walk(vv)
+			}
+		}
+	}
+	walk(payload)
+	return out
 }
 
 type sseUsageParser struct {
@@ -610,7 +745,8 @@ func (p *sseUsageParser) Consume(chunk []byte) {
 			continue
 		}
 		prompt, completion, total := parseUsageTokens([]byte(data))
-		p.merge(prompt, completion, total)
+		metrics := parseProviderUsageMetrics([]byte(data))
+		p.merge(prompt, metrics.PromptCachedTokens, completion, total, metrics)
 		if p.usage.TotalTokens == 0 {
 			p.usage.EstimatedCompletionTokens += estimateCompletionTokensFromResponse([]byte(data))
 		}
@@ -621,17 +757,33 @@ func (p *sseUsageParser) Usage() usageTokenCounts {
 	return p.usage
 }
 
-func (p *sseUsageParser) merge(prompt int, completion int, total int) {
+func (p *sseUsageParser) merge(prompt int, promptCached int, completion int, total int, metrics providerUsageMetrics) {
 	if total > p.usage.TotalTokens {
 		p.usage.PromptTokens = prompt
+		p.usage.PromptCachedTokens = promptCached
 		p.usage.CompletionTokens = completion
 		p.usage.TotalTokens = total
-		return
-	}
-	if p.usage.TotalTokens == 0 && (prompt > 0 || completion > 0) {
+	} else if p.usage.TotalTokens == 0 && (prompt > 0 || completion > 0) {
 		p.usage.PromptTokens = prompt
+		p.usage.PromptCachedTokens = promptCached
 		p.usage.CompletionTokens = completion
 		p.usage.TotalTokens = prompt + completion
+	}
+	if promptCached > p.usage.PromptCachedTokens {
+		p.usage.PromptCachedTokens = promptCached
+	}
+	if metrics.HasPromptTPS {
+		p.usage.PromptTPS = metrics.PromptTPS
+		p.usage.HasPromptTPS = true
+	}
+	if metrics.HasGenTPS {
+		p.usage.GenTPS = metrics.GenTPS
+		p.usage.HasGenTPS = true
+	}
+	if metrics.HasTotalSeconds && metrics.TotalSeconds > p.usage.ProviderTotalSeconds {
+		p.usage.ProviderQueueSeconds = metrics.QueueSeconds
+		p.usage.ProviderTotalSeconds = metrics.TotalSeconds
+		p.usage.HasProviderTotalSeconds = true
 	}
 }
 
@@ -715,11 +867,25 @@ func firstFloat(m map[string]any, keys ...string) float64 {
 
 func extractClientUsageMeta(r *http.Request, cfg config.ServerConfig) clientUsageMeta {
 	token := strings.TrimSpace(bearerToken(r.Header))
+	uaRaw := strings.TrimSpace(r.Header.Get("User-Agent"))
 	return clientUsageMeta{
-		ClientType: classifyClientType(r.Header.Get("User-Agent")),
+		ClientType: classifyClientType(uaRaw),
+		UserAgent:  normalizeUserAgent(uaRaw),
 		ClientIP:   requestClientIP(r),
 		APIKeyName: resolveIncomingTokenName(token, cfg),
 	}
+}
+
+func normalizeUserAgent(userAgent string) string {
+	ua := strings.TrimSpace(userAgent)
+	if ua == "" {
+		return "unknown"
+	}
+	const maxLen = 200
+	if len(ua) <= maxLen {
+		return ua
+	}
+	return strings.TrimSpace(ua[:maxLen]) + "..."
 }
 
 func requestClientIP(r *http.Request) string {
@@ -830,6 +996,17 @@ func computePromptAndGenerationTPS(promptTokens int, completionTokens int, initi
 		genTPS = maxMeasuredTPS
 	}
 	return promptTPS, genTPS
+}
+
+func durationFromProviderSeconds(seconds float64) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	d := time.Duration(seconds * float64(time.Second))
+	if d <= 0 {
+		return time.Millisecond
+	}
+	return d
 }
 
 func estimatePromptTokensFromRequest(requestBody []byte) int {

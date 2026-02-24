@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 func TestRecordUsageCountsRequestWithoutUsagePayload(t *testing.T) {
@@ -108,6 +108,170 @@ func TestParseUsageTokensFindsNestedUsage(t *testing.T) {
 	p, c, total := parseUsageTokens(body)
 	if p != 2 || c != 5 || total != 7 {
 		t.Fatalf("unexpected usage parse result p=%d c=%d t=%d", p, c, total)
+	}
+}
+
+func TestParseProviderUsageMetricsExtractsTimeInfoAndCachedTokens(t *testing.T) {
+	body := []byte(`{
+		"usage":{
+			"prompt_tokens":36,
+			"completion_tokens":1,
+			"total_tokens":37,
+			"prompt_tokens_details":{"cached_tokens":12}
+		},
+		"time_info":{"prompt_time":0.002,"completion_time":0.001}
+	}`)
+	m := parseProviderUsageMetrics(body)
+	if m.PromptCachedTokens != 12 {
+		t.Fatalf("expected cached tokens 12, got %d", m.PromptCachedTokens)
+	}
+	if !m.HasPromptTPS || !m.HasGenTPS {
+		t.Fatalf("expected both tps flags true, got prompt=%v gen=%v", m.HasPromptTPS, m.HasGenTPS)
+	}
+	if m.PromptTPS < 17999 || m.PromptTPS > 18001 {
+		t.Fatalf("unexpected prompt tps: %f", m.PromptTPS)
+	}
+	if m.GenTPS < 999 || m.GenTPS > 1001 {
+		t.Fatalf("unexpected gen tps: %f", m.GenTPS)
+	}
+}
+
+func TestParseProviderUsageMetricsExtractsUsageTimingFields(t *testing.T) {
+	body := []byte(`{
+		"usage":{
+			"prompt_tokens":20,
+			"completion_tokens":10,
+			"total_tokens":30,
+			"queue_time":0.2,
+			"prompt_time":0.5,
+			"completion_time":0.25
+		}
+	}`)
+	m := parseProviderUsageMetrics(body)
+	if !m.HasPromptTPS || !m.HasGenTPS {
+		t.Fatalf("expected prompt/gen tps from usage timings, got prompt=%v gen=%v", m.HasPromptTPS, m.HasGenTPS)
+	}
+	if m.PromptTPS < 39.9 || m.PromptTPS > 40.1 {
+		t.Fatalf("unexpected prompt tps: %f", m.PromptTPS)
+	}
+	if m.GenTPS < 39.9 || m.GenTPS > 40.1 {
+		t.Fatalf("unexpected gen tps: %f", m.GenTPS)
+	}
+	if !m.HasTotalSeconds {
+		t.Fatalf("expected total seconds from usage timings")
+	}
+	if m.TotalSeconds < 0.949 || m.TotalSeconds > 0.951 {
+		t.Fatalf("expected total seconds 0.95, got %f", m.TotalSeconds)
+	}
+	if m.QueueSeconds < 0.199 || m.QueueSeconds > 0.201 {
+		t.Fatalf("expected queue seconds 0.2, got %f", m.QueueSeconds)
+	}
+}
+
+func TestProxyHandlerUsesProviderReportedTimeInfoAndCachedTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-1",
+			"usage":{
+				"prompt_tokens":36,
+				"completion_tokens":1,
+				"total_tokens":37,
+				"prompt_tokens_details":{"cached_tokens":10}
+			},
+			"time_info":{"prompt_time":0.002,"completion_time":0.001}
+		}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{
+		{
+			Name:           "test-provider",
+			BaseURL:        upstream.URL + "/v1",
+			APIKey:         "test-key",
+			Enabled:        true,
+			TimeoutSeconds: 10,
+		},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	resolver := NewProviderResolver(store)
+	s := &Server{
+		store:                 store,
+		resolver:              resolver,
+		stats:                 NewStatsStore(100),
+		providerHealthChecker: NewProviderHealthChecker(resolver, providerHealthCheckInterval),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-provider/test-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.proxyHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	summary := s.stats.Summary(time.Hour)
+	if summary.PromptCachedTokens != 10 {
+		t.Fatalf("expected cached prompt tokens 10, got %d", summary.PromptCachedTokens)
+	}
+	if summary.AvgPromptTPS < 1999 || summary.AvgPromptTPS > 2001 {
+		t.Fatalf("expected prompt tps to use provider time_info then clamp to 2000, got %f", summary.AvgPromptTPS)
+	}
+	if summary.AvgGenerationTPS < 999 || summary.AvgGenerationTPS > 1001 {
+		t.Fatalf("expected gen tps from provider time_info, got %f", summary.AvgGenerationTPS)
+	}
+}
+
+func TestProxyHandlerUsesProviderTotalTimeForLatency(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-1",
+			"usage":{
+				"prompt_tokens":20,
+				"completion_tokens":10,
+				"total_tokens":30,
+				"queue_time":0.2,
+				"prompt_time":0.5,
+				"completion_time":0.25
+			}
+		}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{
+		{
+			Name:           "test-provider",
+			BaseURL:        upstream.URL + "/v1",
+			APIKey:         "test-key",
+			Enabled:        true,
+			TimeoutSeconds: 10,
+		},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	resolver := NewProviderResolver(store)
+	s := &Server{
+		store:                 store,
+		resolver:              resolver,
+		stats:                 NewStatsStore(100),
+		providerHealthChecker: NewProviderHealthChecker(resolver, providerHealthCheckInterval),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-provider/test-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.proxyHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	summary := s.stats.Summary(time.Hour)
+	if summary.AvgLatencyMS < 949 || summary.AvgLatencyMS > 951 {
+		t.Fatalf("expected avg latency from provider total_time (950ms), got %f", summary.AvgLatencyMS)
 	}
 }
 

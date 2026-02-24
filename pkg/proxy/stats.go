@@ -20,9 +20,11 @@ type UsageEvent struct {
 	Provider       string    `json:"provider"`
 	Model          string    `json:"model"`
 	ClientType     string    `json:"client_type,omitempty"`
+	UserAgent      string    `json:"user_agent,omitempty"`
 	ClientIP       string    `json:"client_ip,omitempty"`
 	APIKeyName     string    `json:"api_key_name,omitempty"`
 	PromptTokens   int       `json:"prompt_tokens"`
+	PromptCached   int       `json:"prompt_cached_tokens,omitempty"`
 	CompletionToks int       `json:"completion_tokens"`
 	TotalTokens    int       `json:"total_tokens"`
 	LatencyMS      int64     `json:"latency_ms"`
@@ -34,6 +36,7 @@ type StatsSummary struct {
 	PeriodSeconds         int64                            `json:"period_seconds"`
 	Requests              int                              `json:"requests"`
 	PromptTokens          int                              `json:"prompt_tokens"`
+	PromptCachedTokens    int                              `json:"prompt_cached_tokens,omitempty"`
 	CompletionTokens      int                              `json:"completion_tokens"`
 	TotalTokens           int                              `json:"total_tokens"`
 	AvgLatencyMS          float64                          `json:"avg_latency_ms"`
@@ -45,6 +48,7 @@ type StatsSummary struct {
 	RequestsPerProvider   map[string]int                   `json:"requests_per_provider"`
 	RequestsPerModel      map[string]int                   `json:"requests_per_model"`
 	RequestsPerClientType map[string]int                   `json:"requests_per_client_type,omitempty"`
+	RequestsPerUserAgent  map[string]int                   `json:"requests_per_user_agent,omitempty"`
 	RequestsPerClientIP   map[string]int                   `json:"requests_per_client_ip,omitempty"`
 	RequestsPerAPIKeyName map[string]int                   `json:"requests_per_api_key_name,omitempty"`
 	Buckets               []UsageBucket                    `json:"buckets,omitempty"`
@@ -78,10 +82,12 @@ type UsageBucket struct {
 	Provider         string    `json:"provider"`
 	Model            string    `json:"model"`
 	ClientType       string    `json:"client_type,omitempty"`
+	UserAgent        string    `json:"user_agent,omitempty"`
 	ClientIP         string    `json:"client_ip,omitempty"`
 	APIKeyName       string    `json:"api_key_name,omitempty"`
 	Requests         int       `json:"requests"`
 	PromptTokens     int       `json:"prompt_tokens"`
+	PromptCached     int       `json:"prompt_cached_tokens,omitempty"`
 	CompletionTokens int       `json:"completion_tokens"`
 	TotalTokens      int       `json:"total_tokens"`
 	LatencyMSSum     int64     `json:"latency_ms_sum"`
@@ -135,9 +141,10 @@ func (s *StatsStore) Add(evt UsageEvent) {
 	}
 	start := ts.UTC().Truncate(usageBucketSize)
 	clientType := strings.TrimSpace(evt.ClientType)
+	userAgent := strings.TrimSpace(evt.UserAgent)
 	clientIP := strings.TrimSpace(evt.ClientIP)
 	apiKeyName := strings.TrimSpace(evt.APIKeyName)
-	key := bucketKey(start, evt.Provider, evt.Model, clientType, clientIP, apiKeyName)
+	key := bucketKey(start, evt.Provider, evt.Model, clientType, userAgent, clientIP, apiKeyName)
 	b, ok := s.buckets[key]
 	if !ok {
 		b = &UsageBucket{
@@ -145,6 +152,7 @@ func (s *StatsStore) Add(evt UsageEvent) {
 			Provider:   evt.Provider,
 			Model:      evt.Model,
 			ClientType: clientType,
+			UserAgent:  userAgent,
 			ClientIP:   clientIP,
 			APIKeyName: apiKeyName,
 		}
@@ -152,6 +160,7 @@ func (s *StatsStore) Add(evt UsageEvent) {
 	}
 	b.Requests++
 	b.PromptTokens += evt.PromptTokens
+	b.PromptCached += evt.PromptCached
 	b.CompletionTokens += evt.CompletionToks
 	b.TotalTokens += evt.TotalTokens
 	b.LatencyMSSum += evt.LatencyMS
@@ -173,6 +182,7 @@ func (s *StatsStore) Summary(period time.Duration) StatsSummary {
 		RequestsPerProvider:   map[string]int{},
 		RequestsPerModel:      map[string]int{},
 		RequestsPerClientType: map[string]int{},
+		RequestsPerUserAgent:  map[string]int{},
 		RequestsPerClientIP:   map[string]int{},
 		RequestsPerAPIKeyName: map[string]int{},
 	}
@@ -202,6 +212,7 @@ func (s *StatsStore) Summary(period time.Duration) StatsSummary {
 		}
 		count += b.Requests
 		prompt += b.PromptTokens
+		summary.PromptCachedTokens += b.PromptCached
 		completion += b.CompletionTokens
 		total += b.TotalTokens
 		latencySum += b.LatencyMSSum
@@ -211,6 +222,9 @@ func (s *StatsStore) Summary(period time.Duration) StatsSummary {
 		summary.RequestsPerModel[b.Model] += b.Requests
 		if clientType := strings.TrimSpace(b.ClientType); clientType != "" {
 			summary.RequestsPerClientType[clientType] += b.Requests
+		}
+		if userAgent := strings.TrimSpace(b.UserAgent); userAgent != "" {
+			summary.RequestsPerUserAgent[userAgent] += b.Requests
 		}
 		if clientIP := strings.TrimSpace(b.ClientIP); clientIP != "" {
 			summary.RequestsPerClientIP[clientIP] += b.Requests
@@ -229,10 +243,13 @@ func (s *StatsStore) Summary(period time.Duration) StatsSummary {
 			if summary.Buckets[i].Provider == summary.Buckets[j].Provider {
 				if summary.Buckets[i].Model == summary.Buckets[j].Model {
 					if summary.Buckets[i].ClientType == summary.Buckets[j].ClientType {
-						if summary.Buckets[i].ClientIP == summary.Buckets[j].ClientIP {
-							return summary.Buckets[i].APIKeyName < summary.Buckets[j].APIKeyName
+						if summary.Buckets[i].UserAgent == summary.Buckets[j].UserAgent {
+							if summary.Buckets[i].ClientIP == summary.Buckets[j].ClientIP {
+								return summary.Buckets[i].APIKeyName < summary.Buckets[j].APIKeyName
+							}
+							return summary.Buckets[i].ClientIP < summary.Buckets[j].ClientIP
 						}
-						return summary.Buckets[i].ClientIP < summary.Buckets[j].ClientIP
+						return summary.Buckets[i].UserAgent < summary.Buckets[j].UserAgent
 					}
 					return summary.Buckets[i].ClientType < summary.Buckets[j].ClientType
 				}
@@ -250,8 +267,8 @@ func (s *StatsStore) Summary(period time.Duration) StatsSummary {
 	return summary
 }
 
-func bucketKey(start time.Time, provider, model, clientType, clientIP, apiKeyName string) string {
-	return start.Format(time.RFC3339) + "|" + provider + "|" + model + "|" + clientType + "|" + clientIP + "|" + apiKeyName
+func bucketKey(start time.Time, provider, model, clientType, userAgent, clientIP, apiKeyName string) string {
+	return start.Format(time.RFC3339) + "|" + provider + "|" + model + "|" + clientType + "|" + userAgent + "|" + clientIP + "|" + apiKeyName
 }
 
 func (s *StatsStore) pruneLocked() {
@@ -296,7 +313,15 @@ func (s *StatsStore) load() {
 	}
 	for i := range payload.Buckets {
 		bk := payload.Buckets[i]
-		k := bucketKey(bk.StartAt, bk.Provider, bk.Model, strings.TrimSpace(bk.ClientType), strings.TrimSpace(bk.ClientIP), strings.TrimSpace(bk.APIKeyName))
+		k := bucketKey(
+			bk.StartAt,
+			bk.Provider,
+			bk.Model,
+			strings.TrimSpace(bk.ClientType),
+			strings.TrimSpace(bk.UserAgent),
+			strings.TrimSpace(bk.ClientIP),
+			strings.TrimSpace(bk.APIKeyName),
+		)
 		c := bk
 		s.buckets[k] = &c
 	}

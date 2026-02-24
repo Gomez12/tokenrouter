@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="TokenRouter logo">
+  <defs>
+    <linearGradient id="trGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0ea5e9"/>
+      <stop offset="55%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- T -->
+  <rect x="88" y="88" width="188" height="42" rx="14" fill="url(#trGrad)"/>
+  <rect x="162" y="88" width="40" height="176" rx="14" fill="url(#trGrad)"/>
+
+  <!-- R -->
+  <rect x="272" y="88" width="42" height="208" rx="14" fill="url(#trGrad)"/>
+  <rect x="272" y="88" width="136" height="40" rx="14" fill="url(#trGrad)"/>
+  <rect x="272" y="166" width="124" height="38" rx="14" fill="url(#trGrad)"/>
+  <path d="M 318 208 L 404 308 Q 414 320 402 332 L 384 348 Q 372 360 360 348 L 288 264 Z" fill="url(#trGrad)"/>
+
+  <!-- Lower parts flowing down and joining (USB-inspired trunk) -->
+  <path d="M 180 252 C 180 286, 184 304, 204 326 C 228 352, 248 372, 250 398" fill="none" stroke="url(#trGrad)" stroke-width="34" stroke-linecap="round"/>
+  <path d="M 298 288 C 294 324, 282 346, 266 372 C 258 384, 254 392, 252 398" fill="none" stroke="url(#trGrad)" stroke-width="34" stroke-linecap="round"/>
+
+  <!-- Shared trunk -->
+  <path d="M 252 398 L 252 460" fill="none" stroke="url(#trGrad)" stroke-width="34" stroke-linecap="round"/>
+  <circle cx="252" cy="468" r="18" fill="url(#trGrad)"/>
+
+  <!-- Subtle USB hint node -->
+  <circle cx="300" cy="332" r="8" fill="#60a5fa"/>
+</svg>

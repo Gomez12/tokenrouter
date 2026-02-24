@@ -13,38 +13,55 @@ func TestDefaultServerConfigPathUsesConfigToml(t *testing.T) {
 	}
 }
 
-func TestLoadServerConfigFallsBackToLegacyAndMigrates(t *testing.T) {
+func TestDefaultClientConfigPathUsesToroToml(t *testing.T) {
+	if got := filepath.Base(DefaultClientConfigPath()); got != "toro.toml" {
+		t.Fatalf("expected default client config file %q, got %q", "toro.toml", got)
+	}
+}
+
+func TestLoadServerConfigMigratesLegacyIncomingAPIKeys(t *testing.T) {
 	dir := t.TempDir()
-	legacy := filepath.Join(dir, legacyConfigFileName)
-	current := filepath.Join(dir, defaultConfigFileName)
-
-	cfg := NewDefaultServerConfig()
-	cfg.IncomingTokens = []IncomingAPIToken{{ID: "tok-1", Name: "Token 1", Key: "k"}}
-	cfg.IncomingAPIKeys = []string{"k"}
-	cfg.AdminAPIKey = "admin"
-	cfg.Providers = []ProviderConfig{{Name: "openai-main", Enabled: true}}
-	if err := Save(legacy, cfg); err != nil {
-		t.Fatalf("save legacy config: %v", err)
+	path := filepath.Join(dir, defaultConfigFileName)
+	legacyToml := `
+listen_addr = ":8080"
+incoming_api_keys = ["k1", "k2", "k1", ""]
+`
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(legacyToml)+"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
 	}
-	if _, err := os.Stat(current); !os.IsNotExist(err) {
-		t.Fatalf("expected %s not to exist before load, err=%v", current, err)
-	}
-
-	loaded, err := LoadServerConfig(current)
+	cfg, err := LoadServerConfig(path)
 	if err != nil {
-		t.Fatalf("load with legacy fallback failed: %v", err)
+		t.Fatalf("load config: %v", err)
 	}
-	if loaded.AdminAPIKey != "admin" {
-		t.Fatalf("unexpected loaded admin key: %q", loaded.AdminAPIKey)
+	if len(cfg.IncomingTokens) != 2 {
+		t.Fatalf("expected 2 migrated tokens, got %d", len(cfg.IncomingTokens))
 	}
-	if _, err := os.Stat(current); err != nil {
-		t.Fatalf("expected migrated config at %s: %v", current, err)
+	if cfg.IncomingTokens[0].Key != "k1" || cfg.IncomingTokens[1].Key != "k2" {
+		t.Fatalf("unexpected migrated keys: %+v", cfg.IncomingTokens)
 	}
-	b, err := os.ReadFile(current)
+}
+
+func TestLoadServerConfigMigratesLegacyAdminAPIKeyToIncomingAdminToken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, defaultConfigFileName)
+	legacyToml := `
+listen_addr = ":8080"
+admin_api_key = "legacy-admin-secret"
+`
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(legacyToml)+"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadServerConfig(path)
 	if err != nil {
-		t.Fatalf("read migrated config: %v", err)
+		t.Fatalf("load config: %v", err)
 	}
-	if !strings.Contains(string(b), "[[providers]]") {
-		t.Fatalf("expected providers table in migrated config:\n%s", string(b))
+	if len(cfg.IncomingTokens) != 1 {
+		t.Fatalf("expected 1 migrated admin token, got %d", len(cfg.IncomingTokens))
+	}
+	if cfg.IncomingTokens[0].Role != TokenRoleAdmin {
+		t.Fatalf("expected migrated token role admin, got %q", cfg.IncomingTokens[0].Role)
+	}
+	if cfg.IncomingTokens[0].Key != "legacy-admin-secret" {
+		t.Fatalf("unexpected migrated admin key: %q", cfg.IncomingTokens[0].Key)
 	}
 }

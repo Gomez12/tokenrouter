@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/assets"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/assets"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 func refreshOAuthTokenForProvider(ctx context.Context, store *config.ServerConfigStore, p config.ProviderConfig) config.ProviderConfig {

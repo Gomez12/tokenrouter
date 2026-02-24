@@ -1,4 +1,4 @@
-# openai-personal-proxy
+# tokenrouter
 
 OpenAI API-compatible proxy server in Go.
 
@@ -34,13 +34,13 @@ OpenAI API-compatible proxy server in Go.
 1. Run server wizard:
 
 ```bash
-go run ./cmd/openai-personal-proxy config
+go run ./cmd/torod config
 ```
 
 2. Start proxy:
 
 ```bash
-go run ./cmd/openai-personal-proxy serve
+go run ./cmd/torod serve
 ```
 
 If the server config does not exist yet, `serve` starts a first-time TUI wizard and asks whether TLS should be enabled (`Let's Encrypt`) or disabled (plain HTTP).
@@ -51,7 +51,8 @@ If the server config does not exist yet, `serve` starts a first-time TUI wizard 
 http://127.0.0.1:8080/admin
 ```
 
-You will be redirected to `/admin/login` and can sign in with `admin_api_key` from `config.toml`.
+You will be redirected to `/admin/login` and can sign in with an `incoming_tokens` entry with role `admin`.
+On first run, if no admin token exists, the server routes you to `/admin/setup` to create one before login is available.
 
 ## Dev auto-restart
 
@@ -64,12 +65,35 @@ Use the watcher script to rebuild and restart automatically when code changes, o
 Pass through `serve` args if needed:
 
 ```bash
-./dev-restart.sh serve --config ~/.config/openai-personal-proxy/config.toml
+./dev-restart.sh serve --config ~/.config/tokenrouter/torod.toml
+```
+
+## CI/CD
+
+- Every push/PR commit triggers a `devbuild` workflow run and uploads build artifacts.
+- Semantic tags trigger releases automatically.
+  - Tag format: `vX.Y.Z` (example: `v0.4.2`)
+  - Release workflow builds cross-platform artifacts and publishes a GitHub Release.
+
+Manual release trigger example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Config paths
 
-- Server config: `~/.config/openai-personal-proxy/config.toml`
+- Server config: `~/.config/tokenrouter/torod.toml`
+- Toro client config: `~/.config/tokenrouter/toro.toml`
+
+## Toro client CLI
+
+Configure client-side remote server URL + API key:
+
+```bash
+go run ./cmd/toro config
+```
 
 ## Routing behavior
 
@@ -90,7 +114,7 @@ Pass through `serve` args if needed:
 
 ## Pricing Cache
 
-- Local cache path: `~/.cache/openai-personal-proxy/pricing-cache.json`
+- Local cache path: `~/.cache/tokenrouter/pricing-cache.json`
 - Pricing data is fetched from provider `/v1/models` metadata when available.
 - Pricing fetch is pluggable (`pkg/pricing`), with provider-specific sources.
 - Current provider-specific source: OpenCode Zen pricing parsed from `https://opencode.ai/docs/zen/`.

@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/cache"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/cache"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
 type ModelPricing struct {

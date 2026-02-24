@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,7 +17,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -25,10 +29,13 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/assets"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/cache"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/pricing"
+	"github.com/lkarlslund/tokenrouter/pkg/assets"
+	"github.com/lkarlslund/tokenrouter/pkg/cache"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/pricing"
+	"github.com/lkarlslund/tokenrouter/pkg/version"
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 const adminSessionCookie = "opp_admin_session"
@@ -52,6 +59,8 @@ type AdminHandler struct {
 	wsMu          sync.Mutex
 	wsClients     map[chan []byte]struct{}
 }
+
+type adminAuthContextKey struct{}
 
 type oauthSession struct {
 	Provider     string
@@ -109,20 +118,29 @@ func (h *AdminHandler) RegisterRoutes(r chi.Router) {
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin", h.page)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin/", h.page)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin/ws", h.adminWebsocket)
+	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodGet, "/admin/setup", h.setup)
+	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodPost, "/admin/setup", h.setup)
 	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodGet, "/admin/login", h.login)
 	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodPost, "/admin/login", h.login)
 	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodPost, "/admin/logout", h.logout)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/stats", h.statsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/settings/security", h.securitySettingsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/settings/security", h.securitySettingsAPI)
-	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/access-tokens", h.accessTokensAPI)
-	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/access-tokens", h.accessTokensAPI)
-	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Delete("/admin/api/access-tokens/{id}", h.accessTokenByIDAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/settings/tls", h.tlsSettingsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/settings/tls", h.tlsSettingsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/settings/tls/test-certificate", h.tlsTestCertificateAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/settings/tls/renew", h.tlsRenewCertificateAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/version", h.versionAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireTokenRole(config.TokenRoleAdmin, config.TokenRoleKeymaster)).Get("/admin/api/access-tokens", h.accessTokensAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireTokenRole(config.TokenRoleAdmin, config.TokenRoleKeymaster)).Post("/admin/api/access-tokens", h.accessTokensAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireTokenRole(config.TokenRoleAdmin, config.TokenRoleKeymaster)).Put("/admin/api/access-tokens/{id}", h.accessTokenByIDAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireTokenRole(config.TokenRoleAdmin, config.TokenRoleKeymaster)).Delete("/admin/api/access-tokens/{id}", h.accessTokenByIDAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/pricing", h.pricingAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/pricing/refresh", h.refreshPricingAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/providers/popular", h.popularProvidersAPI)
 	r.With(h.withRuntimeInstanceHeader).Get("/admin/static/*", h.adminStaticAsset)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/providers/device-code", h.providerDeviceCodeAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/providers/device-token", h.providerDeviceTokenAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/providers/oauth/start", h.providerOAuthStartAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/providers/oauth/result", h.providerOAuthResultAPI)
 	r.With(h.withRuntimeInstanceHeader).Get("/admin/oauth/callback", h.providerOAuthCallbackPage)
@@ -247,6 +265,10 @@ func (h *AdminHandler) withRuntimeInstanceHeader(next http.Handler) http.Handler
 }
 
 func (h *AdminHandler) login(w http.ResponseWriter, r *http.Request) {
+	if h.adminSetupRequired() {
+		http.Redirect(w, r, "/admin/setup", http.StatusFound)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if h.isAuthenticated(r) {
@@ -272,13 +294,13 @@ func (h *AdminHandler) login(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid form", http.StatusBadRequest)
 			return
 		}
-		cfg := h.store.Snapshot()
 		key := strings.TrimSpace(r.FormValue("api_key"))
 		next := "/admin"
 		if q := r.FormValue("next"); strings.HasPrefix(q, "/admin") {
 			next = q
 		}
-		if !safeEqual(key, cfg.AdminAPIKey) {
+		identity, ok := resolveAuthIdentity(key, h.store.Snapshot())
+		if !ok || identity.Role != config.TokenRoleAdmin {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			t, err := getTemplates()
 			if err != nil {
@@ -293,7 +315,7 @@ func (h *AdminHandler) login(w http.ResponseWriter, r *http.Request) {
 		}
 		http.SetCookie(w, &http.Cookie{
 			Name:     adminSessionCookie,
-			Value:    cfg.AdminAPIKey,
+			Value:    key,
 			Path:     "/admin",
 			HttpOnly: true,
 			SameSite: http.SameSiteLaxMode,
@@ -304,6 +326,109 @@ func (h *AdminHandler) login(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (h *AdminHandler) setup(w http.ResponseWriter, r *http.Request) {
+	if !h.adminSetupRequired() {
+		if h.isAuthenticated(r) {
+			http.Redirect(w, r, "/admin", http.StatusFound)
+			return
+		}
+		http.Redirect(w, r, "/admin/login?next=/admin", http.StatusFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		t, err := getTemplates()
+		if err != nil {
+			http.Error(w, "failed to render setup page", http.StatusInternalServerError)
+			return
+		}
+		_ = t.ExecuteTemplate(w, "setup.html", struct {
+			Error string
+		}{})
+	case http.MethodPost:
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
+		}
+		key := strings.TrimSpace(r.FormValue("key"))
+		confirm := strings.TrimSpace(r.FormValue("confirm_key"))
+		renderSetupWithError := func(msg string) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			t, err := getTemplates()
+			if err != nil {
+				http.Error(w, "failed to render setup page", http.StatusInternalServerError)
+				return
+			}
+			_ = t.ExecuteTemplate(w, "setup.html", struct {
+				Error string
+			}{Error: msg})
+		}
+		if key == "" {
+			renderSetupWithError("Admin key is required")
+			return
+		}
+		if key != confirm {
+			renderSetupWithError("Admin key confirmation does not match")
+			return
+		}
+		if len(key) < 12 {
+			renderSetupWithError("Admin key must be at least 12 characters")
+			return
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		if err := h.store.Update(func(c *config.ServerConfig) error {
+			if config.HasAdminToken(c.IncomingTokens) {
+				return fmt.Errorf("admin token already configured")
+			}
+			for i := range c.IncomingTokens {
+				if strings.TrimSpace(c.IncomingTokens[i].Key) != key {
+					continue
+				}
+				c.IncomingTokens[i].Role = config.TokenRoleAdmin
+				if strings.TrimSpace(c.IncomingTokens[i].Name) == "" {
+					c.IncomingTokens[i].Name = "Admin"
+				}
+				if strings.TrimSpace(c.IncomingTokens[i].CreatedAt) == "" {
+					c.IncomingTokens[i].CreatedAt = now
+				}
+				return nil
+			}
+			c.IncomingTokens = append(c.IncomingTokens, config.IncomingAPIToken{
+				Name:      "Admin",
+				Role:      config.TokenRoleAdmin,
+				Key:       key,
+				CreatedAt: now,
+			})
+			return nil
+		}); err != nil {
+			if strings.EqualFold(strings.TrimSpace(err.Error()), "admin token already configured") {
+				http.Redirect(w, r, "/admin/login?next=/admin", http.StatusFound)
+				return
+			}
+			http.Error(w, "failed to save admin token", http.StatusInternalServerError)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     adminSessionCookie,
+			Value:    key,
+			Path:     "/admin",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   r.TLS != nil,
+			MaxAge:   86400,
+		})
+		http.Redirect(w, r, "/admin", http.StatusFound)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *AdminHandler) adminSetupRequired() bool {
+	cfg := h.store.Snapshot()
+	return !config.HasAdminToken(cfg.IncomingTokens)
 }
 
 func (h *AdminHandler) logout(w http.ResponseWriter, r *http.Request) {
@@ -325,6 +450,10 @@ func (h *AdminHandler) logout(w http.ResponseWriter, r *http.Request) {
 
 func (h *AdminHandler) requireAdminPage(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.adminSetupRequired() {
+			http.Redirect(w, r, "/admin/setup", http.StatusFound)
+			return
+		}
 		if !h.isAuthenticated(r) {
 			http.Redirect(w, r, "/admin/login?next="+url.QueryEscape(r.URL.Path), http.StatusFound)
 			return
@@ -335,25 +464,53 @@ func (h *AdminHandler) requireAdminPage(next http.Handler) http.Handler {
 
 func (h *AdminHandler) requireAdminAPI(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !h.isAuthenticated(r) {
+		if h.adminSetupRequired() {
+			http.Error(w, "admin setup required", http.StatusServiceUnavailable)
+			return
+		}
+		identity, ok := h.requestIdentity(r)
+		if !ok || identity.Role != config.TokenRoleAdmin {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), adminAuthContextKey{}, identity)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func (h *AdminHandler) isAuthenticated(r *http.Request) bool {
-	cfg := h.store.Snapshot()
-	if cfg.AdminAPIKey == "" {
-		return false
-	}
-	for _, token := range h.adminTokensFromRequest(r) {
-		if safeEqual(token, cfg.AdminAPIKey) {
-			return true
+func (h *AdminHandler) requireTokenRole(allowedRoles ...string) func(http.Handler) http.Handler {
+	allowed := map[string]struct{}{}
+	for _, role := range allowedRoles {
+		role = config.NormalizeIncomingTokenRole(role)
+		if role == "" {
+			continue
 		}
+		allowed[role] = struct{}{}
 	}
-	return false
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if h.adminSetupRequired() {
+				http.Error(w, "admin setup required", http.StatusServiceUnavailable)
+				return
+			}
+			identity, ok := h.requestIdentity(r)
+			if !ok {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if _, allowedRole := allowed[identity.Role]; !allowedRole {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			ctx := context.WithValue(r.Context(), adminAuthContextKey{}, identity)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+func (h *AdminHandler) isAuthenticated(r *http.Request) bool {
+	identity, ok := h.requestIdentity(r)
+	return ok && identity.Role == config.TokenRoleAdmin
 }
 
 func (h *AdminHandler) adminTokensFromRequest(r *http.Request) []string {
@@ -368,6 +525,22 @@ func (h *AdminHandler) adminTokensFromRequest(r *http.Request) []string {
 		tokens = append(tokens, strings.TrimSpace(c.Value))
 	}
 	return tokens
+}
+
+func (h *AdminHandler) requestIdentity(r *http.Request) (tokenAuthIdentity, bool) {
+	cfg := h.store.Snapshot()
+	for _, token := range h.adminTokensFromRequest(r) {
+		if identity, ok := resolveAuthIdentity(token, cfg); ok {
+			return identity, true
+		}
+	}
+	return tokenAuthIdentity{}, false
+}
+
+func adminIdentityFromContext(ctx context.Context) (tokenAuthIdentity, bool) {
+	raw := ctx.Value(adminAuthContextKey{})
+	identity, ok := raw.(tokenAuthIdentity)
+	return identity, ok
 }
 
 func safeEqual(a, b string) bool {
@@ -458,6 +631,9 @@ func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []confi
 		}
 		reader := quotaReaderFromPreset(preset)
 		if reader == "" {
+			if cached, _, ok := h.quotaCache.Get(p.Name); ok && cached.Snapshot.Provider != "" {
+				out[p.Name] = cached.Snapshot
+			}
 			continue
 		}
 		snap := h.readProviderQuotaCached(ctx, p, preset)
@@ -546,16 +722,25 @@ func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, pre
 	snap = h.runQuotaReader(ctx, p, preset, snap)
 
 	nextDelay := quotaRefreshError
+	storeSnap := snap
+	if snap.Status != "ok" {
+		if prev, _, ok := h.quotaCache.Get(p.Name); ok {
+			if strings.EqualFold(strings.TrimSpace(prev.Snapshot.Status), "ok") {
+				// Preserve last known-good quota snapshot and retry in background.
+				storeSnap = prev.Snapshot
+			}
+		}
+	}
 	if snap.Status == "ok" {
 		nextDelay = quotaRefreshOK
 	}
 	h.quotaMu.Lock()
 	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
-		Snapshot:   snap,
+		Snapshot:   storeSnap,
 		Refreshing: false,
 	}, now, nextDelay)
 	h.quotaMu.Unlock()
-	return snap
+	return storeSnap
 }
 
 func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header http.Header) {
@@ -572,12 +757,12 @@ func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header h
 	}
 	preset, ok := byName[providerTypeOrName(p)]
 	if !ok {
-		return
+		preset = assets.PopularProvider{
+			ProviderConfig: config.ProviderConfig{Name: providerTypeOrName(p)},
+			DisplayName:    p.Name,
+		}
 	}
 	reader := quotaReaderFromPreset(preset)
-	if reader == "" {
-		return
-	}
 	now := time.Now().UTC()
 	snap := newProviderQuotaSnapshot(now, p, preset, reader)
 	var metrics []ProviderQuotaMetric
@@ -600,7 +785,20 @@ func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header h
 		metrics = rateLimitMetricsFromHeaders(header, "cerebras", mistralFeatureWindowFromSuffix)
 		snap.PlanType = "cerebras"
 	default:
-		return
+		metrics = autoQuotaMetricsFromHeaders(header)
+		snap.PlanType = "auto"
+		snap.Reader = "header_auto"
+	}
+	if len(metrics) == 0 {
+		metrics = autoQuotaMetricsFromHeaders(header)
+		if len(metrics) > 0 {
+			if strings.TrimSpace(snap.PlanType) == "" {
+				snap.PlanType = "auto"
+			}
+			if strings.TrimSpace(snap.Reader) == "" {
+				snap.Reader = "header_auto"
+			}
+		}
 	}
 	if len(metrics) == 0 {
 		return
@@ -623,6 +821,34 @@ func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header h
 		Refreshing: false,
 	}, now, quotaRefreshOK)
 	h.quotaMu.Unlock()
+}
+
+func autoQuotaMetricsFromHeaders(h http.Header) []ProviderQuotaMetric {
+	return rateLimitMetricsFromHeaders(h, "auto", autoQuotaFeatureWindowFromSuffix)
+}
+
+func autoQuotaFeatureWindowFromSuffix(suffix string) (string, string) {
+	s := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(suffix, "_", "-")))
+	feature := "requests"
+	if strings.Contains(s, "token") {
+		feature = "tokens"
+	}
+	switch {
+	case strings.Contains(s, "minute"), strings.HasSuffix(s, "-min"), strings.HasSuffix(s, "-m"):
+		return feature, "1m"
+	case strings.Contains(s, "hour"), strings.HasSuffix(s, "-h"):
+		return feature, "1h"
+	case strings.Contains(s, "day"), strings.HasSuffix(s, "-d"):
+		return feature, "1d"
+	case strings.Contains(s, "week"), strings.HasSuffix(s, "-w"):
+		return feature, "7d"
+	case strings.Contains(s, "month"):
+		return feature, "30d"
+	case s == "requests" || s == "tokens":
+		return feature, "quota"
+	default:
+		return feature, strings.ReplaceAll(s, "-", "/")
+	}
 }
 
 func (h *AdminHandler) ensureProviderOAuthTokenFresh(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider) config.ProviderConfig {
@@ -1241,7 +1467,7 @@ func (h *AdminHandler) readCerebrasQuota(ctx context.Context, p config.ProviderC
 		return snap
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		msg := strings.TrimSpace(string(body))
 		if msg == "" {
@@ -1252,6 +1478,12 @@ func (h *AdminHandler) readCerebrasQuota(ctx context.Context, p config.ProviderC
 	}
 
 	metrics := rateLimitMetricsFromHeaders(resp.Header, "cerebras", mistralFeatureWindowFromSuffix)
+	if len(metrics) == 0 {
+		chatMetrics, chatErr := h.readCerebrasQuotaFromTinyChat(ctx, p, baseURL, token, body)
+		if chatErr == nil && len(chatMetrics) > 0 {
+			metrics = chatMetrics
+		}
+	}
 	if len(metrics) == 0 {
 		snap.Error = "quota headers unavailable"
 		return snap
@@ -1270,6 +1502,17 @@ func (h *AdminHandler) readCerebrasQuota(ctx context.Context, p config.ProviderC
 	snap.ResetAt = best.ResetAt
 	snap.PlanType = "cerebras"
 	return snap
+}
+
+func (h *AdminHandler) readCerebrasQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
+	modelID := mistralFirstModelID(modelsBody)
+	resp, err := sendTinyChatProbe(ctx, baseURL, token, modelID)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	return rateLimitMetricsFromHeaders(resp.Header, "cerebras", mistralFeatureWindowFromSuffix), nil
 }
 
 func (h *AdminHandler) readMistralQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
@@ -1301,14 +1544,31 @@ func (h *AdminHandler) readGroqQuotaFromTinyChat(ctx context.Context, p config.P
 }
 
 func (h *AdminHandler) readHuggingFaceQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
-	modelID := mistralFirstModelID(modelsBody)
-	resp, err := sendTinyChatProbe(ctx, baseURL, token, modelID)
-	if err != nil {
-		return nil, err
+	candidates := modelIDsFromModelsBody(modelsBody,
+		"Qwen/Qwen2.5-7B-Instruct",
+		"meta-llama/Llama-3.1-8B-Instruct",
+	)
+	if len(candidates) > 12 {
+		candidates = candidates[:12]
 	}
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-	return huggingFaceMetricsFromHeaders(resp.Header), nil
+	var lastErr error
+	for _, modelID := range candidates {
+		resp, err := sendTinyChatProbe(ctx, baseURL, token, modelID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+		metrics := huggingFaceMetricsFromHeaders(resp.Header)
+		resp.Body.Close()
+		if len(metrics) > 0 {
+			return metrics, nil
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, nil
 }
 
 func sendTinyChatProbe(ctx context.Context, baseURL string, token string, modelID string) (*http.Response, error) {
@@ -1406,6 +1666,44 @@ func rateLimitMetricsFromHeaders(h http.Header, keyPrefix string, classifySuffix
 		}
 		value := strings.TrimSpace(vals[0])
 		switch {
+		case key == headerPrefix+"limit":
+			limit, err := strconv.ParseFloat(value, 64)
+			if err != nil || limit <= 0 {
+				continue
+			}
+			const suffix = "requests"
+			mp := parts[suffix]
+			if mp == nil {
+				mp = &metricParts{}
+				parts[suffix] = mp
+			}
+			mp.limit = limit
+			mp.hasLimit = true
+		case key == headerPrefix+"remaining":
+			remain, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				continue
+			}
+			const suffix = "requests"
+			mp := parts[suffix]
+			if mp == nil {
+				mp = &metricParts{}
+				parts[suffix] = mp
+			}
+			mp.remaining = remain
+			mp.hasRemain = true
+		case key == headerPrefix+"reset":
+			const suffix = "requests"
+			if globalReset == "" {
+				globalReset = value
+			}
+			resetBySuffix[suffix] = value
+			mp := parts[suffix]
+			if mp == nil {
+				mp = &metricParts{}
+				parts[suffix] = mp
+			}
+			mp.resetRaw = value
 		case strings.HasPrefix(key, headerPrefix+"limit-"):
 			suffix := strings.TrimPrefix(key, headerPrefix+"limit-")
 			if suffix == "" {
@@ -1755,6 +2053,37 @@ func mistralFirstModelID(modelsBody []byte) string {
 		}
 	}
 	return fallback
+}
+
+func modelIDsFromModelsBody(modelsBody []byte, fallbacks ...string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 16)
+	var parsed modelListResponse
+	if err := json.Unmarshal(modelsBody, &parsed); err == nil {
+		for _, m := range parsed.Data {
+			id := strings.TrimSpace(m.ID)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	for _, fb := range fallbacks {
+		id := strings.TrimSpace(fb)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 func antigravityUserAgent() string {
@@ -2256,21 +2585,226 @@ func (h *AdminHandler) securitySettingsAPI(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+func (h *AdminHandler) tlsSettingsAPI(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		cfg := h.store.Snapshot()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled":   cfg.TLS.Enabled,
+			"domain":    strings.TrimSpace(cfg.TLS.Domain),
+			"email":     strings.TrimSpace(cfg.TLS.Email),
+			"cache_dir": strings.TrimSpace(cfg.TLS.CacheDir),
+		})
+	case http.MethodPut:
+		var payload struct {
+			Enabled bool   `json:"enabled"`
+			Domain  string `json:"domain"`
+			Email   string `json:"email"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		domain := strings.TrimSpace(payload.Domain)
+		email := strings.TrimSpace(payload.Email)
+		if payload.Enabled && domain == "" {
+			http.Error(w, "domain is required when tls is enabled", http.StatusBadRequest)
+			return
+		}
+		if err := h.store.Update(func(c *config.ServerConfig) error {
+			c.TLS.Enabled = payload.Enabled
+			c.TLS.Domain = domain
+			c.TLS.Email = email
+			return nil
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *AdminHandler) tlsTestCertificateAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg := h.store.Snapshot()
+	notAfter, cacheDir, err := obtainManagedCertificate(cfg.TLS, true, false)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+	msg := "test certificate obtained"
+	if !notAfter.IsZero() {
+		msg = "test certificate obtained; expires " + notAfter.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "ok",
+		"message":   msg,
+		"not_after": notAfter.UTC().Format(time.RFC3339),
+		"cache_dir": cacheDir,
+	})
+}
+
+func (h *AdminHandler) tlsRenewCertificateAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg := h.store.Snapshot()
+	notAfter, cacheDir, err := obtainManagedCertificate(cfg.TLS, false, true)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"status": "error",
+			"error":  err.Error(),
+		})
+		return
+	}
+	msg := "certificate renewed"
+	if !notAfter.IsZero() {
+		msg = "certificate renewed; expires " + notAfter.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "ok",
+		"message":   msg,
+		"not_after": notAfter.UTC().Format(time.RFC3339),
+		"cache_dir": cacheDir,
+	})
+}
+
+func (h *AdminHandler) versionAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	v := version.Current()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version": version.String(),
+		"raw":     v.Version,
+		"commit":  v.Commit,
+		"date":    v.Date,
+		"dirty":   v.Dirty,
+	})
+}
+
+func obtainManagedCertificate(tlsCfg config.TLSConfig, useStaging bool, forceRenew bool) (time.Time, string, error) {
+	domain := strings.TrimSpace(tlsCfg.Domain)
+	if domain == "" {
+		return time.Time{}, "", fmt.Errorf("tls domain is not configured")
+	}
+	cacheDir := strings.TrimSpace(tlsCfg.CacheDir)
+	if cacheDir == "" {
+		cacheDir = filepath.Join(os.TempDir(), "tokenrouter-autocert")
+	}
+	if useStaging {
+		cacheDir = filepath.Join(cacheDir, "staging-test")
+	}
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return time.Time{}, cacheDir, fmt.Errorf("create cache dir: %w", err)
+	}
+	if forceRenew {
+		purgeAutocertDomainCache(cacheDir, domain)
+	}
+
+	mgr := &autocert.Manager{
+		Cache:      autocert.DirCache(cacheDir),
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(domain),
+		Email:      strings.TrimSpace(tlsCfg.Email),
+	}
+	if useStaging {
+		mgr.Client = &acme.Client{DirectoryURL: "https://acme-staging-v02.api.letsencrypt.org/directory"}
+	}
+
+	type result struct {
+		notAfter time.Time
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		cert, err := mgr.GetCertificate(&tls.ClientHelloInfo{
+			ServerName: domain,
+		})
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		if cert == nil || len(cert.Certificate) == 0 {
+			done <- result{}
+			return
+		}
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			done <- result{}
+			return
+		}
+		done <- result{notAfter: leaf.NotAfter.UTC()}
+	}()
+
+	select {
+	case out := <-done:
+		return out.notAfter, cacheDir, out.err
+	case <-time.After(2 * time.Minute):
+		return time.Time{}, cacheDir, fmt.Errorf("timed out waiting for certificate challenge completion")
+	}
+}
+
+func purgeAutocertDomainCache(cacheDir, domain string) {
+	dc := autocert.DirCache(cacheDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = dc.Delete(ctx, domain)
+	_ = dc.Delete(ctx, domain+"+rsa")
+	_ = dc.Delete(ctx, domain+"+ecdsa")
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return
+	}
+	needle := strings.ToLower(strings.TrimSpace(domain))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(entry.Name()))
+		if !strings.Contains(name, needle) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(cacheDir, entry.Name()))
+	}
+}
+
 func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
+	actor, ok := adminIdentityFromContext(r.Context())
+	if !ok {
+		actor = tokenAuthIdentity{Role: config.TokenRoleAdmin}
+	}
 	switch r.Method {
 	case http.MethodGet:
 		cfg := h.store.Snapshot()
 		type tokenItem struct {
 			ID          string `json:"id"`
 			Name        string `json:"name"`
+			Role        string `json:"role,omitempty"`
+			ParentID    string `json:"parent_id,omitempty"`
 			RedactedKey string `json:"redacted_key"`
 			ExpiresAt   string `json:"expires_at,omitempty"`
 		}
 		out := make([]tokenItem, 0, len(cfg.IncomingTokens))
 		for _, t := range cfg.IncomingTokens {
+			if actor.Role == config.TokenRoleKeymaster && strings.TrimSpace(t.ParentID) != strings.TrimSpace(actor.Token.ID) {
+				continue
+			}
 			out = append(out, tokenItem{
 				ID:          strings.TrimSpace(t.ID),
 				Name:        strings.TrimSpace(t.Name),
+				Role:        config.NormalizeIncomingTokenRole(t.Role),
+				ParentID:    strings.TrimSpace(t.ParentID),
 				RedactedKey: redactAccessKey(strings.TrimSpace(t.Key)),
 				ExpiresAt:   strings.TrimSpace(t.ExpiresAt),
 			})
@@ -2280,6 +2814,7 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 		var payload struct {
 			Name      string `json:"name"`
 			Key       string `json:"key"`
+			Role      string `json:"role,omitempty"`
 			ExpiresAt string `json:"expires_at,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -2303,6 +2838,18 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "name is required", http.StatusBadRequest)
 			return
 		}
+		role := config.NormalizeIncomingTokenRole(payload.Role)
+		if role == "" {
+			role = config.TokenRoleInferrer
+		}
+		parentID := ""
+		if actor.Role == config.TokenRoleKeymaster {
+			if role != config.TokenRoleInferrer {
+				http.Error(w, "keymaster can only create inferrer tokens", http.StatusForbidden)
+				return
+			}
+			parentID = strings.TrimSpace(actor.Token.ID)
+		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		if err := h.store.Update(func(c *config.ServerConfig) error {
 			for _, existing := range c.IncomingTokens {
@@ -2313,6 +2860,8 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 			c.IncomingTokens = append(c.IncomingTokens, config.IncomingAPIToken{
 				Name:      name,
 				Key:       key,
+				Role:      role,
+				ParentID:  parentID,
 				ExpiresAt: expiresAt,
 				CreatedAt: now,
 			})
@@ -2328,16 +2877,93 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) accessTokenByIDAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPut {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+	actor, ok := adminIdentityFromContext(r.Context())
+	if !ok {
+		actor = tokenAuthIdentity{Role: config.TokenRoleAdmin}
 	}
 	id := strings.TrimSpace(chi.URLParam(r, "id"))
 	if id == "" {
 		http.Error(w, "id is required", http.StatusBadRequest)
 		return
 	}
+	if r.Method == http.MethodPut {
+		var payload struct {
+			Name      string `json:"name"`
+			Role      string `json:"role,omitempty"`
+			ExpiresAt string `json:"expires_at,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		name := strings.TrimSpace(payload.Name)
+		if name == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+		role := config.NormalizeIncomingTokenRole(payload.Role)
+		if role == "" {
+			http.Error(w, "role is required", http.StatusBadRequest)
+			return
+		}
+		expiresAt := strings.TrimSpace(payload.ExpiresAt)
+		if expiresAt != "" {
+			if _, err := time.Parse(time.RFC3339, expiresAt); err != nil {
+				http.Error(w, "expires_at must be RFC3339", http.StatusBadRequest)
+				return
+			}
+		}
+		if err := h.store.Update(func(c *config.ServerConfig) error {
+			for i := range c.IncomingTokens {
+				t := &c.IncomingTokens[i]
+				if strings.TrimSpace(t.ID) != id {
+					continue
+				}
+				if actor.Role == config.TokenRoleKeymaster {
+					if strings.TrimSpace(t.ParentID) != strings.TrimSpace(actor.Token.ID) {
+						return fmt.Errorf("forbidden")
+					}
+					if role != config.TokenRoleInferrer {
+						return fmt.Errorf("keymaster can only set role inferrer")
+					}
+				}
+				t.Name = name
+				t.Role = role
+				t.ExpiresAt = expiresAt
+				return nil
+			}
+			return fmt.Errorf("token not found")
+		}); err != nil {
+			if strings.EqualFold(strings.TrimSpace(err.Error()), "forbidden") {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
 	if err := h.store.Update(func(c *config.ServerConfig) error {
+		target := config.IncomingAPIToken{}
+		for _, t := range c.IncomingTokens {
+			if strings.TrimSpace(t.ID) == id {
+				target = t
+				break
+			}
+		}
+		if actor.Role == config.TokenRoleKeymaster {
+			if strings.TrimSpace(target.ID) == "" {
+				return fmt.Errorf("token not found")
+			}
+			if strings.TrimSpace(target.ParentID) != strings.TrimSpace(actor.Token.ID) {
+				return fmt.Errorf("forbidden")
+			}
+		}
 		next := make([]config.IncomingAPIToken, 0, len(c.IncomingTokens))
 		found := false
 		for _, t := range c.IncomingTokens {
@@ -2353,6 +2979,10 @@ func (h *AdminHandler) accessTokenByIDAPI(w http.ResponseWriter, r *http.Request
 		c.IncomingTokens = next
 		return nil
 	}); err != nil {
+		if strings.EqualFold(strings.TrimSpace(err.Error()), "forbidden") {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -2364,10 +2994,7 @@ func redactAccessKey(key string) string {
 	if key == "" {
 		return ""
 	}
-	if len(key) <= 4 {
-		return key
-	}
-	return key[:4] + strings.Repeat("*", len(key)-4)
+	return strings.Repeat("*", 8)
 }
 
 func (h *AdminHandler) providersAPI(w http.ResponseWriter, r *http.Request) {
@@ -2532,12 +3159,16 @@ func (h *AdminHandler) providerDeviceCodeAPI(w http.ResponseWriter, r *http.Requ
 	req.ClientID = strings.TrimSpace(req.ClientID)
 	req.Scope = strings.TrimSpace(req.Scope)
 
+	var preset assets.PopularProvider
+	var havePreset bool
 	if req.Provider != "" {
 		if popular, err := getPopularProviders(); err == nil {
 			for _, p := range popular {
 				if p.Name != req.Provider {
 					continue
 				}
+				preset = p
+				havePreset = true
 				if req.DeviceCodeURL == "" {
 					req.DeviceCodeURL = strings.TrimSpace(p.DeviceCodeURL)
 				}
@@ -2562,20 +3193,34 @@ func (h *AdminHandler) providerDeviceCodeAPI(w http.ResponseWriter, r *http.Requ
 	if req.Scope == "" {
 		req.Scope = "openid profile email"
 	}
+	providerName := strings.ToLower(strings.TrimSpace(req.Provider))
 	u, err := url.Parse(req.DeviceCodeURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		http.Error(w, "invalid device_code_url", http.StatusBadRequest)
 		return
 	}
-	form := url.Values{}
-	form.Set("client_id", req.ClientID)
-	form.Set("scope", req.Scope)
-	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, req.DeviceCodeURL, strings.NewReader(form.Encode()))
+	body := ""
+	contentType := "application/x-www-form-urlencoded"
+	if providerName == "openai" || providerName == "github-copilot" {
+		contentType = "application/json"
+		payload := map[string]string{"client_id": req.ClientID}
+		if req.Scope != "" {
+			payload["scope"] = req.Scope
+		}
+		raw, _ := json.Marshal(payload)
+		body = string(raw)
+	} else {
+		form := url.Values{}
+		form.Set("client_id", req.ClientID)
+		form.Set("scope", req.Scope)
+		body = form.Encode()
+	}
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, req.DeviceCodeURL, strings.NewReader(body))
 	if err != nil {
 		http.Error(w, "failed to build device code request", http.StatusBadRequest)
 		return
 	}
-	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	httpReq.Header.Set("Content-Type", contentType)
 	httpReq.Header.Set("Accept", "application/json")
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(httpReq)
@@ -2587,11 +3232,11 @@ func (h *AdminHandler) providerDeviceCodeAPI(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		errMsg := strings.TrimSpace(string(body))
+		errMsg := strings.TrimSpace(string(rawBody))
 		var errBody map[string]any
-		if json.Unmarshal(body, &errBody) == nil {
+		if json.Unmarshal(rawBody, &errBody) == nil {
 			if desc := strings.TrimSpace(fmt.Sprintf("%v", errBody["error_description"])); desc != "" && desc != "<nil>" {
 				errMsg = desc
 			} else if code := strings.TrimSpace(fmt.Sprintf("%v", errBody["error"])); code != "" && code != "<nil>" {
@@ -2606,7 +3251,7 @@ func (h *AdminHandler) providerDeviceCodeAPI(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var decoded map[string]any
-	if err := json.Unmarshal(body, &decoded); err != nil {
+	if err := json.Unmarshal(rawBody, &decoded); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"ok":    false,
 			"error": "device code response was not valid JSON",
@@ -2622,18 +3267,304 @@ func (h *AdminHandler) providerDeviceCodeAPI(w http.ResponseWriter, r *http.Requ
 			respPayload[key] = v
 		}
 	}
+	if providerName == "openai" {
+		if v, ok := decoded["device_auth_id"]; ok {
+			respPayload["device_auth_id"] = v
+		}
+		// OpenAI device flow uses user_code for display and device_auth_id for exchange.
+		// Keep the UI binding URL available even if upstream omits verification_uri.
+		if _, ok := decoded["verification_uri"]; !ok && havePreset && strings.TrimSpace(preset.DeviceBindingURL) != "" {
+			respPayload["verification_uri"] = strings.TrimSpace(preset.DeviceBindingURL)
+		}
+	}
 	writeJSON(w, http.StatusOK, respPayload)
 }
 
-func (h *AdminHandler) providerOAuthStartAPI(w http.ResponseWriter, r *http.Request) {
+func (h *AdminHandler) providerDeviceTokenAPI(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider string `json:"provider"`
+		Provider       string `json:"provider"`
+		DeviceTokenURL string `json:"device_token_url"`
+		ClientID       string `json:"client_id"`
+		DeviceCode     string `json:"device_code"`
+		DeviceAuthID   string `json:"device_auth_id"`
+		GrantType      string `json:"grant_type"`
+		OAuthTokenURL  string `json:"oauth_token_url"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	req.Provider = strings.TrimSpace(req.Provider)
+	req.DeviceTokenURL = strings.TrimSpace(req.DeviceTokenURL)
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	req.DeviceCode = strings.TrimSpace(req.DeviceCode)
+	req.DeviceAuthID = strings.TrimSpace(req.DeviceAuthID)
+	req.GrantType = strings.TrimSpace(req.GrantType)
+	req.OAuthTokenURL = strings.TrimSpace(req.OAuthTokenURL)
+
+	var preset assets.PopularProvider
+	var havePreset bool
+	if req.Provider != "" {
+		if popular, err := getPopularProviders(); err == nil {
+			for _, p := range popular {
+				if p.Name != req.Provider {
+					continue
+				}
+				preset = p
+				havePreset = true
+				if req.DeviceTokenURL == "" {
+					req.DeviceTokenURL = strings.TrimSpace(p.DeviceTokenURL)
+				}
+				if req.ClientID == "" {
+					req.ClientID = strings.TrimSpace(p.DeviceClientID)
+				}
+				if req.GrantType == "" {
+					req.GrantType = strings.TrimSpace(p.DeviceGrantType)
+				}
+				break
+			}
+		}
+	}
+	if req.DeviceTokenURL == "" {
+		http.Error(w, "provider does not support device token exchange", http.StatusBadRequest)
+		return
+	}
+	if req.ClientID == "" {
+		http.Error(w, "client_id is required for this provider", http.StatusBadRequest)
+		return
+	}
+	if req.DeviceCode == "" {
+		http.Error(w, "device_code is required", http.StatusBadRequest)
+		return
+	}
+	if strings.EqualFold(req.Provider, "openai") && req.DeviceAuthID == "" {
+		http.Error(w, "device_auth_id is required for openai headless flow", http.StatusBadRequest)
+		return
+	}
+	if req.GrantType == "" {
+		req.GrantType = "urn:ietf:params:oauth:grant-type:device_code"
+	}
+	providerName := strings.ToLower(strings.TrimSpace(req.Provider))
+
+	body := ""
+	contentType := "application/x-www-form-urlencoded"
+	if providerName == "openai" {
+		contentType = "application/json"
+		payload := map[string]string{
+			"device_auth_id": req.DeviceAuthID,
+			"user_code":      req.DeviceCode,
+		}
+		raw, _ := json.Marshal(payload)
+		body = string(raw)
+	} else if providerName == "github-copilot" {
+		contentType = "application/json"
+		payload := map[string]string{
+			"client_id":   req.ClientID,
+			"device_code": req.DeviceCode,
+			"grant_type":  req.GrantType,
+		}
+		raw, _ := json.Marshal(payload)
+		body = string(raw)
+	} else {
+		form := url.Values{}
+		form.Set("client_id", req.ClientID)
+		form.Set("device_code", req.DeviceCode)
+		form.Set("grant_type", req.GrantType)
+		body = form.Encode()
+	}
+
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, req.DeviceTokenURL, strings.NewReader(body))
+	if err != nil {
+		http.Error(w, "failed to build device token request", http.StatusBadRequest)
+		return
+	}
+	httpReq.Header.Set("Content-Type", contentType)
+	httpReq.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"ok":    false,
+			"error": "device token request failed: " + err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+
+	decoded := map[string]any{}
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "device token response was not valid JSON",
+		})
+		return
+	}
+
+	errCode := strings.TrimSpace(fmt.Sprintf("%v", decoded["error"]))
+	if providerName == "openai" {
+		if (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound) && (errCode == "" || errCode == "<nil>") {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":      true,
+				"pending": true,
+			})
+			return
+		}
+		if errCode == "authorization_pending" || errCode == "slow_down" {
+			out := map[string]any{
+				"ok":      true,
+				"pending": true,
+				"error":   errCode,
+			}
+			if iv, ok := decoded["interval"]; ok {
+				out["interval"] = iv
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		authCode := strings.TrimSpace(fmt.Sprintf("%v", decoded["authorization_code"]))
+		codeVerifier := strings.TrimSpace(fmt.Sprintf("%v", decoded["code_verifier"]))
+		if authCode != "" && authCode != "<nil>" && codeVerifier != "" && codeVerifier != "<nil>" {
+			tokenURL := req.OAuthTokenURL
+			if havePreset {
+				if tokenURL == "" {
+					tokenURL = strings.TrimSpace(preset.OAuthTokenURL)
+				}
+			}
+			if tokenURL == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"ok":    false,
+					"error": "openai oauth token endpoint not configured",
+				})
+				return
+			}
+			redirectURI := "https://auth.openai.com/deviceauth/callback"
+			form := url.Values{}
+			form.Set("grant_type", "authorization_code")
+			form.Set("code", authCode)
+			form.Set("redirect_uri", redirectURI)
+			form.Set("client_id", req.ClientID)
+			form.Set("code_verifier", codeVerifier)
+			exReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "failed to build oauth token exchange request"})
+				return
+			}
+			exReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			exReq.Header.Set("Accept", "application/json")
+			exResp, err := (&http.Client{Timeout: 15 * time.Second}).Do(exReq)
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "oauth token exchange failed: " + err.Error()})
+				return
+			}
+			defer exResp.Body.Close()
+			exBody, _ := io.ReadAll(io.LimitReader(exResp.Body, 64*1024))
+			var exDecoded map[string]any
+			if err := json.Unmarshal(exBody, &exDecoded); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "oauth token response was not valid JSON"})
+				return
+			}
+			if exResp.StatusCode < 200 || exResp.StatusCode > 299 {
+				exErr := strings.TrimSpace(fmt.Sprintf("%v", exDecoded["error_description"]))
+				if exErr == "" || exErr == "<nil>" {
+					exErr = strings.TrimSpace(fmt.Sprintf("%v", exDecoded["error"]))
+				}
+				if exErr == "" || exErr == "<nil>" {
+					exErr = strings.TrimSpace(string(exBody))
+				}
+				if exErr == "" {
+					exErr = "oauth token exchange failed"
+				}
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": exErr, "status_code": exResp.StatusCode})
+				return
+			}
+			tok := strings.TrimSpace(fmt.Sprintf("%v", exDecoded["access_token"]))
+			if tok == "" || tok == "<nil>" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "oauth token exchange missing access_token"})
+				return
+			}
+			out := map[string]any{"ok": true, "pending": false, "auth_token": tok}
+			if rt := strings.TrimSpace(fmt.Sprintf("%v", exDecoded["refresh_token"])); rt != "" && rt != "<nil>" {
+				out["refresh_token"] = rt
+			}
+			if exp, ok := exDecoded["expires_in"]; ok {
+				out["expires_in"] = exp
+			}
+			if idToken := strings.TrimSpace(fmt.Sprintf("%v", exDecoded["id_token"])); idToken != "" && idToken != "<nil>" {
+				if accountID := extractOpenAIAccountID(idToken); accountID != "" {
+					out["account_id"] = accountID
+				}
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if tok := strings.TrimSpace(fmt.Sprintf("%v", decoded["access_token"])); tok != "" && tok != "<nil>" {
+			out := map[string]any{
+				"ok":         true,
+				"pending":    false,
+				"auth_token": tok,
+			}
+			if rt := strings.TrimSpace(fmt.Sprintf("%v", decoded["refresh_token"])); rt != "" && rt != "<nil>" {
+				out["refresh_token"] = rt
+			}
+			if exp, ok := decoded["expires_in"]; ok {
+				out["expires_in"] = exp
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		if errCode == "authorization_pending" || errCode == "slow_down" {
+			out := map[string]any{
+				"ok":      true,
+				"pending": true,
+				"error":   errCode,
+			}
+			if iv, ok := decoded["interval"]; ok {
+				out["interval"] = iv
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+	}
+
+	msg := strings.TrimSpace(fmt.Sprintf("%v", decoded["error_description"]))
+	if msg == "" || msg == "<nil>" {
+		msg = errCode
+	}
+	if msg == "" || msg == "<nil>" {
+		msg = strings.TrimSpace(string(b))
+	}
+	if msg == "" {
+		msg = "device token exchange failed"
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]any{
+		"ok":          false,
+		"status_code": resp.StatusCode,
+		"error":       msg,
+	})
+}
+
+func (h *AdminHandler) providerOAuthStartAPI(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Provider          string `json:"provider"`
+		OAuthAuthorizeURL string `json:"oauth_authorize_url"`
+		OAuthTokenURL     string `json:"oauth_token_url"`
+		OAuthClientID     string `json:"oauth_client_id"`
+		OAuthClientSecret string `json:"oauth_client_secret"`
+		OAuthScope        string `json:"oauth_scope"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.Provider = strings.TrimSpace(req.Provider)
+	req.OAuthAuthorizeURL = strings.TrimSpace(req.OAuthAuthorizeURL)
+	req.OAuthTokenURL = strings.TrimSpace(req.OAuthTokenURL)
+	req.OAuthClientID = strings.TrimSpace(req.OAuthClientID)
+	req.OAuthClientSecret = strings.TrimSpace(req.OAuthClientSecret)
+	req.OAuthScope = strings.TrimSpace(req.OAuthScope)
 	if req.Provider == "" {
 		http.Error(w, "provider is required", http.StatusBadRequest)
 		return
@@ -2661,8 +3592,24 @@ func (h *AdminHandler) providerOAuthStartAPI(w http.ResponseWriter, r *http.Requ
 	scope := strings.TrimSpace(preset.OAuthScope)
 	baseURL := strings.TrimSpace(preset.OAuthBaseURL)
 	originator := strings.TrimSpace(preset.OAuthOriginator)
+	if req.OAuthAuthorizeURL != "" {
+		authorizeURL = req.OAuthAuthorizeURL
+	}
+	if req.OAuthTokenURL != "" {
+		tokenURL = req.OAuthTokenURL
+	}
+	if req.OAuthClientID != "" {
+		clientID = req.OAuthClientID
+	}
+	if req.OAuthClientSecret != "" {
+		clientSecret = req.OAuthClientSecret
+	}
+	if req.OAuthScope != "" {
+		scope = req.OAuthScope
+	}
+
 	if authorizeURL == "" || tokenURL == "" || clientID == "" {
-		http.Error(w, "provider does not support browser oauth", http.StatusBadRequest)
+		http.Error(w, "provider oauth configuration incomplete (authorize_url, token_url, client_id required)", http.StatusBadRequest)
 		return
 	}
 	if scope == "" {
@@ -2720,7 +3667,7 @@ func (h *AdminHandler) providerOAuthStartAPI(w http.ResponseWriter, r *http.Requ
 		q.Set("originator", originator)
 		q.Set("id_token_add_organizations", "true")
 		q.Set("codex_cli_simplified_flow", "true")
-	} else {
+	} else if providerName == "google-gemini" {
 		q.Set("access_type", "offline")
 		q.Set("prompt", "consent")
 		q.Set("include_granted_scopes", "true")

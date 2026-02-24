@@ -84,6 +84,7 @@ func TestStatsStoreAggregatesClientMetadata(t *testing.T) {
 		Provider:       "openai",
 		Model:          "openai/gpt-5",
 		ClientType:     "openai-python",
+		UserAgent:      "OpenAI/Python 1.0.0",
 		ClientIP:       "127.0.0.1",
 		APIKeyName:     "Dev Laptop",
 		PromptTokens:   10,
@@ -98,6 +99,7 @@ func TestStatsStoreAggregatesClientMetadata(t *testing.T) {
 		Provider:       "openai",
 		Model:          "openai/gpt-5",
 		ClientType:     "curl",
+		UserAgent:      "curl/8.5.0",
 		ClientIP:       "10.0.0.7",
 		APIKeyName:     "CI Runner",
 		PromptTokens:   10,
@@ -126,5 +128,11 @@ func TestStatsStoreAggregatesClientMetadata(t *testing.T) {
 	}
 	if got := summary.RequestsPerAPIKeyName["CI Runner"]; got != 1 {
 		t.Fatalf("expected api key name CI Runner count 1, got %d", got)
+	}
+	if got := summary.RequestsPerUserAgent["OpenAI/Python 1.0.0"]; got != 1 {
+		t.Fatalf("expected user-agent OpenAI/Python 1.0.0 count 1, got %d", got)
+	}
+	if got := summary.RequestsPerUserAgent["curl/8.5.0"]; got != 1 {
+		t.Fatalf("expected user-agent curl/8.5.0 count 1, got %d", got)
 	}
 }

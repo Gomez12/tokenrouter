@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lkarlslund/openai-personal-proxy/pkg/assets"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/config"
-	"github.com/lkarlslund/openai-personal-proxy/pkg/proxy"
+	"github.com/lkarlslund/tokenrouter/pkg/assets"
+	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/proxy"
 )
 
 func TestPopularProvidersAssetLoads(t *testing.T) {
