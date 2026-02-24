@@ -3,7 +3,26 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>OpenAI Personal Proxy Admin</title>
+  <title>TokenRouter Admin</title>
+  <script>
+    (function () {
+      var key = 'opp_theme_mode_v1';
+      var mode = 'auto';
+      try {
+        var stored = String(window.localStorage.getItem(key) || '').trim();
+        if (stored === 'light' || stored === 'dark' || stored === 'auto') mode = stored;
+      } catch (_) {}
+      var resolved = mode;
+      if (mode === 'auto') {
+        try {
+          resolved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+        } catch (_) {
+          resolved = 'light';
+        }
+      }
+      document.documentElement.setAttribute('data-bs-theme', resolved);
+    })();
+  </script>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/css/bootstrap.min.css" rel="stylesheet">
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <script defer src="/admin/static/admin.js"></script>
@@ -19,6 +38,27 @@
     .auth-choice-btn {
       min-height: 120px;
     }
+    .provider-preset-btn {
+      background-color: var(--bs-tertiary-bg);
+    }
+    .provider-preset-btn:hover,
+    .provider-preset-btn:focus {
+      background-color: var(--bs-secondary-bg);
+    }
+    [data-bs-theme="dark"] .provider-icon-invert-dark {
+      filter: invert(1) brightness(1.12);
+    }
+
+    .form-switch .form-check-input {
+      width: 2.6em;
+      height: 1.3em;
+      cursor: pointer;
+      margin-right: 0.55rem;
+    }
+
+    .form-switch .form-check-label {
+      padding-top: 0.05rem;
+    }
   </style>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
@@ -28,8 +68,11 @@
     <div class="card-body">
       <div class="d-flex align-items-start justify-content-between gap-2">
         <div>
-          <h1 class="h3 mb-1">OpenAI Personal Proxy</h1>
-          <p class="text-body-secondary mb-0">Authenticated admin interface with live updates.</p>
+          <h1 class="h3 mb-1 d-flex align-items-center gap-2">
+            <img src="/admin/static/tokenrouter.svg" alt="" width="28" height="28" style="object-fit:contain;" />
+            <span>TokenRouter</span>
+            <small class="text-body-secondary fw-normal" x-show="appVersion" style="display:none;" x-text="appVersion"></small>
+          </h1>
         </div>
         <div class="d-flex gap-2">
           <button
@@ -93,7 +136,10 @@
       <div class="card-body">
         <div class="d-flex align-items-center justify-content-between mb-2">
           <h2 class="h5 mb-0">Provider Quotas</h2>
-          <button class="btn btn-sm btn-outline-primary" @click="loadStats(true)">Refresh</button>
+          <button class="btn btn-sm btn-outline-primary" :disabled="quotaRefreshInProgress" @click="refreshQuota()">
+            <span x-show="!quotaRefreshInProgress">Refresh</span>
+            <span x-show="quotaRefreshInProgress">Refreshing...</span>
+          </button>
         </div>
         <div x-html="quotaSummaryHtml"></div>
       </div>
@@ -129,21 +175,59 @@
     <div class="card shadow-sm mb-3">
       <div class="card-body">
         <div class="mb-2"><h2 class="h5 mb-0">API Access</h2></div>
-        <div class="form-check">
+        <div class="form-check form-switch">
           <input class="form-check-input" type="checkbox" id="allowLocalhostNoAuth" x-model="allowLocalhostNoAuth" @change="saveSecuritySettings()">
           <label class="form-check-label" for="allowLocalhostNoAuth">Allow unauthenticated API access from localhost</label>
         </div>
         <div class="small text-body-secondary mt-2">Only loopback requests (127.0.0.1 / ::1) bypass API key checks when enabled.</div>
-        <div class="form-check mt-3">
+        <div class="form-check form-switch mt-3">
           <input class="form-check-input" type="checkbox" id="allowHostDockerInternalNoAuth" x-model="allowHostDockerInternalNoAuth" @change="saveSecuritySettings()">
           <label class="form-check-label" for="allowHostDockerInternalNoAuth">Allow unauthenticated API access from host.docker.internal</label>
         </div>
         <div class="small text-body-secondary mt-2">When enabled, requests from the IP resolved by <code>host.docker.internal</code> bypass API key checks.</div>
-        <div class="form-check mt-3">
+        <div class="form-check form-switch mt-3">
           <input class="form-check-input" type="checkbox" id="autoEnablePublicFreeModels" x-model="autoEnablePublicFreeModels" @change="saveSecuritySettings()">
           <label class="form-check-label" for="autoEnablePublicFreeModels">Automatically enable public free-model providers (no setup required)</label>
         </div>
         <div class="small text-body-secondary mt-2">When enabled, free models from built-in providers are available for use even if no providers are configured manually.</div>
+      </div>
+    </div>
+
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="mb-2"><h2 class="h5 mb-0">Let's Encrypt TLS</h2></div>
+        <div class="form-check form-switch mb-2">
+          <input class="form-check-input" type="checkbox" id="tlsEnabled" x-model="tlsSettings.enabled">
+          <label class="form-check-label" for="tlsEnabled">Enable automatic Let's Encrypt certificates</label>
+        </div>
+        <div x-show="tlsSettings.enabled" style="display:none;">
+        <div class="row g-2 mb-2">
+          <div class="col-md-6">
+            <label class="form-label">External hostname</label>
+            <input class="form-control" placeholder="example.yourdomain.com" x-model="tlsSettings.domain" />
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">ACME email (optional)</label>
+            <input class="form-control" placeholder="ops@example.com" x-model="tlsSettings.email" />
+          </div>
+        </div>
+        <div class="small text-body-secondary mb-3">ACME cache dir: <code x-text="tlsSettings.cache_dir || '(default)'"></code></div>
+        <div class="d-flex flex-wrap gap-2">
+          <button class="btn btn-outline-primary" :disabled="tlsSaveInProgress || tlsActionInProgress" @click="saveTLSSettings()">
+            <span x-show="!tlsSaveInProgress">Save TLS Settings</span>
+            <span x-show="tlsSaveInProgress">Saving...</span>
+          </button>
+          <button class="btn btn-outline-secondary" :disabled="tlsActionInProgress || tlsSaveInProgress" @click="testTLSCertificate()">
+            <span x-show="!tlsActionInProgress">Get Test Certificate</span>
+            <span x-show="tlsActionInProgress">Working...</span>
+          </button>
+          <button class="btn btn-outline-secondary" :disabled="tlsActionInProgress || tlsSaveInProgress" @click="renewTLSCertificate()">
+            <span x-show="!tlsActionInProgress">Force Renew Certificate</span>
+            <span x-show="tlsActionInProgress">Working...</span>
+          </button>
+        </div>
+        <div class="small text-body-secondary mt-2">Certificates require public DNS + reachability on ports 80/443 for ACME challenges.</div>
+        </div>
       </div>
     </div>
 
@@ -199,15 +283,29 @@
         <div class="card-body">
           <div x-show="addProviderStep === 'pick_provider'" style="display:none;">
             <div class="small text-body-secondary mb-3">Choose a provider to configure.</div>
-            <div class="row g-2 row-cols-1 row-cols-md-3">
-              <template x-for="p in popularProviders" :key="p.name">
-                <div class="col">
-                  <button type="button" class="btn btn-light border rounded-0 w-100 h-100 p-3 text-start d-flex align-items-center gap-2" @click="selectProviderPreset(p.name)">
-                    <img :src="providerIconSrc(p.name)" @error="providerIconError($event)" alt="" width="28" height="28" style="object-fit:contain;" />
-                    <span class="fw-semibold" x-text="p.display_name"></span>
-                  </button>
-                </div>
-              </template>
+            <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+              <input class="form-control" style="max-width:360px;" placeholder="Search providers..." x-model.trim="providerSearch" />
+              <span class="small text-body-secondary">
+                <span x-text="filteredPopularProvidersCount()"></span>
+                <span>/</span>
+                <span x-text="(popularProviders || []).length"></span>
+                <span>shown</span>
+              </span>
+            </div>
+            <div class="border rounded p-2" style="max-height:52vh; overflow:auto;">
+              <div class="row g-2 row-cols-1 row-cols-md-3">
+                <template x-for="p in filteredPopularProviders()" :key="p.name">
+                  <div class="col">
+                    <button type="button" class="btn border rounded-0 w-100 h-100 p-3 text-start d-flex align-items-center gap-2 provider-preset-btn" @click="selectProviderPreset(p.name)">
+                      <img :src="providerIconSrc(p.name)" :class="providerIconNeedsDarkInvert(p.name) ? 'provider-icon-invert-dark' : ''" @error="providerIconError($event)" alt="" width="28" height="28" style="object-fit:contain;" />
+                      <span class="fw-semibold" x-text="p.display_name"></span>
+                    </button>
+                  </div>
+                </template>
+              </div>
+              <div class="small text-body-secondary py-3 text-center" x-show="filteredPopularProvidersCount() === 0" style="display:none;">
+                No providers match the current search.
+              </div>
             </div>
             <div class="mt-3 d-flex justify-content-end">
               <button class="btn btn-outline-secondary" @click="closeAddProviderModal()">Cancel</button>
@@ -216,7 +314,7 @@
 
           <div x-show="addProviderStep === 'choose_auth'" style="display:none;">
             <div class="mb-3 d-flex align-items-center gap-2">
-              <img :src="providerIconSrc(selectedPreset)" @error="providerIconError($event)" alt="" width="28" height="28" style="object-fit:contain;" />
+              <img :src="providerIconSrc(selectedPreset)" :class="providerIconNeedsDarkInvert(selectedPreset) ? 'provider-icon-invert-dark' : ''" @error="providerIconError($event)" alt="" width="28" height="28" style="object-fit:contain;" />
               <span class="fw-semibold" x-text="selectedPresetDisplayName()"></span>
             </div>
             <div class="small text-body-secondary mb-3">Choose how you want to authenticate.</div>
@@ -266,7 +364,7 @@
                 <a :href="selectedPresetGetKeyURL()" target="_blank" rel="noopener noreferrer">Get API key</a>
               </div>
             </div>
-            <div class="form-check mb-2" x-show="selectedPreset" style="display:none;">
+            <div class="form-check form-switch mb-2" x-show="selectedPreset" style="display:none;">
               <input class="form-check-input" type="checkbox" id="overrideProviderSettingsApi" x-model="overrideProviderSettings">
               <label class="form-check-label" for="overrideProviderSettingsApi">Override preset endpoint/timeouts</label>
             </div>
@@ -276,7 +374,7 @@
                 <input class="form-control" type="number" min="1" x-model="draft.timeout_seconds" />
               </div>
             </div>
-            <div class="form-check mb-3">
+            <div class="form-check form-switch mb-3">
               <input class="form-check-input" type="checkbox" id="providerEnabledApi" x-model="draft.enabled">
               <label class="form-check-label" for="providerEnabledApi">Enabled</label>
             </div>
@@ -293,7 +391,7 @@
               <button class="btn btn-sm btn-outline-secondary" @click="goBackFromForm()">Back</button>
             </div>
             <div class="mb-2 d-flex align-items-center gap-2">
-              <img :src="providerIconSrc(selectedPreset)" @error="providerIconError($event)" alt="" width="28" height="28" style="object-fit:contain;" />
+              <img :src="providerIconSrc(selectedPreset)" :class="providerIconNeedsDarkInvert(selectedPreset) ? 'provider-icon-invert-dark' : ''" @error="providerIconError($event)" alt="" width="28" height="28" style="object-fit:contain;" />
               <span class="fw-semibold" x-text="selectedPresetDisplayName()"></span>
             </div>
             <div class="small text-body-secondary mb-3">Use official ChatGPT/Codex browser login. After successful sign-in, tokens are captured and stored automatically.</div>
@@ -305,6 +403,36 @@
               <button class="btn btn-outline-secondary" type="button" @click="cancelOAuthPolling()" :disabled="!oauthLoginInProgress">Cancel</button>
             </div>
             <div class="small text-body-secondary mb-2">If the browser did not open, allow popups and retry. This uses the same OpenAI OAuth flow as Codex tooling.</div>
+            <div class="mb-2">
+              <button class="btn btn-sm btn-outline-secondary" type="button" @click="oauthAdvanced = !oauthAdvanced">
+                <span x-show="!oauthAdvanced">Show advanced OAuth settings</span>
+                <span x-show="oauthAdvanced">Hide advanced OAuth settings</span>
+              </button>
+            </div>
+            <div class="border rounded p-2 mb-2" x-show="oauthAdvanced" style="display:none;">
+              <div class="row g-2">
+                <div class="col-12">
+                  <label class="form-label mb-1">Authorize URL</label>
+                  <input class="form-control" x-model="draft.oauth_authorize_url" placeholder="https://.../oauth/authorize" />
+                </div>
+                <div class="col-12">
+                  <label class="form-label mb-1">Token URL</label>
+                  <input class="form-control" x-model="draft.oauth_token_url" placeholder="https://.../oauth/token" />
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label mb-1">Client ID</label>
+                  <input class="form-control" x-model="draft.oauth_client_id" placeholder="oauth client id" />
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label mb-1">Client Secret (optional)</label>
+                  <input class="form-control" x-model="draft.oauth_client_secret" placeholder="oauth client secret" />
+                </div>
+                <div class="col-12">
+                  <label class="form-label mb-1">Scope (optional)</label>
+                  <input class="form-control" x-model="draft.oauth_scope" placeholder="openid profile email offline_access" />
+                </div>
+              </div>
+            </div>
             <div class="mb-2">
               <label class="form-label">Auth Token</label>
               <input class="form-control" x-model="draft.auth_token" placeholder="filled after browser login" />
@@ -321,7 +449,7 @@
               <button class="btn btn-sm btn-outline-secondary" @click="goBackFromForm()">Back</button>
             </div>
             <div class="mb-2 d-flex align-items-center gap-2">
-              <img :src="providerIconSrc(selectedPreset)" @error="providerIconError($event)" alt="" width="28" height="28" style="object-fit:contain;" />
+              <img :src="providerIconSrc(selectedPreset)" :class="providerIconNeedsDarkInvert(selectedPreset) ? 'provider-icon-invert-dark' : ''" @error="providerIconError($event)" alt="" width="28" height="28" style="object-fit:contain;" />
               <span class="fw-semibold" x-text="selectedPresetDisplayName()"></span>
             </div>
             <div class="small text-body-secondary mb-3">Step 1: enter a device code and open the provider binding page. Step 2: finish login there and paste the returned token here.</div>
@@ -342,6 +470,19 @@
                 <input class="form-control" x-model="draft.device_scope" placeholder="OAuth scope" />
               </div>
               <div class="small text-body-secondary mt-1">Uses provider device-code endpoint and auto-fills code + verification URL.</div>
+            </div>
+            <div class="mb-2" x-show="draft.device_token_url || selectedPresetSupportsDeviceTokenPolling()" style="display:none;">
+              <label class="form-label">Device Token Exchange</label>
+              <div class="input-group">
+                <input class="form-control" x-model="draft.device_token_url" placeholder="device token URL" />
+                <button class="btn btn-outline-primary" type="button" @click="pollDeviceToken()" :disabled="deviceTokenPollInProgress || !selectedPresetSupportsDeviceTokenPolling()">
+                  <span x-show="!deviceTokenPollInProgress">Poll Token</span>
+                  <span x-show="deviceTokenPollInProgress">Polling...</span>
+                </button>
+              </div>
+              <div class="mt-2">
+                <input class="form-control" x-model="draft.device_grant_type" placeholder="grant type (defaults to device_code)" />
+              </div>
             </div>
             <div class="mb-2">
               <label class="form-label">Device Code</label>
@@ -381,12 +522,12 @@
   </div>
 
   <div x-show="showAddAccessTokenModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeAddAccessTokenModal()">
-    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeAddAccessTokenModal()"></div>
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="!requiresInitialTokenSetup && closeAddAccessTokenModal()"></div>
     <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
       <div class="card shadow" style="width:100%;max-width:640px;">
         <div class="card-header d-flex justify-content-between align-items-center">
-          <h3 class="h5 mb-0">Add Access Key</h3>
-          <button class="btn btn-sm btn-outline-secondary" @click="closeAddAccessTokenModal()">X</button>
+          <h3 class="h5 mb-0" x-text="accessTokenDraft.id ? 'Edit Access Key' : 'Add Access Key'"></h3>
+          <button class="btn btn-sm btn-outline-secondary" x-show="!requiresInitialTokenSetup" style="display:none;" @click="closeAddAccessTokenModal()">X</button>
         </div>
         <div class="card-body">
           <div class="row g-2">
@@ -394,7 +535,15 @@
               <label class="form-label">Token Name</label>
               <input class="form-control" x-model="accessTokenDraft.name" placeholder="Required name" />
             </div>
-            <div class="col-md-7">
+            <div class="col-md-3">
+              <label class="form-label">Type</label>
+              <select class="form-select" x-model="accessTokenDraft.role" required>
+                <option value="inferrer">inferrer</option>
+                <option value="keymaster">keymaster</option>
+                <option value="admin">admin</option>
+              </select>
+            </div>
+            <div class="col-md-4">
               <label class="form-label">Expiry</label>
               <select class="form-select" x-model="accessTokenDraft.expiry_preset">
                 <option value="1d">1 day</option>
@@ -403,20 +552,27 @@
                 <option value="3m">3 months</option>
                 <option value="12m">12 months</option>
                 <option value="never">Never</option>
+                <option value="custom" x-show="accessTokenDraft.id" style="display:none;">Custom</option>
               </select>
             </div>
           </div>
-          <div class="mt-3">
+          <div class="mt-3" x-show="accessTokenDraft.expiry_preset === 'custom'" style="display:none;">
+            <label class="form-label">Custom Expiry (RFC3339)</label>
+            <input class="form-control" x-model="accessTokenDraft.expires_at" placeholder="2026-12-31T23:59:59Z" />
+          </div>
+          <div class="mt-3" x-show="!accessTokenDraft.id" style="display:none;">
             <label class="form-label">Key</label>
             <div class="input-group">
-              <input class="form-control" x-model="accessTokenDraft.key" />
+              <input class="form-control" x-model="accessTokenDraft.key" @click="copyAccessTokenKey()" title="Click to copy key" />
+              <button class="btn btn-outline-secondary" type="button" @click="copyAccessTokenKey()">Copy</button>
               <button class="btn btn-outline-secondary" type="button" @click="regenerateAccessTokenKey()">Generate</button>
             </div>
           </div>
-          <div class="small text-body-secondary mt-2">A random long key is generated by default. You can regenerate or edit before saving.</div>
+          <div class="small text-body-secondary mt-2" x-show="!accessTokenDraft.id" style="display:none;">A random long key is generated by default. You can regenerate or edit before saving.</div>
+          <div class="small text-body-secondary mt-2" x-show="accessTokenDraft.id" style="display:none;">API key value is hidden after creation and cannot be changed.</div>
           <div class="small mt-2" x-show="accessTokenStatusHtml" style="display:none;" x-html="accessTokenStatusHtml"></div>
           <div class="d-flex justify-content-end gap-2 mt-3">
-            <button class="btn btn-outline-secondary" @click="closeAddAccessTokenModal()">Cancel</button>
+            <button class="btn btn-outline-secondary" x-show="!requiresInitialTokenSetup" style="display:none;" @click="closeAddAccessTokenModal()">Cancel</button>
             <button class="btn btn-primary" @click="saveAccessToken()">Save</button>
           </div>
         </div>
