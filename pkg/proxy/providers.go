@@ -122,6 +122,7 @@ func (r *ProviderResolver) GetProviderByName(name string) (config.ProviderConfig
 
 func (r *ProviderResolver) Resolve(model string) (config.ProviderConfig, string, error) {
 	providers := r.ListProviders()
+	normalizedModel := normalizeModelID(model)
 	if model != "" {
 		if providerName, stripped, ok := splitModelPrefix(model); ok {
 			stripped = normalizeModelID(stripped)
@@ -132,6 +133,9 @@ func (r *ProviderResolver) Resolve(model string) (config.ProviderConfig, string,
 			}
 		}
 	}
+	if preferredProvider := preferredProviderForUnqualifiedModel(normalizedModel, providers); preferredProvider != nil {
+		return *preferredProvider, normalizedModel, nil
+	}
 	cfg := r.store.Snapshot()
 	if cfg.DefaultProvider != "" {
 		for _, p := range providers {
@@ -141,9 +145,27 @@ func (r *ProviderResolver) Resolve(model string) (config.ProviderConfig, string,
 		}
 	}
 	for _, p := range providers {
-		return p, normalizeModelID(model), nil
+		return p, normalizedModel, nil
 	}
 	return config.ProviderConfig{}, "", fmt.Errorf("no enabled providers configured")
+}
+
+func preferredProviderForUnqualifiedModel(model string, providers []config.ProviderConfig) *config.ProviderConfig {
+	model = strings.TrimSpace(strings.ToLower(model))
+	if model == "" {
+		return nil
+	}
+	if strings.HasPrefix(model, "gpt-") || strings.HasPrefix(model, "o") {
+		for i := range providers {
+			p := providers[i]
+			name := strings.ToLower(strings.TrimSpace(p.Name))
+			providerType := strings.ToLower(strings.TrimSpace(p.ProviderType))
+			if name == "openai" || providerType == "openai" {
+				return &providers[i]
+			}
+		}
+	}
+	return nil
 }
 
 func (r *ProviderResolver) DiscoverModels(ctx context.Context) ([]ModelCard, error) {

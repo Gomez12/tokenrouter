@@ -2,13 +2,15 @@ package proxy
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,10 +20,15 @@ import (
 	"time"
 	"unicode/utf8"
 
+	log "github.com/charmbracelet/log"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/klauspost/compress/zstd"
 	"github.com/lkarlslund/tokenrouter/pkg/cache"
 	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/conversations"
+	"github.com/lkarlslund/tokenrouter/pkg/logstore"
+	"github.com/lkarlslund/tokenrouter/pkg/logutil"
 	"github.com/lkarlslund/tokenrouter/pkg/pricing"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -31,6 +38,8 @@ type Server struct {
 	resolver              *ProviderResolver
 	stats                 *StatsStore
 	pricing               *pricing.Manager
+	conversations         *conversations.Store
+	logs                  *logstore.Store
 	providerHealthChecker *ProviderHealthChecker
 	adminHandler          *AdminHandler
 	httpServer            *http.Server
@@ -50,7 +59,16 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 		resolver:        resolver,
 		stats:           stats,
 		modelsCachePath: config.DefaultModelsCachePath(),
+		conversations: conversations.NewStore(config.DefaultConversationsPath(), conversations.Settings{
+			Enabled:    cfg.Conversations.Enabled,
+			MaxItems:   cfg.Conversations.MaxItems,
+			MaxAgeDays: cfg.Conversations.MaxAgeDays,
+		}),
+		logs: logstore.NewStore(config.DefaultLogsPath(), logstore.Settings{
+			MaxLines: cfg.Logs.MaxLines,
+		}),
 	}
+	logutil.SetOutputTee(s.logs.Writer())
 	s.loadModelsCacheFromDisk()
 	pricingMgr, err := pricing.NewManager(config.DefaultPricingCachePath())
 	if err != nil {
@@ -64,7 +82,7 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(s.proxyRequestLifecycleMiddleware)
-	r.Use(middleware.Logger)
+	r.Use(requestDebugLogMiddleware)
 	r.Use(middleware.Recoverer)
 
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
@@ -78,9 +96,11 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	r.With(s.authAPIMiddleware).Get("/v1", s.handleV1Root)
 
 	r.Route("/v1", func(v1 chi.Router) {
 		v1.Use(s.authAPIMiddleware)
+		v1.Get("/", s.handleV1Root)
 		v1.Get("/models", s.handleModels)
 		v1.Post("/chat/completions", s.proxyHandler)
 		v1.Post("/completions", s.proxyHandler)
@@ -90,6 +110,8 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 
 	instanceID := fmt.Sprintf("%d-%d", time.Now().UTC().UnixNano(), os.Getpid())
 	adminHandler := NewAdminHandler(store, stats, resolver, pricingMgr, s.providerHealthChecker, instanceID)
+	adminHandler.conversations = s.conversations
+	adminHandler.logs = s.logs
 	s.adminHandler = adminHandler
 	adminHandler.RegisterRoutes(r)
 
@@ -106,6 +128,14 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	defer func() {
+		if s.conversations != nil {
+			s.conversations.Flush()
+		}
+		if s.logs != nil {
+			s.logs.Flush()
+		}
+	}()
 	cfg := s.store.Snapshot()
 	errCh := make(chan error, 2)
 	go s.providerHealthChecker.Run(ctx)
@@ -129,14 +159,14 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 
 		go func() {
-			log.Printf("http challenge/redirect listening on :80")
+			log.Infof("http challenge/redirect listening on :80")
 			if err := httpChallenge.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("http challenge server: %w", err)
 			}
 		}()
 
 		go func() {
-			log.Printf("https listening on :443 for %s", cfg.TLS.Domain)
+			log.Infof("https listening on :443 for %s", cfg.TLS.Domain)
 			if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("https server: %w", err)
 			}
@@ -153,7 +183,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	go func() {
-		log.Printf("proxy listening on %s", cfg.ListenAddr)
+		log.Infof("proxy listening on %s", cfg.ListenAddr)
 		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("proxy server: %w", err)
 		}
@@ -170,6 +200,22 @@ func (s *Server) Run(ctx context.Context) error {
 
 func redirectHTTPS(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "https://"+r.Host+r.RequestURI, http.StatusMovedPermanently)
+}
+
+func requestDebugLogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		start := time.Now()
+		next.ServeHTTP(ww, r)
+		log.Debug("http request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", ww.Status(),
+			"bytes", ww.BytesWritten(),
+			"duration", time.Since(start).String(),
+			"remote", r.RemoteAddr,
+		)
+	})
 }
 
 func (s *Server) proxyRequestLifecycleMiddleware(next http.Handler) http.Handler {
@@ -195,11 +241,11 @@ func (s *Server) waitForProxyIdle(ctx context.Context) {
 	for {
 		active := s.activeProxyRequests.Load()
 		if active <= 0 {
-			log.Printf("shutdown: proxy idle")
+			log.Infof("shutdown: proxy idle")
 			return
 		}
 		if lastLog.IsZero() || time.Since(lastLog) >= time.Second {
-			log.Printf("shutdown: waiting for %d active proxy request(s)", active)
+			log.Infof("shutdown: waiting for %d active proxy request(s)", active)
 			lastLog = time.Now()
 		}
 		select {
@@ -245,6 +291,20 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
 }
 
+func (s *Server) handleV1Root(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"object":  "tokenrouter",
+		"service": "TokenRouter OpenAI-compatible API",
+		"paths": []string{
+			"/v1/models",
+			"/v1/chat/completions",
+			"/v1/completions",
+			"/v1/embeddings",
+			"/v1/responses",
+		},
+	})
+}
+
 func (s *Server) loadModelsCacheFromDisk() {
 	if s == nil || strings.TrimSpace(s.modelsCachePath) == "" {
 		return
@@ -275,12 +335,11 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	body, err := readRequestBody(r, 8<<20)
 	if err != nil {
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		http.Error(w, "failed to read request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	defer r.Body.Close()
 
 	model, mutatedBody, provider, upstreamModel, stream, err := s.prepareUpstreamRequest(body)
 	if err != nil {
@@ -288,6 +347,11 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientMeta := extractClientUsageMeta(r, s.store.Snapshot())
+	captureEnabled := isConversationCaptureEndpoint(r.URL.Path)
+	reqConversationID, reqPrevResponseID := parseConversationRequestIDs(body)
+	requestPayload := capJSONBytes(body, 128<<10)
+	requestText := extractPromptTextFromBody(body)
+	requestHeaders := sanitizeConversationRequestHeaders(r.Header)
 
 	start := time.Now()
 	if stream {
@@ -327,6 +391,35 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			usageLatency = durationFromProviderSeconds(usage.ProviderTotalSeconds)
 		}
 		s.recordUsageMeasured(provider.Name, model, upstreamModel, statusCode, usageLatency, usage.PromptTokens, usage.PromptCachedTokens, usage.CompletionTokens, usage.TotalTokens, promptTPS, genTPS, clientMeta)
+		if captureEnabled && s.adminHandler != nil {
+			streamPayload, _ := json.Marshal(map[string]any{
+				"id":     strings.TrimSpace(usage.ResponseID),
+				"object": "conversation_stream_capture",
+				"text":   strings.TrimSpace(usage.CapturedOutput),
+			})
+			s.adminHandler.RecordConversation(conversations.CaptureInput{
+				Timestamp:            time.Now().UTC(),
+				Endpoint:             normalizeConversationEndpoint(r.URL.Path),
+				Provider:             provider.Name,
+				Model:                upstreamModel,
+				RemoteIP:             clientMeta.ClientIP,
+				APIKeyName:           clientMeta.APIKeyName,
+				RequestHeaders:       requestHeaders,
+				ResponseHeaders:      sanitizeConversationResponseHeaders(upstreamHeader),
+				RequestPayload:       requestPayload,
+				ResponsePayload:      capJSONBytes(streamPayload, 128<<10),
+				RequestTextMarkdown:  requestText,
+				ResponseTextMarkdown: strings.TrimSpace(usage.CapturedOutput),
+				StatusCode:           statusCode,
+				LatencyMS:            latency.Milliseconds(),
+				Stream:               true,
+				ProtocolIDs: conversations.ProtocolIDs{
+					RequestConversationID:   reqConversationID,
+					RequestPreviousResponse: reqPrevResponseID,
+					ResponseID:              strings.TrimSpace(usage.ResponseID),
+				},
+			})
+		}
 		return
 	}
 
@@ -376,6 +469,31 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		usageLatency = durationFromProviderSeconds(metrics.TotalSeconds)
 	}
 	s.recordUsageMeasured(provider.Name, model, upstreamModel, statusCode, usageLatency, promptTokens, metrics.PromptCachedTokens, completionTokens, totalTokens, promptTPS, genTPS, clientMeta)
+	if captureEnabled && s.adminHandler != nil {
+		responseText := extractCompletionTextFromBody(respBody)
+		s.adminHandler.RecordConversation(conversations.CaptureInput{
+			Timestamp:            time.Now().UTC(),
+			Endpoint:             normalizeConversationEndpoint(r.URL.Path),
+			Provider:             provider.Name,
+			Model:                upstreamModel,
+			RemoteIP:             clientMeta.ClientIP,
+			APIKeyName:           clientMeta.APIKeyName,
+			RequestHeaders:       requestHeaders,
+			ResponseHeaders:      sanitizeConversationResponseHeaders(header),
+			RequestPayload:       requestPayload,
+			ResponsePayload:      capJSONBytes(respBody, 128<<10),
+			RequestTextMarkdown:  requestText,
+			ResponseTextMarkdown: responseText,
+			StatusCode:           statusCode,
+			LatencyMS:            latency.Milliseconds(),
+			Stream:               false,
+			ProtocolIDs: conversations.ProtocolIDs{
+				RequestConversationID:   reqConversationID,
+				RequestPreviousResponse: reqPrevResponseID,
+				ResponseID:              parseResponseID(respBody),
+			},
+		})
+	}
 }
 
 func (s *Server) prepareUpstreamRequest(body []byte) (incomingModel string, outBody []byte, provider config.ProviderConfig, upstreamModel string, stream bool, err error) {
@@ -463,6 +581,8 @@ type usageTokenCounts struct {
 	ProviderQueueSeconds      float64
 	ProviderTotalSeconds      float64
 	HasProviderTotalSeconds   bool
+	CapturedOutput            string
+	ResponseID                string
 }
 
 type clientUsageMeta struct {
@@ -558,6 +678,119 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 			return resp.StatusCode, upstreamHeader, parser.Usage(), initialLatency, readErr
 		}
 	}
+}
+
+func readRequestBody(r *http.Request, limit int64) ([]byte, error) {
+	body := r.Body
+	if body == nil {
+		return nil, io.EOF
+	}
+	defer body.Close()
+	raw, err := io.ReadAll(io.LimitReader(body, limit))
+	if err != nil {
+		return nil, err
+	}
+	encoding := strings.TrimSpace(strings.ToLower(r.Header.Get("Content-Encoding")))
+	if encoding == "" || encoding == "identity" {
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+			return raw, nil
+		}
+		if decoded, ok := decodeByMagic(raw, limit); ok {
+			return decoded, nil
+		}
+		return raw, nil
+	}
+	decoded, err := decodeRequestBytes(raw, encoding, limit)
+	if err == nil {
+		return decoded, nil
+	}
+	// Some clients send an incorrect content-encoding header while still
+	// sending plain JSON. In that case, prefer raw payload if it looks like JSON.
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		return raw, nil
+	}
+	return nil, err
+}
+
+func decodeRequestBytes(raw []byte, encoding string, limit int64) ([]byte, error) {
+	parts := strings.Split(encoding, ",")
+	decoded := raw
+	for i := len(parts) - 1; i >= 0; i-- {
+		enc := strings.TrimSpace(strings.ToLower(parts[i]))
+		if enc == "" || enc == "identity" {
+			continue
+		}
+		out, err := decodeSingleEncoding(decoded, enc, limit)
+		if err != nil {
+			return nil, err
+		}
+		decoded = out
+	}
+	return decoded, nil
+}
+
+func decodeSingleEncoding(raw []byte, encoding string, limit int64) ([]byte, error) {
+	in := bytes.NewReader(raw)
+	switch encoding {
+	case "gzip":
+		gr, err := gzip.NewReader(in)
+		if err != nil {
+			return nil, fmt.Errorf("decode gzip: %w", err)
+		}
+		defer gr.Close()
+		return io.ReadAll(io.LimitReader(gr, limit))
+	case "deflate":
+		zr, zErr := zlib.NewReader(in)
+		if zErr == nil {
+			defer zr.Close()
+			return io.ReadAll(io.LimitReader(zr, limit))
+		}
+		fr := flate.NewReader(in)
+		defer fr.Close()
+		return io.ReadAll(io.LimitReader(fr, limit))
+	case "zstd":
+		zr, err := zstd.NewReader(in)
+		if err != nil {
+			return nil, fmt.Errorf("decode zstd: %w", err)
+		}
+		defer zr.Close()
+		return io.ReadAll(io.LimitReader(zr, limit))
+	default:
+		return nil, fmt.Errorf("unsupported content-encoding %q", encoding)
+	}
+}
+
+func decodeByMagic(raw []byte, limit int64) ([]byte, bool) {
+	// zstd frame magic bytes: 28 B5 2F FD
+	if len(raw) >= 4 && raw[0] == 0x28 && raw[1] == 0xB5 && raw[2] == 0x2F && raw[3] == 0xFD {
+		if b, err := decodeSingleEncoding(raw, "zstd", limit); err == nil {
+			trim := bytes.TrimSpace(b)
+			if len(trim) > 0 && (trim[0] == '{' || trim[0] == '[') {
+				return b, true
+			}
+		}
+	}
+	// gzip magic bytes: 1F 8B
+	if len(raw) >= 2 && raw[0] == 0x1F && raw[1] == 0x8B {
+		if b, err := decodeSingleEncoding(raw, "gzip", limit); err == nil {
+			trim := bytes.TrimSpace(b)
+			if len(trim) > 0 && (trim[0] == '{' || trim[0] == '[') {
+				return b, true
+			}
+		}
+	}
+	// zlib usually starts with 0x78 (common: 78 9C, 78 DA, 78 01).
+	if len(raw) >= 1 && raw[0] == 0x78 {
+		if b, err := decodeSingleEncoding(raw, "deflate", limit); err == nil {
+			trim := bytes.TrimSpace(b)
+			if len(trim) > 0 && (trim[0] == '{' || trim[0] == '[') {
+				return b, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func isOpenAICodexProvider(provider config.ProviderConfig) bool {
@@ -744,6 +977,7 @@ func (p *sseUsageParser) Consume(chunk []byte) {
 		if data == "" || data == "[DONE]" {
 			continue
 		}
+		p.captureStreamFields([]byte(data))
 		prompt, completion, total := parseUsageTokens([]byte(data))
 		metrics := parseProviderUsageMetrics([]byte(data))
 		p.merge(prompt, metrics.PromptCachedTokens, completion, total, metrics)
@@ -751,6 +985,34 @@ func (p *sseUsageParser) Consume(chunk []byte) {
 			p.usage.EstimatedCompletionTokens += estimateCompletionTokensFromResponse([]byte(data))
 		}
 	}
+}
+
+func (p *sseUsageParser) captureStreamFields(data []byte) {
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return
+	}
+	if p.usage.ResponseID == "" {
+		if rid := strings.TrimSpace(asString(payload["id"])); rid != "" && rid != "<nil>" {
+			p.usage.ResponseID = rid
+		}
+	}
+	if p.usage.ResponseID == "" {
+		if resp, ok := payload["response"].(map[string]any); ok {
+			if rid := strings.TrimSpace(asString(resp["id"])); rid != "" && rid != "<nil>" {
+				p.usage.ResponseID = rid
+			}
+		}
+	}
+	chunkText := strings.TrimSpace(extractCompletionText(payload))
+	if chunkText == "" {
+		return
+	}
+	if p.usage.CapturedOutput == "" {
+		p.usage.CapturedOutput = chunkText
+		return
+	}
+	p.usage.CapturedOutput += chunkText
 }
 
 func (p *sseUsageParser) Usage() usageTokenCounts {
@@ -1115,6 +1377,182 @@ func firstErr(ch <-chan error) error {
 		return err
 	default:
 		return nil
+	}
+}
+
+func isConversationCaptureEndpoint(path string) bool {
+	switch strings.TrimSpace(path) {
+	case "/v1/chat/completions", "/v1/responses":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeConversationEndpoint(path string) string {
+	switch strings.TrimSpace(path) {
+	case "/v1/chat/completions":
+		return "chat.completions"
+	case "/v1/responses":
+		return "responses"
+	default:
+		return strings.TrimSpace(path)
+	}
+}
+
+func parseConversationRequestIDs(body []byte) (conversationID string, previousResponseID string) {
+	if len(body) == 0 {
+		return "", ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", ""
+	}
+	conversationID = strings.TrimSpace(asStringAny(firstMapValueAny(payload, "conversation_id", "conversationId")))
+	previousResponseID = strings.TrimSpace(asStringAny(firstMapValueAny(payload, "previous_response_id", "previousResponseId")))
+	return conversationID, previousResponseID
+}
+
+func parseResponseID(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	if rid := strings.TrimSpace(asStringAny(payload["id"])); rid != "" && rid != "<nil>" {
+		return rid
+	}
+	if resp, ok := payload["response"].(map[string]any); ok {
+		if rid := strings.TrimSpace(asStringAny(resp["id"])); rid != "" && rid != "<nil>" {
+			return rid
+		}
+	}
+	return ""
+}
+
+func extractPromptTextFromBody(body []byte) string {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(extractPromptText(payload))
+}
+
+func extractCompletionTextFromBody(body []byte) string {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(extractCompletionText(payload))
+}
+
+func capJSONBytes(in []byte, max int) []byte {
+	if len(in) == 0 {
+		return nil
+	}
+	normalize := func(b []byte) []byte {
+		if json.Valid(b) {
+			out := make([]byte, len(b))
+			copy(out, b)
+			return out
+		}
+		encoded, _ := json.Marshal(string(b))
+		return encoded
+	}
+	if max <= 0 || len(in) <= max {
+		return normalize(in)
+	}
+	trimmed := append([]byte(nil), in[:max]...)
+	ellipsis := []byte(`"...(truncated)"`)
+	if len(trimmed) > len(ellipsis) {
+		copy(trimmed[len(trimmed)-len(ellipsis):], ellipsis)
+	}
+	return normalize(trimmed)
+}
+
+func sanitizeConversationRequestHeaders(h http.Header) map[string]string {
+	return sanitizeConversationHeaders(h, true)
+}
+
+func sanitizeConversationResponseHeaders(h http.Header) map[string]string {
+	return sanitizeConversationHeaders(h, false)
+}
+
+func sanitizeConversationHeaders(h http.Header, request bool) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for k, vals := range h {
+		key := strings.ToLower(strings.TrimSpace(k))
+		if key == "" {
+			continue
+		}
+		if isSensitiveHeader(key) {
+			out[key] = "[redacted]"
+			continue
+		}
+		if !isAllowedConversationHeader(key, request) {
+			continue
+		}
+		out[key] = strings.TrimSpace(strings.Join(vals, ", "))
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func isSensitiveHeader(key string) bool {
+	return key == "authorization" || key == "cookie" || key == "set-cookie" ||
+		strings.Contains(key, "token") || strings.Contains(key, "secret") ||
+		strings.Contains(key, "api-key") || strings.Contains(key, "apikey") ||
+		strings.Contains(key, "auth")
+}
+
+func isAllowedConversationHeader(key string, request bool) bool {
+	if strings.HasPrefix(key, "x-") {
+		return true
+	}
+	if strings.HasPrefix(key, "ratelimit-") {
+		return true
+	}
+	if strings.HasPrefix(key, "openai-") {
+		return true
+	}
+	if request {
+		switch key {
+		case "user-agent", "content-type", "accept", "origin", "referer":
+			return true
+		}
+		return false
+	}
+	switch key {
+	case "content-type", "retry-after":
+		return true
+	}
+	return false
+}
+
+func firstMapValueAny(m map[string]any, keys ...string) any {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			return v
+		}
+	}
+	return nil
+}
+
+func asStringAny(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case json.Number:
+		return t.String()
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", v))
 	}
 }
 

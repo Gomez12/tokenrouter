@@ -25,6 +25,8 @@
   </script>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/css/bootstrap.min.css" rel="stylesheet">
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
   <script defer src="/admin/static/admin.js"></script>
   <style>
     [data-bs-theme="light"] body {
@@ -59,6 +61,43 @@
     .form-switch .form-check-label {
       padding-top: 0.05rem;
     }
+
+    .icon-btn {
+      border: 0;
+      background: transparent;
+      color: var(--bs-body-color);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 2rem;
+      min-height: 2rem;
+      padding: 0.15rem 0.35rem;
+      border-radius: 0.375rem;
+      line-height: 1;
+      font-size: 1.35rem;
+      cursor: pointer;
+    }
+
+    .icon-btn:hover,
+    .icon-btn:focus-visible {
+      background: color-mix(in srgb, var(--bs-secondary-bg) 70%, transparent);
+      outline: none;
+    }
+
+    .icon-btn svg {
+      width: 1.25rem !important;
+      height: 1.25rem !important;
+    }
+
+    .icon-btn-danger {
+      color: var(--bs-danger-text-emphasis);
+    }
+
+    .icon-btn[disabled] {
+      opacity: 0.45;
+      cursor: default;
+      pointer-events: none;
+    }
   </style>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
@@ -76,7 +115,7 @@
         </div>
         <div class="d-flex gap-2">
           <button
-            class="btn btn-sm btn-outline-secondary"
+            class="icon-btn"
             type="button"
             @click="cycleTheme()"
             :title="themeButtonLabel()"
@@ -95,6 +134,12 @@
   <ul class="nav nav-tabs mb-0">
     <li class="nav-item">
       <button class="nav-link rounded-top" :class="activeTab==='status' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('status')">Status</button>
+    </li>
+    <li class="nav-item">
+      <button class="nav-link rounded-top" :class="activeTab==='conversations' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('conversations')">Conversations</button>
+    </li>
+    <li class="nav-item">
+      <button class="nav-link rounded-top" :class="activeTab==='log' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('log')">Log</button>
     </li>
     <li class="nav-item">
       <button class="nav-link rounded-top" :class="activeTab==='quota' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('quota')">Quota</button>
@@ -116,7 +161,17 @@
         <div class="d-flex align-items-center justify-content-between mb-2">
           <h2 class="h5 mb-0">Usage Stats</h2>
           <div class="d-flex align-items-center gap-2">
-            <select class="form-select form-select-sm" style="width:auto;" x-model="statsRangeHours" @change="loadStats(true)">
+            <select class="form-select form-select-sm" style="width:auto;" x-model="statusUpdateSpeed" @change="setStatusUpdateSpeed($event.target.value)">
+              <option value="realtime">realtime</option>
+              <option value="2s">2s</option>
+              <option value="10s">10s</option>
+              <option value="30s">30s</option>
+              <option value="1m">1m</option>
+              <option value="5m">5m</option>
+              <option value="15m">15m</option>
+              <option value="disabled">disabled</option>
+            </select>
+            <select class="form-select form-select-sm" style="width:auto;" x-model="statsRangeHours" @change="setStatsRangeHours($event.target.value)">
               <option value="1">1h</option>
               <option value="4">4h</option>
               <option value="8">8h</option>
@@ -127,6 +182,99 @@
           </div>
         </div>
         <div x-html="statsSummaryHtml"></div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="activeTab==='conversations'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex flex-wrap align-items-start justify-content-between gap-2 mb-2">
+          <h2 class="h5 mb-0">Conversations</h2>
+          <div class="d-flex flex-wrap align-items-center gap-2">
+            <button class="icon-btn" title="Conversation settings" aria-label="Conversation settings" @click="openConversationsSettingsModal()">⚙</button>
+            <input class="form-control form-control-sm" style="width:320px;" placeholder="Filter conversations..." x-model.trim="conversationsSearch" @input="debouncedLoadConversations()" />
+            <button class="btn btn-sm btn-outline-primary" @click="loadConversations()">Refresh</button>
+          </div>
+        </div>
+        <div class="small text-body-secondary mb-2" x-show="conversationsStatusHtml" style="display:none;" x-html="conversationsStatusHtml"></div>
+        <div class="row g-3">
+          <div class="col-lg-4">
+            <div class="border rounded p-2" style="max-height:68vh; overflow:auto;" x-html="conversationsListHtml"></div>
+            <div x-html="conversationsPagerHtml"></div>
+          </div>
+          <div class="col-lg-8">
+            <div class="border rounded p-2" style="max-height:68vh; overflow:auto;" x-html="conversationDetailHtml"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="showConversationsSettingsModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeConversationsSettingsModal()">
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeConversationsSettingsModal()"></div>
+    <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
+      <div class="card shadow" style="width:100%;max-width:560px;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="h5 mb-0">Conversation Settings</h3>
+          <button class="icon-btn" @click="closeConversationsSettingsModal()" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="card-body">
+          <div class="form-check form-switch mb-3">
+            <input class="form-check-input" type="checkbox" id="conversationsEnabled" x-model="conversationsSettings.enabled">
+            <label class="form-check-label" for="conversationsEnabled">Enabled</label>
+          </div>
+          <div class="row g-2 mb-3">
+            <div class="col-md-6">
+              <label class="form-label">Max items</label>
+              <input class="form-control" type="number" min="100" max="200000" step="100" x-model.number="conversationsSettings.max_items" />
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Max age days</label>
+              <input class="form-control" type="number" min="1" step="1" x-model.number="conversationsSettings.max_age_days" />
+            </div>
+          </div>
+          <div class="small text-body-secondary mb-3">Retention applies to persisted conversation data.</div>
+          <div class="d-flex justify-content-end gap-2">
+            <button class="btn btn-outline-secondary" @click="closeConversationsSettingsModal()">Cancel</button>
+            <button class="btn btn-primary" :disabled="conversationsSaveInProgress" @click="saveConversationsSettings()">
+              <span x-show="!conversationsSaveInProgress">Save</span>
+              <span x-show="conversationsSaveInProgress">Saving...</span>
+            </button>
+          </div>
+          <div class="small text-body-secondary mt-3" x-show="conversationsStatusHtml" style="display:none;" x-html="conversationsStatusHtml"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="activeTab==='log'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+          <h2 class="h5 mb-0">Log</h2>
+          <div class="d-flex flex-wrap align-items-center gap-2">
+            <select class="form-select form-select-sm" style="width:auto;" x-model="logLevelFilter" @change="loadLogs()">
+              <option value="all">all</option>
+              <option value="debug">debug</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+              <option value="fatal">fatal</option>
+            </select>
+            <input class="form-control form-control-sm" style="width:320px;" placeholder="Filter log entries..." x-model.trim="logSearch" @input="debouncedLoadLogs()" />
+            <input class="form-control form-control-sm" style="width:130px;" type="number" min="100" max="200000" step="100" x-model.number="logMaxLines" />
+            <button class="btn btn-sm btn-outline-primary" :disabled="logSaveInProgress" @click="saveLogSettings()">
+              <span x-show="!logSaveInProgress">Save</span>
+              <span x-show="logSaveInProgress">Saving...</span>
+            </button>
+            <button class="btn btn-sm btn-outline-danger" @click="clearLogs()" :disabled="!logEntries || logEntries.length === 0">Clear log</button>
+            <button class="btn btn-sm btn-outline-primary" @click="loadLogs()">Refresh</button>
+          </div>
+        </div>
+        <div class="small text-body-secondary mb-2" x-show="logStatusHtml" style="display:none;" x-html="logStatusHtml"></div>
+        <div class="small text-body-secondary mb-2">Entries shown: <span x-text="logEntriesShownCount"></span> of <span x-text="logEntriesTotalCount"></span></div>
+        <div class="border rounded p-2" style="max-height:70vh; overflow:auto;" x-html="logEntriesHtml"></div>
       </div>
     </div>
   </div>
@@ -278,7 +426,7 @@
       <div class="card shadow" style="width:100%;max-width:860px;">
         <div class="card-header d-flex justify-content-between align-items-center">
           <h3 class="h5 mb-0" x-text="addProviderTitle()"></h3>
-          <button class="btn btn-sm btn-outline-secondary" @click="closeAddProviderModal()">X</button>
+          <button class="icon-btn" @click="closeAddProviderModal()" title="Close" aria-label="Close">✕</button>
         </div>
         <div class="card-body">
           <div x-show="addProviderStep === 'pick_provider'" style="display:none;">
@@ -527,7 +675,7 @@
       <div class="card shadow" style="width:100%;max-width:640px;">
         <div class="card-header d-flex justify-content-between align-items-center">
           <h3 class="h5 mb-0" x-text="accessTokenDraft.id ? 'Edit Access Key' : 'Add Access Key'"></h3>
-          <button class="btn btn-sm btn-outline-secondary" x-show="!requiresInitialTokenSetup" style="display:none;" @click="closeAddAccessTokenModal()">X</button>
+          <button class="icon-btn" x-show="!requiresInitialTokenSetup" style="display:none;" @click="closeAddAccessTokenModal()" title="Close" aria-label="Close">✕</button>
         </div>
         <div class="card-body">
           <div class="row g-2">

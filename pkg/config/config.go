@@ -45,6 +45,16 @@ type TLSConfig struct {
 	CacheDir string `toml:"cache_dir"`
 }
 
+type ConversationsConfig struct {
+	Enabled    bool `toml:"enabled"`
+	MaxItems   int  `toml:"max_items,omitempty"`
+	MaxAgeDays int  `toml:"max_age_days,omitempty"`
+}
+
+type LogsConfig struct {
+	MaxLines int `toml:"max_lines,omitempty"`
+}
+
 type IncomingAPIToken struct {
 	ID        string `toml:"id"`
 	Name      string `toml:"name"`
@@ -57,14 +67,16 @@ type IncomingAPIToken struct {
 }
 
 type ServerConfig struct {
-	ListenAddr                    string             `toml:"listen_addr"`
-	IncomingTokens                []IncomingAPIToken `toml:"incoming_tokens"`
-	AllowLocalhostNoAuth          bool               `toml:"allow_localhost_no_auth"`
-	AllowHostDockerInternalNoAuth bool               `toml:"allow_host_docker_internal_no_auth"`
-	AutoEnablePublicFreeModels    bool               `toml:"auto_enable_public_free_models"`
-	DefaultProvider               string             `toml:"default_provider"`
-	Providers                     []ProviderConfig   `toml:"providers"`
-	TLS                           TLSConfig          `toml:"tls"`
+	ListenAddr                    string              `toml:"listen_addr"`
+	IncomingTokens                []IncomingAPIToken  `toml:"incoming_tokens"`
+	AllowLocalhostNoAuth          bool                `toml:"allow_localhost_no_auth"`
+	AllowHostDockerInternalNoAuth bool                `toml:"allow_host_docker_internal_no_auth"`
+	AutoEnablePublicFreeModels    bool                `toml:"auto_enable_public_free_models"`
+	DefaultProvider               string              `toml:"default_provider"`
+	Providers                     []ProviderConfig    `toml:"providers"`
+	Conversations                 ConversationsConfig `toml:"conversations"`
+	Logs                          LogsConfig          `toml:"logs"`
+	TLS                           TLSConfig           `toml:"tls"`
 }
 
 type ClientConfig struct {
@@ -112,12 +124,36 @@ func DefaultModelsCachePath() string {
 	return filepath.Join(home, ".cache", "tokenrouter", "models-cache.json")
 }
 
+func DefaultConversationsPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "conversations.json"
+	}
+	return filepath.Join(home, ".cache", "tokenrouter", "conversations.json")
+}
+
+func DefaultLogsPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "logs.json"
+	}
+	return filepath.Join(home, ".cache", "tokenrouter", "logs.json")
+}
+
 func NewDefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
 		ListenAddr:      ":8080",
 		IncomingTokens:  []IncomingAPIToken{},
 		DefaultProvider: "",
 		Providers:       []ProviderConfig{},
+		Conversations: ConversationsConfig{
+			Enabled:    true,
+			MaxItems:   5000,
+			MaxAgeDays: 30,
+		},
+		Logs: LogsConfig{
+			MaxLines: 5000,
+		},
 		TLS: TLSConfig{
 			Enabled:  false,
 			Domain:   "",
@@ -334,6 +370,15 @@ func (c *ServerConfig) Normalize() {
 	if c.TLS.CacheDir == "" {
 		c.TLS.CacheDir = filepath.Join(os.TempDir(), "tokenrouter-autocert")
 	}
+	if c.Conversations.MaxItems <= 0 {
+		c.Conversations.MaxItems = 5000
+	}
+	if c.Conversations.MaxAgeDays <= 0 {
+		c.Conversations.MaxAgeDays = 30
+	}
+	if c.Logs.MaxLines <= 0 {
+		c.Logs.MaxLines = 5000
+	}
 	tokenSeen := map[string]struct{}{}
 	tokens := make([]IncomingAPIToken, 0, len(c.IncomingTokens))
 	for i, t := range c.IncomingTokens {
@@ -412,6 +457,21 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.TLS.Enabled && c.TLS.Domain == "" {
 		return errors.New("tls.domain is required when tls.enabled=true")
+	}
+	if c.Conversations.MaxItems < 100 {
+		return errors.New("conversations.max_items must be >= 100")
+	}
+	if c.Conversations.MaxItems > 200000 {
+		return errors.New("conversations.max_items must be <= 200000")
+	}
+	if c.Conversations.MaxAgeDays < 1 {
+		return errors.New("conversations.max_age_days must be >= 1")
+	}
+	if c.Logs.MaxLines < 100 {
+		return errors.New("logs.max_lines must be >= 100")
+	}
+	if c.Logs.MaxLines > 200000 {
+		return errors.New("logs.max_lines must be <= 200000")
 	}
 	nameSeen := map[string]struct{}{}
 	for _, p := range c.Providers {

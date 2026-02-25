@@ -32,6 +32,8 @@ import (
 	"github.com/lkarlslund/tokenrouter/pkg/assets"
 	"github.com/lkarlslund/tokenrouter/pkg/cache"
 	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/conversations"
+	"github.com/lkarlslund/tokenrouter/pkg/logstore"
 	"github.com/lkarlslund/tokenrouter/pkg/pricing"
 	"github.com/lkarlslund/tokenrouter/pkg/version"
 	"golang.org/x/crypto/acme"
@@ -46,6 +48,8 @@ type AdminHandler struct {
 	stats         *StatsStore
 	resolver      *ProviderResolver
 	pricing       *pricing.Manager
+	conversations *conversations.Store
+	logs          *logstore.Store
 	healthChecker *ProviderHealthChecker
 	instance      string
 	oauthMu       sync.Mutex
@@ -88,7 +92,7 @@ type quotaCacheValue struct {
 const quotaRefreshOK = 15 * time.Minute
 const quotaRefreshError = 30 * time.Second
 const statsRefreshInterval = 15 * time.Minute
-const adminRealtimeInterval = 10 * time.Second
+const adminRealtimeInterval = 2 * time.Second
 
 type modelListResponse struct {
 	Data []struct {
@@ -152,6 +156,14 @@ func (h *AdminHandler) RegisterRoutes(r chi.Router) {
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/models/refresh", h.refreshModelsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/models", h.modelsCatalogAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/models/catalog", h.modelsCatalogAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/settings/conversations", h.conversationsSettingsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/settings/conversations", h.conversationsSettingsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/settings/logs", h.logsSettingsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/settings/logs", h.logsSettingsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/logs", h.logsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Delete("/admin/api/logs", h.logsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/conversations", h.conversationsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/conversations/{id}", h.conversationByIDAPI)
 }
 
 func (h *AdminHandler) runRealtimeTicker() {
@@ -180,6 +192,22 @@ func (h *AdminHandler) broadcastAdminEvent(event map[string]any) {
 		default:
 		}
 	}
+}
+
+func (h *AdminHandler) RecordConversation(in conversations.CaptureInput) {
+	if h == nil || h.conversations == nil {
+		return
+	}
+	rec, ok := h.conversations.Add(in)
+	if !ok {
+		return
+	}
+	h.broadcastAdminEvent(map[string]any{
+		"type":             "conversation_append",
+		"conversation_key": rec.ConversationKey,
+		"id":               rec.ID,
+		"updated_at":       rec.UpdatedAt.Format(time.RFC3339Nano),
+	})
 }
 
 func (h *AdminHandler) registerWSClient(ch chan []byte) {
@@ -614,13 +642,9 @@ func (h *AdminHandler) statsAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []config.ProviderConfig) map[string]ProviderQuotaSnapshot {
-	popular, err := getPopularProviders()
+	byName, err := popularProvidersByName()
 	if err != nil {
 		return nil
-	}
-	byName := make(map[string]assets.PopularProvider, len(popular))
-	for _, p := range popular {
-		byName[p.Name] = p
 	}
 	out := map[string]ProviderQuotaSnapshot{}
 	for _, p := range providers {
@@ -647,6 +671,44 @@ func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []confi
 
 func quotaReaderFromPreset(preset assets.PopularProvider) string {
 	return strings.TrimSpace(preset.QuotaReader)
+}
+
+func popularProvidersByName() (map[string]assets.PopularProvider, error) {
+	popular, err := getPopularProviders()
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]assets.PopularProvider, len(popular))
+	for _, p := range popular {
+		byName[p.Name] = p
+	}
+	return byName, nil
+}
+
+func presetForProvider(p config.ProviderConfig) (assets.PopularProvider, bool) {
+	byName, err := popularProvidersByName()
+	if err != nil {
+		return assets.PopularProvider{}, false
+	}
+	preset, ok := byName[providerTypeOrName(p)]
+	return preset, ok
+}
+
+func providerBaseURLOrPreset(p config.ProviderConfig, preset assets.PopularProvider) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	if baseURL != "" {
+		return baseURL
+	}
+	return strings.TrimRight(strings.TrimSpace(preset.BaseURL), "/")
+}
+
+func quotaProbeModelCandidates(preset assets.PopularProvider, modelsBody []byte, fallbacks ...string) []string {
+	allFallbacks := make([]string, 0, len(preset.QuotaProbeModels)+len(fallbacks))
+	for _, id := range preset.QuotaProbeModels {
+		allFallbacks = append(allFallbacks, strings.TrimSpace(id))
+	}
+	allFallbacks = append(allFallbacks, fallbacks...)
+	return modelIDsFromModelsBody(modelsBody, allFallbacks...)
 }
 
 func (h *AdminHandler) runQuotaReader(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
@@ -747,13 +809,9 @@ func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header h
 	if h == nil || len(header) == 0 {
 		return
 	}
-	popular, err := getPopularProviders()
+	byName, err := popularProvidersByName()
 	if err != nil {
 		return
-	}
-	byName := make(map[string]assets.PopularProvider, len(popular))
-	for _, pp := range popular {
-		byName[pp.Name] = pp
 	}
 	preset, ok := byName[providerTypeOrName(p)]
 	if !ok {
@@ -927,18 +985,19 @@ func (h *AdminHandler) ensureProviderOAuthTokenFresh(ctx context.Context, p conf
 }
 
 func (h *AdminHandler) readOpenAICodexQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
-	token := strings.TrimSpace(p.AuthToken)
-	tokenFromAuth := token != ""
-	if token == "" {
-		token = strings.TrimSpace(p.APIKey)
-	}
+	token, tokenFromAuth := providerTokenPreferAuth(p)
 	if token == "" {
 		snap.Error = "missing auth token"
 		return snap
 	}
-	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
-	if tokenFromAuth && (baseURL == "" || strings.Contains(strings.ToLower(baseURL), "api.openai.com")) {
-		baseURL = "https://chatgpt.com/backend-api"
+	preset, _ := presetForProvider(p)
+	baseURL := providerBaseURLOrPreset(p, preset)
+	oauthBaseURL := strings.TrimRight(strings.TrimSpace(preset.OAuthBaseURL), "/")
+	if tokenFromAuth && (baseURL == "" || strings.Contains(strings.ToLower(baseURL), "api.openai.com")) && oauthBaseURL != "" {
+		baseURL = oauthBaseURL
+	}
+	if baseURL == "" && oauthBaseURL != "" {
+		baseURL = oauthBaseURL
 	}
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api"
@@ -1227,17 +1286,16 @@ func extractAntigravityProjectID(body []byte) string {
 }
 
 func (h *AdminHandler) readGroqQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
-	token := strings.TrimSpace(p.APIKey)
-	if token == "" {
-		token = strings.TrimSpace(p.AuthToken)
-	}
+	token := providerTokenPreferAPIKey(p)
 	if token == "" {
 		snap.Error = "missing api key"
 		return snap
 	}
-	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	preset, _ := presetForProvider(p)
+	baseURL := providerBaseURLOrPreset(p, preset)
 	if baseURL == "" {
-		baseURL = "https://api.groq.com/openai/v1"
+		snap.Error = "base_url is required"
+		return snap
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -1276,7 +1334,7 @@ func (h *AdminHandler) readGroqQuota(ctx context.Context, p config.ProviderConfi
 		metrics = append(metrics, m)
 	}
 	if len(metrics) == 0 {
-		chatMetrics, chatErr := h.readGroqQuotaFromTinyChat(ctx, p, baseURL, token)
+		chatMetrics, chatErr := h.readGroqQuotaFromTinyChat(ctx, p, preset, baseURL, token, body)
 		if chatErr == nil && len(chatMetrics) > 0 {
 			metrics = chatMetrics
 		}
@@ -1299,17 +1357,16 @@ func (h *AdminHandler) readGroqQuota(ctx context.Context, p config.ProviderConfi
 }
 
 func (h *AdminHandler) readMistralQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
-	token := strings.TrimSpace(p.APIKey)
-	if token == "" {
-		token = strings.TrimSpace(p.AuthToken)
-	}
+	token := providerTokenPreferAPIKey(p)
 	if token == "" {
 		snap.Error = "missing api key"
 		return snap
 	}
-	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	preset, _ := presetForProvider(p)
+	baseURL := providerBaseURLOrPreset(p, preset)
 	if baseURL == "" {
-		baseURL = "https://api.mistral.ai/v1"
+		snap.Error = "base_url is required"
+		return snap
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -1341,7 +1398,7 @@ func (h *AdminHandler) readMistralQuota(ctx context.Context, p config.ProviderCo
 	}
 	metrics := mistralMetricsFromHeaders(resp.Header)
 	if len(metrics) == 0 {
-		chatMetrics, chatErr := h.readMistralQuotaFromTinyChat(ctx, p, baseURL, token, body)
+		chatMetrics, chatErr := h.readMistralQuotaFromTinyChat(ctx, p, preset, baseURL, token, body)
 		if chatErr == nil && len(chatMetrics) > 0 {
 			metrics = chatMetrics
 		}
@@ -1367,17 +1424,16 @@ func (h *AdminHandler) readMistralQuota(ctx context.Context, p config.ProviderCo
 }
 
 func (h *AdminHandler) readHuggingFaceQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
-	token := strings.TrimSpace(p.APIKey)
-	if token == "" {
-		token = strings.TrimSpace(p.AuthToken)
-	}
+	token := providerTokenPreferAPIKey(p)
 	if token == "" {
 		snap.Error = "missing api key"
 		return snap
 	}
-	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	preset, _ := presetForProvider(p)
+	baseURL := providerBaseURLOrPreset(p, preset)
 	if baseURL == "" {
-		baseURL = "https://router.huggingface.co/v1"
+		snap.Error = "base_url is required"
+		return snap
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -1410,7 +1466,7 @@ func (h *AdminHandler) readHuggingFaceQuota(ctx context.Context, p config.Provid
 
 	metrics := huggingFaceMetricsFromHeaders(resp.Header)
 	if len(metrics) == 0 {
-		chatMetrics, chatErr := h.readHuggingFaceQuotaFromTinyChat(ctx, p, baseURL, token, body)
+		chatMetrics, chatErr := h.readHuggingFaceQuotaFromTinyChat(ctx, p, preset, baseURL, token, body)
 		if chatErr == nil && len(chatMetrics) > 0 {
 			metrics = chatMetrics
 		}
@@ -1436,17 +1492,16 @@ func (h *AdminHandler) readHuggingFaceQuota(ctx context.Context, p config.Provid
 }
 
 func (h *AdminHandler) readCerebrasQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
-	token := strings.TrimSpace(p.APIKey)
-	if token == "" {
-		token = strings.TrimSpace(p.AuthToken)
-	}
+	token := providerTokenPreferAPIKey(p)
 	if token == "" {
 		snap.Error = "missing api key"
 		return snap
 	}
-	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	preset, _ := presetForProvider(p)
+	baseURL := providerBaseURLOrPreset(p, preset)
 	if baseURL == "" {
-		baseURL = "https://api.cerebras.ai/v1"
+		snap.Error = "base_url is required"
+		return snap
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -1479,7 +1534,7 @@ func (h *AdminHandler) readCerebrasQuota(ctx context.Context, p config.ProviderC
 
 	metrics := rateLimitMetricsFromHeaders(resp.Header, "cerebras", mistralFeatureWindowFromSuffix)
 	if len(metrics) == 0 {
-		chatMetrics, chatErr := h.readCerebrasQuotaFromTinyChat(ctx, p, baseURL, token, body)
+		chatMetrics, chatErr := h.readCerebrasQuotaFromTinyChat(ctx, p, preset, baseURL, token, body)
 		if chatErr == nil && len(chatMetrics) > 0 {
 			metrics = chatMetrics
 		}
@@ -1504,8 +1559,12 @@ func (h *AdminHandler) readCerebrasQuota(ctx context.Context, p config.ProviderC
 	return snap
 }
 
-func (h *AdminHandler) readCerebrasQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
-	modelID := mistralFirstModelID(modelsBody)
+func (h *AdminHandler) readCerebrasQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
+	candidates := quotaProbeModelCandidates(preset, modelsBody)
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	modelID := candidates[0]
 	resp, err := sendTinyChatProbe(ctx, baseURL, token, modelID)
 	if err != nil {
 		return nil, err
@@ -1515,8 +1574,12 @@ func (h *AdminHandler) readCerebrasQuotaFromTinyChat(ctx context.Context, p conf
 	return rateLimitMetricsFromHeaders(resp.Header, "cerebras", mistralFeatureWindowFromSuffix), nil
 }
 
-func (h *AdminHandler) readMistralQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
-	modelID := mistralFirstModelID(modelsBody)
+func (h *AdminHandler) readMistralQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
+	candidates := quotaProbeModelCandidates(preset, modelsBody)
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	modelID := candidates[0]
 	resp, err := sendTinyChatProbe(ctx, baseURL, token, modelID)
 	if err != nil {
 		return nil, err
@@ -1526,28 +1589,39 @@ func (h *AdminHandler) readMistralQuotaFromTinyChat(ctx context.Context, p confi
 	return mistralMetricsFromHeaders(resp.Header), nil
 }
 
-func (h *AdminHandler) readGroqQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string) ([]ProviderQuotaMetric, error) {
-	resp, err := sendTinyChatProbe(ctx, baseURL, token, "llama-3.1-8b-instant")
-	if err != nil {
-		return nil, err
+func (h *AdminHandler) readGroqQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
+	candidates := quotaProbeModelCandidates(preset, modelsBody)
+	if len(candidates) == 0 {
+		return nil, nil
 	}
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-	metrics := make([]ProviderQuotaMetric, 0, 4)
-	if m, ok := groqMetricFromHeaders(resp.Header, "requests", "requests/day"); ok {
-		metrics = append(metrics, m)
+	var lastErr error
+	for _, modelID := range candidates {
+		resp, err := sendTinyChatProbe(ctx, baseURL, token, modelID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+		metrics := make([]ProviderQuotaMetric, 0, 4)
+		if m, ok := groqMetricFromHeaders(resp.Header, "requests", "requests/day"); ok {
+			metrics = append(metrics, m)
+		}
+		if m, ok := groqMetricFromHeaders(resp.Header, "tokens", "tokens/min"); ok {
+			metrics = append(metrics, m)
+		}
+		resp.Body.Close()
+		if len(metrics) > 0 {
+			return metrics, nil
+		}
 	}
-	if m, ok := groqMetricFromHeaders(resp.Header, "tokens", "tokens/min"); ok {
-		metrics = append(metrics, m)
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	return metrics, nil
+	return nil, nil
 }
 
-func (h *AdminHandler) readHuggingFaceQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
-	candidates := modelIDsFromModelsBody(modelsBody,
-		"Qwen/Qwen2.5-7B-Instruct",
-		"meta-llama/Llama-3.1-8B-Instruct",
-	)
+func (h *AdminHandler) readHuggingFaceQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
+	candidates := quotaProbeModelCandidates(preset, modelsBody)
 	if len(candidates) > 12 {
 		candidates = candidates[:12]
 	}
@@ -1601,6 +1675,23 @@ func sendTinyChatProbe(ctx context.Context, baseURL string, token string, modelI
 		return nil, fmt.Errorf("chat probe status %d", resp.StatusCode)
 	}
 	return resp, nil
+}
+
+func providerTokenPreferAPIKey(p config.ProviderConfig) string {
+	if v := strings.TrimSpace(p.APIKey); v != "" {
+		return v
+	}
+	return strings.TrimSpace(p.AuthToken)
+}
+
+func providerTokenPreferAuth(p config.ProviderConfig) (token string, fromAuth bool) {
+	if v := strings.TrimSpace(p.AuthToken); v != "" {
+		return v, true
+	}
+	if v := strings.TrimSpace(p.APIKey); v != "" {
+		return v, false
+	}
+	return "", false
 }
 
 func groqMetricFromHeaders(h http.Header, feature string, _ string) (ProviderQuotaMetric, bool) {
@@ -2038,21 +2129,6 @@ func mistralFeatureWindowFromSuffix(suffix string) (string, string) {
 	default:
 		return feature, strings.ReplaceAll(s, "-", "/")
 	}
-}
-
-func mistralFirstModelID(modelsBody []byte) string {
-	const fallback = "mistral-small-latest"
-	var parsed modelListResponse
-	if err := json.Unmarshal(modelsBody, &parsed); err != nil {
-		return fallback
-	}
-	for _, m := range parsed.Data {
-		id := strings.TrimSpace(m.ID)
-		if id != "" {
-			return id
-		}
-	}
-	return fallback
 }
 
 func modelIDsFromModelsBody(modelsBody []byte, fallbacks ...string) []string {
@@ -2624,6 +2700,168 @@ func (h *AdminHandler) tlsSettingsAPI(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (h *AdminHandler) conversationsSettingsAPI(w http.ResponseWriter, r *http.Request) {
+	if h.conversations == nil {
+		http.Error(w, "conversations store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		cfg := h.store.Snapshot()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled":      cfg.Conversations.Enabled,
+			"max_items":    cfg.Conversations.MaxItems,
+			"max_age_days": cfg.Conversations.MaxAgeDays,
+		})
+	case http.MethodPut:
+		var payload struct {
+			Enabled    bool `json:"enabled"`
+			MaxItems   int  `json:"max_items"`
+			MaxAgeDays int  `json:"max_age_days"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if err := h.store.Update(func(c *config.ServerConfig) error {
+			c.Conversations.Enabled = payload.Enabled
+			c.Conversations.MaxItems = payload.MaxItems
+			c.Conversations.MaxAgeDays = payload.MaxAgeDays
+			return nil
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cfg := h.store.Snapshot()
+		h.conversations.UpdateSettings(conversations.Settings{
+			Enabled:    cfg.Conversations.Enabled,
+			MaxItems:   cfg.Conversations.MaxItems,
+			MaxAgeDays: cfg.Conversations.MaxAgeDays,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *AdminHandler) logsSettingsAPI(w http.ResponseWriter, r *http.Request) {
+	if h.logs == nil {
+		http.Error(w, "logs store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		cfg := h.store.Snapshot()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"max_lines": cfg.Logs.MaxLines,
+		})
+	case http.MethodPut:
+		var payload struct {
+			MaxLines int `json:"max_lines"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if err := h.store.Update(func(c *config.ServerConfig) error {
+			c.Logs.MaxLines = payload.MaxLines
+			return nil
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cfg := h.store.Snapshot()
+		h.logs.UpdateSettings(logstore.Settings{
+			MaxLines: cfg.Logs.MaxLines,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *AdminHandler) logsAPI(w http.ResponseWriter, r *http.Request) {
+	if h.logs == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"entries": []any{},
+		})
+		return
+	}
+	if r.Method == http.MethodDelete {
+		h.logs.Clear()
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	filter := logstore.ListFilter{
+		Level: strings.TrimSpace(r.URL.Query().Get("level")),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")),
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			filter.Limit = n
+		}
+	}
+	entries := h.logs.List(filter)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries": entries,
+	})
+}
+
+func (h *AdminHandler) conversationsAPI(w http.ResponseWriter, r *http.Request) {
+	if h.conversations == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"threads": []any{}, "total": 0, "next_before": ""})
+		return
+	}
+	filter := conversations.ListFilter{
+		Query:      strings.TrimSpace(r.URL.Query().Get("q")),
+		Provider:   strings.TrimSpace(r.URL.Query().Get("provider")),
+		Model:      strings.TrimSpace(r.URL.Query().Get("model")),
+		APIKeyName: strings.TrimSpace(r.URL.Query().Get("api_key_name")),
+		RemoteIP:   strings.TrimSpace(r.URL.Query().Get("remote_ip")),
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			filter.Limit = n
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("before")); raw != "" {
+		if ts, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			filter.Before = ts
+		}
+	}
+	threads, nextBefore, total := h.conversations.ListThreads(filter)
+	settings := h.conversations.Settings()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"threads":      threads,
+		"total":        total,
+		"next_before":  nextBefore,
+		"max_items":    settings.MaxItems,
+		"max_age_days": settings.MaxAgeDays,
+		"enabled":      settings.Enabled,
+	})
+}
+
+func (h *AdminHandler) conversationByIDAPI(w http.ResponseWriter, r *http.Request) {
+	if h.conversations == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"records": []any{}})
+		return
+	}
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	records := h.conversations.Conversation(id)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":      id,
+		"records": records,
+	})
 }
 
 func (h *AdminHandler) tlsTestCertificateAPI(w http.ResponseWriter, r *http.Request) {
@@ -3883,7 +4121,8 @@ func (h *AdminHandler) writeOAuthCallbackHTML(w http.ResponseWriter, ok bool, ms
 	if !ok {
 		status = "Authentication failed: " + msg
 	}
-	_, _ = w.Write([]byte(`<!doctype html><html><head><meta charset="utf-8"><title>OAuth</title></head><body><div style="font-family:system-ui;padding:20px;">` + htmlEscape(status) + `</div><script>setTimeout(function(){window.close();},800);</script></body></html>`))
+	escapedStatus := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&#39;").Replace(status)
+	_, _ = w.Write([]byte(`<!doctype html><html><head><meta charset="utf-8"><title>OAuth</title></head><body><div style="font-family:system-ui;padding:20px;">` + escapedStatus + `</div><script>setTimeout(function(){window.close();},800);</script></body></html>`))
 }
 
 func (h *AdminHandler) externalAdminCallbackURL(r *http.Request) string {
@@ -3949,10 +4188,6 @@ func extractOpenAIAccountID(accessToken string) string {
 		return ""
 	}
 	return accountID
-}
-
-func htmlEscape(s string) string {
-	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&#39;").Replace(s)
 }
 
 func (h *AdminHandler) testProviderAPI(w http.ResponseWriter, r *http.Request) {

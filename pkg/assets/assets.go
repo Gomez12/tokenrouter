@@ -40,6 +40,9 @@ type PopularProvider struct {
 	OAuthBaseURL             string              `json:"oauth_base_url,omitempty"`
 	OAuthOriginator          string              `json:"oauth_originator,omitempty"`
 	QuotaReader              string              `json:"quota_reader,omitempty"`
+	QuotaProbeModels         []string            `json:"quota_probe_models,omitempty"`
+	PricingURL               string              `json:"pricing_url,omitempty"`
+	PricingModelsURL         string              `json:"pricing_models_url,omitempty"`
 	QuotaIncludedByMetric    bool                `json:"quota_included_by_metric,omitempty"`
 	QuotaMetricFeatureIgnore []string            `json:"quota_metric_feature_ignore,omitempty"`
 	QuotaFreeByPlan          map[string][]string `json:"quota_free_models_by_plan,omitempty"`

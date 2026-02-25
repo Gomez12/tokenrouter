@@ -178,10 +178,6 @@ func TestParsePricingFieldsFromProvidersArray(t *testing.T) {
 }
 
 func TestCerebrasPublicPricingSourceFetch(t *testing.T) {
-	orig := cerebrasPublicModelsURL
-	cerebrasPublicModelsURL = "http://127.0.0.1:0"
-	defer func() { cerebrasPublicModelsURL = orig }()
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/public/v1/models" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
@@ -191,13 +187,18 @@ func TestCerebrasPublicPricingSourceFetch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cerebrasPublicModelsURL = srv.URL + "/public/v1/models"
 	src := &CerebrasPublicPricingSource{}
-	entries, source, err := src.Fetch(context.Background(), config.ProviderConfig{Name: "cerebras", BaseURL: "https://api.cerebras.ai/v1"})
+	provider := config.ProviderConfig{
+		Name:         "cerebras-test",
+		ProviderType: "cerebras-test",
+		BaseURL:      "https://api.cerebras.ai/v1",
+		ModelListURL: srv.URL + "/public/v1/models",
+	}
+	entries, source, err := src.Fetch(context.Background(), provider)
 	if err != nil {
 		t.Fatalf("fetch pricing: %v", err)
 	}
-	if source != cerebrasPublicModelsURL {
+	if source != provider.ModelListURL {
 		t.Fatalf("unexpected source: %q", source)
 	}
 	if len(entries) != 2 {

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 
+	log "github.com/charmbracelet/log"
+	"github.com/lkarlslund/tokenrouter/pkg/logutil"
 	"github.com/lkarlslund/tokenrouter/pkg/version"
 	"github.com/spf13/cobra"
 )
@@ -14,21 +16,25 @@ var rootCmd = &cobra.Command{
 	Long:  "TokenRouter daemon with provider aggregation, auth, and admin UI.",
 }
 
+var rootLogLevel string
+
 func Execute() error {
 	return rootCmd.Execute()
 }
 
 func init() {
-	rootCmd.SetOut(os.Stdout)
-	rootCmd.SetErr(os.Stderr)
 	rootCmd.SilenceUsage = true
 	rootCmd.SilenceErrors = true
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		if err := logutil.Configure(rootLogLevel); err != nil {
+			return err
+		}
 		if os.Geteuid() == 0 {
-			fmt.Fprintln(cmd.ErrOrStderr(), "warning: running as root")
+			log.Warn("running as root")
 		}
 		return nil
 	}
+	rootCmd.PersistentFlags().StringVar(&rootLogLevel, "loglevel", "info", "Log level (debug, info, warn, error, fatal)")
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "version",

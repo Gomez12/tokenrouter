@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -8,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
@@ -378,4 +382,217 @@ func TestProxyHandlerFallbackEstimatesTokensWithoutUsageStreaming(t *testing.T) 
 	if summary.CompletionTokens <= 0 {
 		t.Fatalf("expected fallback completion token estimate > 0, got %d", summary.CompletionTokens)
 	}
+}
+
+func TestProxyHandlerAcceptsGzipRequestBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("upstream decode failed: %v", err)
+		}
+		if got := strings.TrimSpace(anyToString(payload["model"])); got != "test-model" {
+			t.Fatalf("expected upstream model test-model, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{
+		{
+			Name:           "test-provider",
+			BaseURL:        upstream.URL + "/v1",
+			APIKey:         "test-key",
+			Enabled:        true,
+			TimeoutSeconds: 10,
+		},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	resolver := NewProviderResolver(store)
+	s := &Server{
+		store:                 store,
+		resolver:              resolver,
+		stats:                 NewStatsStore(100),
+		providerHealthChecker: NewProviderHealthChecker(resolver, providerHealthCheckInterval),
+	}
+
+	raw := []byte(`{"model":"test-provider/test-model","messages":[{"role":"user","content":"hi"}]}`)
+	var compressed bytes.Buffer
+	gzw := gzip.NewWriter(&compressed)
+	if _, err := gzw.Write(raw); err != nil {
+		t.Fatalf("gzip write failed: %v", err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatalf("gzip close failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(compressed.Bytes()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	s.proxyHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestProxyHandlerAcceptsPlainJSONWithIncorrectGzipHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("upstream decode failed: %v", err)
+		}
+		if got := strings.TrimSpace(anyToString(payload["model"])); got != "test-model" {
+			t.Fatalf("expected upstream model test-model, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{
+		{
+			Name:           "test-provider",
+			BaseURL:        upstream.URL + "/v1",
+			APIKey:         "test-key",
+			Enabled:        true,
+			TimeoutSeconds: 10,
+		},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	resolver := NewProviderResolver(store)
+	s := &Server{
+		store:                 store,
+		resolver:              resolver,
+		stats:                 NewStatsStore(100),
+		providerHealthChecker: NewProviderHealthChecker(resolver, providerHealthCheckInterval),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-provider/test-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	s.proxyHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestProxyHandlerAcceptsZstdRequestBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("upstream decode failed: %v", err)
+		}
+		if got := strings.TrimSpace(anyToString(payload["model"])); got != "test-model" {
+			t.Fatalf("expected upstream model test-model, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{
+		{
+			Name:           "test-provider",
+			BaseURL:        upstream.URL + "/v1",
+			APIKey:         "test-key",
+			Enabled:        true,
+			TimeoutSeconds: 10,
+		},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	resolver := NewProviderResolver(store)
+	s := &Server{
+		store:                 store,
+		resolver:              resolver,
+		stats:                 NewStatsStore(100),
+		providerHealthChecker: NewProviderHealthChecker(resolver, providerHealthCheckInterval),
+	}
+
+	raw := []byte(`{"model":"test-provider/test-model","messages":[{"role":"user","content":"hi"}]}`)
+	var compressed bytes.Buffer
+	zw, err := zstd.NewWriter(&compressed)
+	if err != nil {
+		t.Fatalf("zstd writer failed: %v", err)
+	}
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatalf("zstd write failed: %v", err)
+	}
+	zw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(compressed.Bytes()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+	w := httptest.NewRecorder()
+	s.proxyHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestProxyHandlerAcceptsZstdRequestBodyWithoutEncodingHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("upstream decode failed: %v", err)
+		}
+		if got := strings.TrimSpace(anyToString(payload["model"])); got != "test-model" {
+			t.Fatalf("expected upstream model test-model, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{
+		{
+			Name:           "test-provider",
+			BaseURL:        upstream.URL + "/v1",
+			APIKey:         "test-key",
+			Enabled:        true,
+			TimeoutSeconds: 10,
+		},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	resolver := NewProviderResolver(store)
+	s := &Server{
+		store:                 store,
+		resolver:              resolver,
+		stats:                 NewStatsStore(100),
+		providerHealthChecker: NewProviderHealthChecker(resolver, providerHealthCheckInterval),
+	}
+
+	raw := []byte(`{"model":"test-provider/test-model","messages":[{"role":"user","content":"hi"}]}`)
+	var compressed bytes.Buffer
+	zw, err := zstd.NewWriter(&compressed)
+	if err != nil {
+		t.Fatalf("zstd writer failed: %v", err)
+	}
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatalf("zstd write failed: %v", err)
+	}
+	zw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(compressed.Bytes()))
+	req.Header.Set("Content-Type", "application/json")
+	// Intentionally omit Content-Encoding to match observed Codex traffic.
+	w := httptest.NewRecorder()
+	s.proxyHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func anyToString(v any) string {
+	s, _ := v.(string)
+	return s
 }

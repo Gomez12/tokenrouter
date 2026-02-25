@@ -2,9 +2,9 @@ package proxy
 
 import (
 	"html/template"
-	"log"
 	"sync"
 
+	log "github.com/charmbracelet/log"
 	"github.com/lkarlslund/tokenrouter/pkg/assets"
 )
 
@@ -28,7 +28,7 @@ func getPopularProviders() ([]assets.PopularProvider, error) {
 	popularProvidersOnce.Do(func() {
 		popularProviders, popularProvidersErr = assets.LoadPopularProviders()
 		if popularProvidersErr != nil {
-			log.Printf("failed to load embedded popular providers: %v", popularProvidersErr)
+			log.Warnf("failed to load embedded popular providers: %v", popularProvidersErr)
 		}
 	})
 	return popularProviders, popularProvidersErr

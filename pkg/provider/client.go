@@ -56,7 +56,11 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelCard, error) {
 	if isOpenAICodexProvider(c.Provider) {
 		return codexStaticModels(c.Provider.Name), nil
 	}
-	if isGoogleGeminiOAuthProvider(c.Provider) {
+	providerType := strings.ToLower(strings.TrimSpace(c.Provider.ProviderType))
+	name := strings.ToLower(strings.TrimSpace(c.Provider.Name))
+	if (providerType == "google-gemini" || name == "google-gemini") &&
+		strings.TrimSpace(c.Provider.APIKey) == "" &&
+		strings.TrimSpace(c.Provider.AuthToken) != "" {
 		return c.listGoogleGeminiOAuthModels(ctx)
 	}
 	u, err := url.Parse(strings.TrimRight(c.Provider.BaseURL, "/"))
@@ -243,15 +247,6 @@ func JoinProviderPath(basePath, requestPath string) string {
 		return path.Join(base, strings.TrimPrefix(req, "/v1/"))
 	}
 	return path.Join(base, req)
-}
-
-func isGoogleGeminiOAuthProvider(p config.ProviderConfig) bool {
-	providerType := strings.ToLower(strings.TrimSpace(p.ProviderType))
-	name := strings.ToLower(strings.TrimSpace(p.Name))
-	if providerType != "google-gemini" && name != "google-gemini" {
-		return false
-	}
-	return strings.TrimSpace(p.APIKey) == "" && strings.TrimSpace(p.AuthToken) != ""
 }
 
 func isOpenAICodexProvider(provider config.ProviderConfig) bool {

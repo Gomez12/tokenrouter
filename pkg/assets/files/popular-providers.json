@@ -75,6 +75,10 @@
     "compatibility": "openai-compatible",
     "free_tier_with_key": true,
     "quota_reader": "cerebras_headers",
+    "pricing_models_url": "https://api.cerebras.ai/public/v1/models",
+    "quota_probe_models": [
+      "llama3.1-8b"
+    ],
     "get_api_key_url": "https://cloud.cerebras.ai/platform/api-keys",
     "auth_portal_url": "https://cloud.cerebras.ai/platform/api-keys",
     "source_url": "https://inference-docs.cerebras.ai/support/pricing",
@@ -214,6 +218,7 @@
     "api_key_env": "GEMINI_API_KEY",
     "compatibility": "openai-compatible",
     "free_tier_with_key": true,
+    "pricing_url": "https://ai.google.dev/gemini-api/docs/pricing",
     "quota_reader": "google_antigravity",
     "quota_included_by_metric": true,
     "quota_metric_feature_ignore": [
@@ -254,6 +259,9 @@
     "api_key_env": "GROQ_API_KEY",
     "compatibility": "openai-compatible",
     "quota_reader": "groq_headers",
+    "quota_probe_models": [
+      "llama-3.1-8b-instant"
+    ],
     "free_tier_with_key": true,
     "get_api_key_url": "https://console.groq.com/keys",
     "auth_portal_url": "https://console.groq.com/keys",
@@ -281,6 +289,10 @@
     "compatibility": "openai-compatible",
     "free_tier_with_key": true,
     "quota_reader": "huggingface_headers",
+    "quota_probe_models": [
+      "Qwen/Qwen2.5-7B-Instruct",
+      "meta-llama/Llama-3.1-8B-Instruct"
+    ],
     "get_api_key_url": "https://huggingface.co/settings/tokens",
     "auth_portal_url": "https://huggingface.co/inference/get-started",
     "source_url": "https://huggingface.co/docs/inference-providers/en/index",
@@ -341,6 +353,9 @@
     "api_key_env": "MISTRAL_API_KEY",
     "compatibility": "openai-compatible",
     "quota_reader": "mistral_headers",
+    "quota_probe_models": [
+      "mistral-small-latest"
+    ],
     "trial_credits": true,
     "get_api_key_url": "https://console.mistral.ai/api-keys/",
     "auth_portal_url": "https://console.mistral.ai/api-keys/",
@@ -446,6 +461,7 @@
     "api_key_env": "OPENCODE_ZEN_API_KEY",
     "compatibility": "openai-compatible",
     "public_free_no_auth": true,
+    "pricing_url": "https://opencode.ai/docs/zen/",
     "auth_portal_url": "https://opencode.ai/zen",
     "source_url": "https://opencode.ai/docs/zen/",
     "last_verified_at": "2026-02-23"

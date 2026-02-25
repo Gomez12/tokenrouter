@@ -204,3 +204,24 @@ func TestListProvidersResolvesPresetDefaultsUsingProviderType(t *testing.T) {
 		t.Fatal("expected base_url to be resolved from openai preset via provider_type")
 	}
 }
+
+func TestResolvePrefersOpenAIProviderForUnqualifiedGPTModel(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{
+		{Name: "groq", BaseURL: "https://api.groq.com/openai/v1", APIKey: "x", Enabled: true},
+		{Name: "openai", BaseURL: "https://chatgpt.com/backend-api", AuthToken: "tok", Enabled: true},
+	}
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	p, model, err := r.Resolve("gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("resolve failed: %v", err)
+	}
+	if p.Name != "openai" {
+		t.Fatalf("expected openai provider for unqualified gpt model, got %q", p.Name)
+	}
+	if model != "gpt-5.3-codex" {
+		t.Fatalf("expected model unchanged, got %q", model)
+	}
+}

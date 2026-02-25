@@ -4,6 +4,28 @@ function adminApp() {
     stats: {},
     appVersion: '',
     providers: [],
+    conversationThreads: [],
+    conversationRecords: [],
+    selectedConversationKey: '',
+    conversationsSettings: {enabled:true, max_items:5000, max_age_days:30},
+    conversationsSaveInProgress: false,
+    conversationsStatusHtml: '',
+    showConversationsSettingsModal: false,
+    conversationsSearch: '',
+    conversationsListHtml: '',
+    conversationsPagerHtml: '',
+    conversationDetailHtml: '<div class="small text-body-secondary">Select a conversation to inspect chat flow.</div>',
+    conversationsDebounceTimer: null,
+    logEntries: [],
+    logEntriesHtml: '',
+    logEntriesShownCount: 0,
+    logEntriesTotalCount: 0,
+    logLevelFilter: 'all',
+    logSearch: '',
+    logDebounceTimer: null,
+    logMaxLines: 5000,
+    logSaveInProgress: false,
+    logStatusHtml: '',
     popularProviders: [],
     modelsCatalog: [],
     allowLocalhostNoAuth: false,
@@ -16,6 +38,7 @@ function adminApp() {
     statsSummaryHtml: '',
     quotaSummaryHtml: '',
     statsRangeHours: '8',
+    statusUpdateSpeed: 'realtime',
     usageChartGroupBy: 'model',
     usageChart: null,
     providersTableHtml: '',
@@ -44,6 +67,10 @@ function adminApp() {
     providersPageSize: 25,
     modelsPage: 1,
     modelsPageSize: 25,
+    conversationsPage: 1,
+    conversationsPageSize: 25,
+    logsPage: 1,
+    logsPageSize: 25,
     modelsRefreshInProgress: false,
     modelsInitialized: false,
     modelsInitialLoadInProgress: false,
@@ -57,6 +84,8 @@ function adminApp() {
     modelsFreeOnlyCacheKey: 'opp_models_free_only_v1',
     themeCacheKey: 'opp_theme_mode_v1',
     usageChartGroupCacheKey: 'opp_usage_chart_group_v1',
+    statsRangeCacheKey: 'opp_stats_range_hours_v1',
+    statusUpdateSpeedCacheKey: 'opp_status_update_speed_v1',
     accessTokens: [],
     requiresInitialTokenSetup: false,
     showAddAccessTokenModal: false,
@@ -65,6 +94,7 @@ function adminApp() {
     wsReconnectTimer: null,
     wsBackoffMs: 1000,
     fallbackPoller: null,
+    intervalPoller: null,
     draft: {name:'',provider_type:'',base_url:'',api_key:'',auth_token:'',refresh_token:'',token_expires_at:'',account_id:'',device_auth_url:'',device_code:'',device_auth_id:'',device_code_url:'',device_token_url:'',device_client_id:'',device_scope:'',device_grant_type:'',oauth_authorize_url:'',oauth_token_url:'',oauth_client_id:'',oauth_client_secret:'',oauth_scope:'',enabled:true,timeout_seconds:60},
     oauthAdvanced: false,
     init() {
@@ -81,11 +111,25 @@ function adminApp() {
       window.__adminModelsLastPage = () => this.setModelsPage(Number.MAX_SAFE_INTEGER);
       window.__adminSetModelsPage = (v) => this.setModelsPage(v);
       window.__adminSetModelsPageSize = (v) => this.setModelsPageSize(v);
+      window.__adminConversationsFirstPage = () => this.setConversationsPage(1);
+      window.__adminConversationsPrevPage = () => this.setConversationsPage(this.conversationsPage - 1);
+      window.__adminConversationsNextPage = () => this.setConversationsPage(this.conversationsPage + 1);
+      window.__adminConversationsLastPage = () => this.setConversationsPage(Number.MAX_SAFE_INTEGER);
+      window.__adminSetConversationsPage = (v) => this.setConversationsPage(v);
+      window.__adminSetConversationsPageSize = (v) => this.setConversationsPageSize(v);
+      window.__adminLogsFirstPage = () => this.setLogsPage(1);
+      window.__adminLogsPrevPage = () => this.setLogsPage(this.logsPage - 1);
+      window.__adminLogsNextPage = () => this.setLogsPage(this.logsPage + 1);
+      window.__adminLogsLastPage = () => this.setLogsPage(Number.MAX_SAFE_INTEGER);
+      window.__adminSetLogsPage = (v) => this.setLogsPage(v);
+      window.__adminSetLogsPageSize = (v) => this.setLogsPageSize(v);
       window.__adminSetUsageChartGroup = (v) => this.setUsageChartGroup(v);
       this.hydrateModelsFromCache();
       this.restoreModelsFreeOnly();
       this.restoreThemeMode();
       this.restoreUsageChartGroup();
+      this.restoreStatsRangeHours();
+      this.restoreStatusUpdateSpeed();
       this.restoreActiveTab();
       this.loadStats(false);
       this.loadProviders();
@@ -105,10 +149,8 @@ function adminApp() {
       }
     },
     startRealtimeUpdates() {
-      this.connectRealtimeWebSocket();
+      this.configureStatusUpdates();
       window.addEventListener('beforeunload', () => this.stopRealtimeUpdates());
-      window.addEventListener('focus', () => this.onWindowFocusOrVisible());
-      document.addEventListener('visibilitychange', () => this.onWindowFocusOrVisible());
     },
     stopRealtimeUpdates() {
       if (this.wsReconnectTimer) {
@@ -119,26 +161,67 @@ function adminApp() {
         clearInterval(this.fallbackPoller);
         this.fallbackPoller = null;
       }
+      if (this.intervalPoller) {
+        clearInterval(this.intervalPoller);
+        this.intervalPoller = null;
+      }
       if (this.ws) {
         try { this.ws.close(); } catch (_) {}
         this.ws = null;
       }
     },
-    isRealtimeActive() {
-      try {
-        if (document.visibilityState && document.visibilityState !== 'visible') return false;
-        if (typeof document.hasFocus === 'function' && !document.hasFocus()) return false;
-      } catch (_) {}
-      return true;
+    isStatusRealtimeMode() {
+      return this.statusUpdateSpeed === 'realtime';
     },
-    onWindowFocusOrVisible() {
-      if (!this.isRealtimeActive()) return;
-      this.connectRealtimeWebSocket();
+    statusUpdateIntervalMs() {
+      const v = String(this.statusUpdateSpeed || '').trim();
+      if (v === '2s') return 2000;
+      if (v === '10s') return 10000;
+      if (v === '30s') return 30000;
+      if (v === '1m') return 60 * 1000;
+      if (v === '5m') return 5 * 60 * 1000;
+      if (v === '15m') return 15 * 60 * 1000;
+      if (v === 'disabled') return -1;
+      return 0;
+    },
+    configureStatusUpdates() {
+      if (this.intervalPoller) {
+        clearInterval(this.intervalPoller);
+        this.intervalPoller = null;
+      }
+      this.clearFallbackPolling();
+      const intervalMs = this.statusUpdateIntervalMs();
+      if (intervalMs < 0) {
+        if (this.wsReconnectTimer) {
+          clearTimeout(this.wsReconnectTimer);
+          this.wsReconnectTimer = null;
+        }
+        if (this.ws) {
+          try { this.ws.close(); } catch (_) {}
+          this.ws = null;
+        }
+        return;
+      }
+      if (this.isStatusRealtimeMode()) {
+        this.connectRealtimeWebSocket();
+        this.handleRealtimeRefresh(true);
+        return;
+      }
+      if (this.ws) {
+        try { this.ws.close(); } catch (_) {}
+        this.ws = null;
+      }
+      if (this.wsReconnectTimer) {
+        clearTimeout(this.wsReconnectTimer);
+        this.wsReconnectTimer = null;
+      }
+      this.intervalPoller = setInterval(() => this.handleRealtimeRefresh(false), intervalMs);
       this.handleRealtimeRefresh(true);
     },
     ensureFallbackPolling() {
+      if (!this.isStatusRealtimeMode()) return;
       if (this.fallbackPoller) return;
-      this.fallbackPoller = setInterval(() => this.handleRealtimeRefresh(), 30000);
+      this.fallbackPoller = setInterval(() => this.handleRealtimeRefresh(), 5000);
     },
     clearFallbackPolling() {
       if (!this.fallbackPoller) return;
@@ -146,6 +229,7 @@ function adminApp() {
       this.fallbackPoller = null;
     },
     scheduleRealtimeReconnect() {
+      if (!this.isStatusRealtimeMode()) return;
       if (this.wsReconnectTimer) return;
       const delay = Math.min(this.wsBackoffMs, 30000);
       this.wsReconnectTimer = setTimeout(() => {
@@ -155,6 +239,7 @@ function adminApp() {
       this.wsBackoffMs = Math.min(this.wsBackoffMs * 2, 30000);
     },
     connectRealtimeWebSocket() {
+      if (!this.isStatusRealtimeMode()) return;
       if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
       const wsProto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
       const wsURL = wsProto + window.location.host + '/admin/ws';
@@ -169,8 +254,14 @@ function adminApp() {
         ws.onmessage = (ev) => {
           let msg = null;
           try { msg = JSON.parse(String(ev.data || '{}')); } catch (_) {}
-          if (!msg || msg.type !== 'refresh') return;
-          this.handleRealtimeRefresh(true);
+          if (!msg || !msg.type) return;
+          if (msg.type === 'refresh') {
+            this.handleRealtimeRefresh(true);
+            return;
+          }
+          if (msg.type === 'conversation_append' && this.activeTab === 'conversations') {
+            this.loadConversations(false);
+          }
         };
         ws.onerror = () => {
           this.ensureFallbackPolling();
@@ -185,7 +276,6 @@ function adminApp() {
       }
     },
     handleRealtimeRefresh(forceStats) {
-      if (!this.isRealtimeActive()) return;
       if (this.activeTab === 'status' || this.activeTab === 'quota' || this.activeTab === 'access') {
         this.loadStats(!!forceStats);
       }
@@ -197,6 +287,10 @@ function adminApp() {
         this.loadTLSSettings();
       } else if (this.activeTab === 'models') {
         this.loadModelsCatalog(false);
+      } else if (this.activeTab === 'conversations') {
+        this.loadConversations(false);
+      } else if (this.activeTab === 'log') {
+        this.loadLogs();
       }
     },
     headers() { return {'Content-Type':'application/json'}; },
@@ -236,12 +330,18 @@ function adminApp() {
         this.loadAccessTokens();
         this.loadSecuritySettings();
         this.loadTLSSettings();
+      } else if (tab === 'conversations') {
+        this.loadConversationsSettings();
+        this.loadConversations(true);
+      } else if (tab === 'log') {
+        this.loadLogSettings();
+        this.loadLogs();
       }
     },
     restoreActiveTab() {
       try {
         const tab = window.localStorage.getItem(this.activeTabCacheKey);
-        if (tab === 'status' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'models') {
+        if (tab === 'status' || tab === 'conversations' || tab === 'log' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'models') {
           this.activeTab = tab;
         }
       } catch (_) {}
@@ -249,6 +349,12 @@ function adminApp() {
         this.loadModelsCatalog(true);
       } else if (this.activeTab === 'quota') {
         this.loadStats(false);
+      } else if (this.activeTab === 'conversations') {
+        this.loadConversationsSettings();
+        this.loadConversations(true);
+      } else if (this.activeTab === 'log') {
+        this.loadLogSettings();
+        this.loadLogs();
       }
     },
     persistActiveTab() {
@@ -280,6 +386,46 @@ function adminApp() {
       try {
         window.localStorage.setItem(this.usageChartGroupCacheKey, this.usageChartGroupBy);
       } catch (_) {}
+    },
+    restoreStatusUpdateSpeed() {
+      try {
+        const raw = String(window.localStorage.getItem(this.statusUpdateSpeedCacheKey) || '').trim();
+        if (raw === 'realtime' || raw === '2s' || raw === '10s' || raw === '30s' || raw === '1m' || raw === '5m' || raw === '15m' || raw === 'disabled') {
+          this.statusUpdateSpeed = raw;
+        }
+      } catch (_) {}
+    },
+    persistStatusUpdateSpeed() {
+      try {
+        window.localStorage.setItem(this.statusUpdateSpeedCacheKey, String(this.statusUpdateSpeed || 'realtime'));
+      } catch (_) {}
+    },
+    setStatusUpdateSpeed(v) {
+      const raw = String(v || '').trim();
+      if (raw !== 'realtime' && raw !== '2s' && raw !== '10s' && raw !== '30s' && raw !== '1m' && raw !== '5m' && raw !== '15m' && raw !== 'disabled') return;
+      this.statusUpdateSpeed = raw;
+      this.persistStatusUpdateSpeed();
+      this.configureStatusUpdates();
+    },
+    restoreStatsRangeHours() {
+      try {
+        const raw = String(window.localStorage.getItem(this.statsRangeCacheKey) || '').trim();
+        if (raw === '1' || raw === '4' || raw === '8' || raw === '24' || raw === '72') {
+          this.statsRangeHours = raw;
+        }
+      } catch (_) {}
+    },
+    persistStatsRangeHours() {
+      try {
+        window.localStorage.setItem(this.statsRangeCacheKey, String(this.statsRangeHours || '8'));
+      } catch (_) {}
+    },
+    setStatsRangeHours(v) {
+      const raw = String(v || '').trim();
+      if (raw !== '1' && raw !== '4' && raw !== '8' && raw !== '24' && raw !== '72') return;
+      this.statsRangeHours = raw;
+      this.persistStatsRangeHours();
+      this.loadStats(true);
     },
     resolvedThemeMode() {
       if (this.themeMode === 'auto') {
@@ -486,6 +632,28 @@ function adminApp() {
       this.modelsPage = 1;
       this.renderModelsCatalog();
     },
+    setConversationsPage(v) {
+      let n = Number(v);
+      if (!Number.isFinite(n)) n = 1;
+      this.conversationsPage = Math.max(1, Math.floor(n));
+      this.renderConversationsList();
+    },
+    setConversationsPageSize(v) {
+      this.conversationsPageSize = this.parsePageSize(v);
+      this.conversationsPage = 1;
+      this.renderConversationsList();
+    },
+    setLogsPage(v) {
+      let n = Number(v);
+      if (!Number.isFinite(n)) n = 1;
+      this.logsPage = Math.max(1, Math.floor(n));
+      this.renderLogs();
+    },
+    setLogsPageSize(v) {
+      this.logsPageSize = this.parsePageSize(v);
+      this.logsPage = 1;
+      this.renderLogs();
+    },
     setUsageChartGroup(v) {
       const key = String(v || '').trim();
       if (key !== 'model' && key !== 'provider' && key !== 'api_key_name' && key !== 'client_ip' && key !== 'user_agent') return;
@@ -493,23 +661,29 @@ function adminApp() {
       this.persistUsageChartGroup();
       this.renderStats();
     },
-    renderProvidersPager(totalRows, page, totalPages, pageSize) {
+    renderPager(totalRows, page, totalPages, pageSize, key) {
       const disabledFirst = page <= 1 ? ' disabled' : '';
       const disabledLast = page >= totalPages ? ' disabled' : '';
       const sizeValue = pageSize === 0 ? 'all' : String(pageSize);
+      const firstFn = '__admin' + key + 'FirstPage';
+      const prevFn = '__admin' + key + 'PrevPage';
+      const setPageFn = '__adminSet' + key + 'Page';
+      const nextFn = '__admin' + key + 'NextPage';
+      const lastFn = '__admin' + key + 'LastPage';
+      const setPageSizeFn = '__adminSet' + key + 'PageSize';
       return '' +
         '<div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-2">' +
-          '<div class="btn-group btn-group-sm" role="group">' +
-            '<button class="btn btn-outline-secondary"' + disabledFirst + ' onclick="window.__adminProvidersFirstPage()" title="First page" aria-label="First page">&laquo;</button>' +
-            '<button class="btn btn-outline-secondary"' + disabledFirst + ' onclick="window.__adminProvidersPrevPage()" title="Previous page" aria-label="Previous page">&lsaquo;</button>' +
-            '<input class="form-control form-control-sm" type="number" min="1" max="' + totalPages + '" value="' + page + '" style="max-width:86px;" onchange="window.__adminSetProvidersPage(this.value)" />' +
-            '<button class="btn btn-outline-secondary"' + disabledLast + ' onclick="window.__adminProvidersNextPage()" title="Next page" aria-label="Next page">&rsaquo;</button>' +
-            '<button class="btn btn-outline-secondary"' + disabledLast + ' onclick="window.__adminProvidersLastPage()" title="Last page" aria-label="Last page">&raquo;</button>' +
+          '<div class="d-flex align-items-center gap-1">' +
+            '<button class="icon-btn"' + disabledFirst + ' onclick="window.' + firstFn + '()" title="First page" aria-label="First page">&laquo;</button>' +
+            '<button class="icon-btn"' + disabledFirst + ' onclick="window.' + prevFn + '()" title="Previous page" aria-label="Previous page">&lsaquo;</button>' +
+            '<input class="form-control form-control-sm" type="number" min="1" max="' + totalPages + '" value="' + page + '" style="max-width:86px;" onchange="window.' + setPageFn + '(this.value)" />' +
+            '<button class="icon-btn"' + disabledLast + ' onclick="window.' + nextFn + '()" title="Next page" aria-label="Next page">&rsaquo;</button>' +
+            '<button class="icon-btn"' + disabledLast + ' onclick="window.' + lastFn + '()" title="Last page" aria-label="Last page">&raquo;</button>' +
           '</div>' +
           '<div class="d-flex align-items-center gap-2 small text-body-secondary">' +
             '<span>Page ' + page + ' of ' + totalPages + '</span>' +
             '<span>(' + totalRows + ' rows)</span>' +
-            '<select class="form-select form-select-sm" style="width:auto;" onchange="window.__adminSetProvidersPageSize(this.value)">' +
+            '<select class="form-select form-select-sm" style="width:auto;" onchange="window.' + setPageSizeFn + '(this.value)">' +
               '<option value="25"' + (sizeValue === '25' ? ' selected' : '') + '>25</option>' +
               '<option value="50"' + (sizeValue === '50' ? ' selected' : '') + '>50</option>' +
               '<option value="100"' + (sizeValue === '100' ? ' selected' : '') + '>100</option>' +
@@ -518,30 +692,11 @@ function adminApp() {
           '</div>' +
         '</div>';
     },
+    renderProvidersPager(totalRows, page, totalPages, pageSize) {
+      return this.renderPager(totalRows, page, totalPages, pageSize, 'Providers');
+    },
     renderModelsPager(totalRows, page, totalPages, pageSize) {
-      const disabledFirst = page <= 1 ? ' disabled' : '';
-      const disabledLast = page >= totalPages ? ' disabled' : '';
-      const sizeValue = pageSize === 0 ? 'all' : String(pageSize);
-      return '' +
-        '<div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-2">' +
-          '<div class="btn-group btn-group-sm" role="group">' +
-            '<button class="btn btn-outline-secondary"' + disabledFirst + ' onclick="window.__adminModelsFirstPage()" title="First page" aria-label="First page">&laquo;</button>' +
-            '<button class="btn btn-outline-secondary"' + disabledFirst + ' onclick="window.__adminModelsPrevPage()" title="Previous page" aria-label="Previous page">&lsaquo;</button>' +
-            '<input class="form-control form-control-sm" type="number" min="1" max="' + totalPages + '" value="' + page + '" style="max-width:86px;" onchange="window.__adminSetModelsPage(this.value)" />' +
-            '<button class="btn btn-outline-secondary"' + disabledLast + ' onclick="window.__adminModelsNextPage()" title="Next page" aria-label="Next page">&rsaquo;</button>' +
-            '<button class="btn btn-outline-secondary"' + disabledLast + ' onclick="window.__adminModelsLastPage()" title="Last page" aria-label="Last page">&raquo;</button>' +
-          '</div>' +
-          '<div class="d-flex align-items-center gap-2 small text-body-secondary">' +
-            '<span>Page ' + page + ' of ' + totalPages + '</span>' +
-            '<span>(' + totalRows + ' rows)</span>' +
-            '<select class="form-select form-select-sm" style="width:auto;" onchange="window.__adminSetModelsPageSize(this.value)">' +
-              '<option value="25"' + (sizeValue === '25' ? ' selected' : '') + '>25</option>' +
-              '<option value="50"' + (sizeValue === '50' ? ' selected' : '') + '>50</option>' +
-              '<option value="100"' + (sizeValue === '100' ? ' selected' : '') + '>100</option>' +
-              '<option value="all"' + (sizeValue === 'all' ? ' selected' : '') + '>all</option>' +
-            '</select>' +
-          '</div>' +
-        '</div>';
+      return this.renderPager(totalRows, page, totalPages, pageSize, 'Models');
     },
     resetDraft() {
       this.cancelOAuthPolling();
@@ -983,7 +1138,7 @@ function adminApp() {
         '<div class="border rounded p-3 bg-body mt-2">' +
           '<div class="d-flex justify-content-between align-items-center mb-2">' +
             '<div class="fw-semibold">Usage by ' + this.escapeHtml(groupLabel.toLowerCase()) + ' (tokens / 5m)</div>' +
-            '<div class="d-flex align-items-center gap-2">' +
+            '<div class="d-flex align-items-center">' +
               '<select class="form-select form-select-sm" style="width:auto;" onchange="window.__adminSetUsageChartGroup(this.value)">' +
                 '<option value="model"' + (groupField === 'model' ? ' selected' : '') + '>Model</option>' +
                 '<option value="provider"' + (groupField === 'provider' ? ' selected' : '') + '>Provider</option>' +
@@ -991,7 +1146,6 @@ function adminApp() {
                 '<option value="client_ip"' + (groupField === 'client_ip' ? ' selected' : '') + '>Remote IP</option>' +
                 '<option value="user_agent"' + (groupField === 'user_agent' ? ' selected' : '') + '>User Agent</option>' +
               '</select>' +
-              '<div class="small text-body-secondary">range: last ' + this.escapeHtml(String(periodHours)) + 'h</div>' +
             '</div>' +
           '</div>' +
           '<div style="height:280px;"><canvas id="modelUsageChart"></canvas></div>' +
@@ -1311,8 +1465,8 @@ function adminApp() {
         const actionNameAttr = this.escapeHtml(rawName);
         const actions = p.managed
           ? '<div class="d-flex justify-content-end gap-1">' +
-              '<button class="btn btn-sm btn-outline-secondary" type="button" title="Edit provider" aria-label="Edit provider" data-provider-name="' + actionNameAttr + '" onclick="window.__adminEditProvider(this.getAttribute(\'data-provider-name\'))"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M12.146.854a.5.5 0 0 1 .708 0l2.292 2.292a.5.5 0 0 1 0 .708l-8.5 8.5a.5.5 0 0 1-.168.11l-3 1.2a.5.5 0 0 1-.65-.65l1.2-3a.5.5 0 0 1 .11-.168zM11.5 2.207 4.545 9.162l-.733 1.833 1.833-.733L12.6 3.307z"/></svg></button>' +
-              '<button class="btn btn-sm btn-outline-danger" type="button" title="Delete provider" aria-label="Delete provider" data-provider-name="' + actionNameAttr + '" onclick="window.__adminRemoveProvider(this.getAttribute(\'data-provider-name\'))"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z"/></svg></button>' +
+              '<button class="icon-btn" type="button" title="Edit provider" aria-label="Edit provider" data-provider-name="' + actionNameAttr + '" onclick="window.__adminEditProvider(this.getAttribute(\'data-provider-name\'))"><svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M12.146.854a.5.5 0 0 1 .708 0l2.292 2.292a.5.5 0 0 1 0 .708l-8.5 8.5a.5.5 0 0 1-.168.11l-3 1.2a.5.5 0 0 1-.65-.65l1.2-3a.5.5 0 0 1 .11-.168zM11.5 2.207 4.545 9.162l-.733 1.833 1.833-.733L12.6 3.307z"/></svg></button>' +
+              '<button class="icon-btn icon-btn-danger" type="button" title="Delete provider" aria-label="Delete provider" data-provider-name="' + actionNameAttr + '" onclick="window.__adminRemoveProvider(this.getAttribute(\'data-provider-name\'))"><svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z"/></svg></button>' +
             '</div>'
           : '<span class="badge text-bg-light border">Auto</span>';
         return '<tr>' +
@@ -1377,10 +1531,10 @@ function adminApp() {
           '<td><code>' + redacted + '</code></td>' +
           '<td>' + expiry + '</td>' +
           '<td class="text-end">' +
-            '<button class="btn btn-sm btn-outline-secondary me-1" type="button" title="Edit token" aria-label="Edit token" data-token-id="' + id + '" onclick="window.__adminEditAccessToken(this.getAttribute(\'data-token-id\'))">' +
+            '<button class="icon-btn me-1" type="button" title="Edit token" aria-label="Edit token" data-token-id="' + id + '" onclick="window.__adminEditAccessToken(this.getAttribute(\'data-token-id\'))">' +
               '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M12.146.854a.5.5 0 0 1 .708 0l2.292 2.292a.5.5 0 0 1 0 .708l-8.5 8.5a.5.5 0 0 1-.168.11l-3 1.2a.5.5 0 0 1-.65-.65l1.2-3a.5.5 0 0 1 .11-.168zM11.5 2.207 4.545 9.162l-.733 1.833 1.833-.733L12.6 3.307z"/></svg>' +
             '</button>' +
-            '<button class="btn btn-sm btn-outline-danger" type="button" title="Delete token" aria-label="Delete token" data-token-id="' + id + '" onclick="window.__adminDeleteAccessToken(this.getAttribute(\'data-token-id\'))">' +
+            '<button class="icon-btn icon-btn-danger" type="button" title="Delete token" aria-label="Delete token" data-token-id="' + id + '" onclick="window.__adminDeleteAccessToken(this.getAttribute(\'data-token-id\'))">' +
               '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z"/></svg>' +
             '</button>' +
           '</td>' +
@@ -1710,6 +1864,280 @@ function adminApp() {
           this.openAddAccessTokenModal();
           this.accessTokenStatusHtml = '<span class="text-warning">Create your first access token to enable API access.</span>';
         }
+      }
+    },
+    debouncedLoadConversations() {
+      if (this.conversationsDebounceTimer) clearTimeout(this.conversationsDebounceTimer);
+      this.conversationsDebounceTimer = setTimeout(() => this.loadConversations(true), 250);
+    },
+    debouncedLoadLogs() {
+      if (this.logDebounceTimer) clearTimeout(this.logDebounceTimer);
+      this.logDebounceTimer = setTimeout(() => this.loadLogs(), 250);
+    },
+    async loadLogSettings() {
+      const r = await this.apiFetch('/admin/api/settings/logs', {headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) return;
+      const body = await r.json().catch(() => ({}));
+      this.logMaxLines = Number(body.max_lines || 5000);
+    },
+    async saveLogSettings() {
+      if (this.logSaveInProgress) return;
+      const maxLines = Number(this.logMaxLines || 0);
+      if (!Number.isFinite(maxLines) || maxLines < 100 || maxLines > 200000) {
+        this.logStatusHtml = '<span class="text-danger">Max lines must be between 100 and 200000.</span>';
+        return;
+      }
+      this.logSaveInProgress = true;
+      try {
+        const r = await this.apiFetch('/admin/api/settings/logs', {
+          method:'PUT',
+          headers:this.headers(),
+          body:JSON.stringify({max_lines: Math.trunc(maxLines)})
+        });
+        if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+        if (!r.ok) {
+          const txt = await r.text();
+          this.logStatusHtml = '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to save log settings.') + '</span>';
+          return;
+        }
+        this.logStatusHtml = '<span class="text-success">Log settings saved.</span>';
+        await this.loadLogSettings();
+        await this.loadLogs();
+      } finally {
+        this.logSaveInProgress = false;
+      }
+    },
+    async loadLogs() {
+      const params = new URLSearchParams();
+      const level = String(this.logLevelFilter || 'all').trim().toLowerCase();
+      const query = String(this.logSearch || '').trim();
+      if (level && level !== 'all') params.set('level', level);
+      if (query) params.set('q', query);
+      params.set('limit', '1500');
+      const u = '/admin/api/logs' + (params.toString() ? ('?' + params.toString()) : '');
+      const r = await this.apiFetch(u, {headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) return;
+      const body = await r.json().catch(() => ({}));
+      this.logEntries = Array.isArray(body.entries) ? body.entries : [];
+      this.logsPage = 1;
+      this.renderLogs();
+    },
+    async clearLogs() {
+      if (!window.confirm('Delete all persisted log entries?')) return;
+      const r = await this.apiFetch('/admin/api/logs', {method:'DELETE', headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) {
+        const txt = await r.text();
+        this.logStatusHtml = '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to clear log.') + '</span>';
+        return;
+      }
+      this.logEntries = [];
+      this.renderLogs();
+      this.logStatusHtml = '<span class="text-success">Log cleared.</span>';
+    },
+    renderLogs() {
+      const allRows = (this.logEntries || []).map((e) => {
+        const level = String(e.level || 'info').trim().toLowerCase();
+        const badgeCls =
+          level === 'debug' ? 'text-bg-secondary' :
+          level === 'info' ? 'text-bg-primary' :
+          level === 'warn' ? 'text-bg-warning text-dark' :
+          level === 'error' ? 'text-bg-danger' :
+          level === 'fatal' ? 'text-bg-dark' : 'text-bg-secondary';
+        const ts = this.escapeHtml(this.formatTimestamp(e.timestamp));
+        const msg = this.escapeHtml(String(e.message || '').trim());
+        return '' +
+          '<tr>' +
+            '<td class="small text-nowrap">' + ts + '</td>' +
+            '<td class="small text-nowrap"><span class="badge ' + badgeCls + '">' + this.escapeHtml(level || 'info') + '</span></td>' +
+            '<td class="small"><code style="white-space:pre-wrap;">' + msg + '</code></td>' +
+          '</tr>';
+      });
+      const page = this.paginateRows(allRows, this.logsPage, this.logsPageSize);
+      this.logsPage = page.page;
+      this.logsPageSize = page.pageSize;
+      this.logEntriesShownCount = (page.rows || []).length;
+      this.logEntriesTotalCount = page.totalRows;
+      this.logEntriesHtml =
+        '<table class="table table-sm align-middle mb-0">' +
+          '<thead><tr><th style="width:220px;">Time</th><th style="width:90px;">Level</th><th>Message</th></tr></thead>' +
+          '<tbody>' + (page.rows.join('') || '<tr><td colspan="3" class="text-body-secondary small">No log entries.</td></tr>') + '</tbody>' +
+        '</table>' +
+        this.renderPager(page.totalRows, page.page, page.totalPages, page.pageSize, 'Logs');
+    },
+    formatTimestamp(raw) {
+      const s = String(raw || '').trim();
+      if (!s) return '';
+      const t = new Date(s);
+      if (Number.isNaN(t.getTime())) return s;
+      return t.toLocaleString();
+    },
+    async openConversationsSettingsModal() {
+      this.conversationsStatusHtml = '';
+      await this.loadConversationsSettings();
+      this.showConversationsSettingsModal = true;
+    },
+    closeConversationsSettingsModal() {
+      this.showConversationsSettingsModal = false;
+    },
+    async loadConversationsSettings() {
+      const r = await this.apiFetch('/admin/api/settings/conversations', {headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) return;
+      const body = await r.json().catch(() => ({}));
+      this.conversationsSettings = {
+        enabled: !!body.enabled,
+        max_items: Number(body.max_items || 5000),
+        max_age_days: Number(body.max_age_days || 30)
+      };
+    },
+    async saveConversationsSettings() {
+      if (this.conversationsSaveInProgress) return;
+      const maxItems = Number(this.conversationsSettings.max_items || 0);
+      const maxAgeDays = Number(this.conversationsSettings.max_age_days || 0);
+      if (!Number.isFinite(maxItems) || maxItems < 100 || maxItems > 200000) {
+        this.conversationsStatusHtml = '<span class="text-danger">Max items must be between 100 and 200000.</span>';
+        return;
+      }
+      if (!Number.isFinite(maxAgeDays) || maxAgeDays < 1) {
+        this.conversationsStatusHtml = '<span class="text-danger">Max age days must be at least 1.</span>';
+        return;
+      }
+      this.conversationsSaveInProgress = true;
+      try {
+        const payload = {
+          enabled: !!this.conversationsSettings.enabled,
+          max_items: Math.trunc(maxItems),
+          max_age_days: Math.trunc(maxAgeDays)
+        };
+        const r = await this.apiFetch('/admin/api/settings/conversations', {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
+        if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+        if (!r.ok) {
+          const txt = await r.text();
+          this.conversationsStatusHtml = '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to save conversation settings.') + '</span>';
+          return;
+        }
+        this.conversationsStatusHtml = '<span class="text-success">Conversation settings saved.</span>';
+        await this.loadConversationsSettings();
+        await this.loadConversations(true);
+        this.closeConversationsSettingsModal();
+      } finally {
+        this.conversationsSaveInProgress = false;
+      }
+    },
+    async loadConversations(resetSelection) {
+      const params = new URLSearchParams();
+      const q = String(this.conversationsSearch || '').trim();
+      if (q) params.set('q', q);
+      params.set('limit', '5000');
+      const url = '/admin/api/conversations' + (params.toString() ? ('?' + params.toString()) : '');
+      const r = await this.apiFetch(url, {headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) return;
+      const body = await r.json().catch(() => ({}));
+      this.conversationThreads = Array.isArray(body.threads) ? body.threads : [];
+      this.conversationsPage = 1;
+      if (resetSelection && this.conversationThreads.length > 0) {
+        this.selectedConversationKey = String(this.conversationThreads[0].conversation_key || '').trim();
+      }
+      if (!this.selectedConversationKey && this.conversationThreads.length > 0) {
+        this.selectedConversationKey = String(this.conversationThreads[0].conversation_key || '').trim();
+      }
+      if (this.selectedConversationKey && !this.conversationThreads.some((x) => String(x.conversation_key || '').trim() === this.selectedConversationKey)) {
+        this.selectedConversationKey = this.conversationThreads.length ? String(this.conversationThreads[0].conversation_key || '').trim() : '';
+      }
+      this.renderConversationsList();
+      if (this.selectedConversationKey) {
+        await this.loadConversationDetail(this.selectedConversationKey);
+      } else {
+        this.conversationRecords = [];
+        this.conversationDetailHtml = '<div class="small text-body-secondary">No conversations found for current filters.</div>';
+      }
+    },
+    async loadConversationDetail(conversationKey) {
+      const key = String(conversationKey || '').trim();
+      if (!key) return;
+      const r = await this.apiFetch('/admin/api/conversations/' + encodeURIComponent(key), {headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) return;
+      const body = await r.json().catch(() => ({}));
+      this.selectedConversationKey = key;
+      this.conversationRecords = Array.isArray(body.records) ? body.records : [];
+      this.renderConversationsList();
+      this.renderConversationDetail();
+    },
+    renderConversationsList() {
+      const allRows = (this.conversationThreads || []).map((t) => {
+        const key = String(t.conversation_key || '').trim();
+        const selected = key && key === this.selectedConversationKey;
+        const cls = selected ? 'border-primary bg-primary-subtle' : 'border';
+        const provider = this.escapeHtml(t.provider || '-');
+        const model = this.escapeHtml(t.model || '-');
+        const keyName = this.escapeHtml(t.api_key_name || '-');
+        const remote = this.escapeHtml(t.remote_ip || '-');
+        const updated = this.escapeHtml(this.formatRelativeAge(t.last_at || ''));
+        const preview = this.escapeHtml(t.last_preview || '');
+        return '' +
+          '<button type=\"button\" class=\"btn w-100 text-start p-2 mb-2 ' + cls + '\" data-conversation-key=\"' + this.escapeHtml(key) + '\" onclick=\"window.__adminOpenConversation(this.getAttribute(\\\"data-conversation-key\\\"))\">' +
+            '<div class=\"fw-semibold small\">' + provider + ' · ' + model + '</div>' +
+            '<div class=\"small text-body-secondary\">' + keyName + ' · ' + remote + ' · ' + updated + '</div>' +
+            '<div class=\"small text-body-secondary\">' + preview + '</div>' +
+          '</button>';
+      });
+      const page = this.paginateRows(allRows, this.conversationsPage, this.conversationsPageSize);
+      this.conversationsPage = page.page;
+      this.conversationsPageSize = page.pageSize;
+      this.conversationsListHtml = page.rows.join('') || '<div class=\"small text-body-secondary\">No conversations yet.</div>';
+      this.conversationsPagerHtml = this.renderPager(page.totalRows, page.page, page.totalPages, page.pageSize, 'Conversations');
+      window.__adminOpenConversation = (key) => this.loadConversationDetail(key);
+    },
+    renderConversationDetail() {
+      const records = this.conversationRecords || [];
+      if (!records.length) {
+        this.conversationDetailHtml = '<div class=\"small text-body-secondary\">No messages captured for this conversation.</div>';
+        return;
+      }
+      const rows = records.map((rec) => {
+        const ts = this.escapeHtml(this.formatRelativeAge(rec.created_at || ''));
+        const status = this.escapeHtml(String(rec.status_code || ''));
+        const latency = this.escapeHtml(String(rec.latency_ms || 0) + 'ms');
+        const sent = this.renderMarkdown(rec.request_text_markdown || '');
+        const recv = this.renderMarkdown(rec.response_text_markdown || '');
+        const reqPayload = this.escapeHtml(JSON.stringify(rec.request_payload || {}, null, 2));
+        const respPayload = this.escapeHtml(JSON.stringify(rec.response_payload || {}, null, 2));
+        const reqHeaders = this.escapeHtml(JSON.stringify(rec.request_headers || {}, null, 2));
+        const respHeaders = this.escapeHtml(JSON.stringify(rec.response_headers || {}, null, 2));
+        return '' +
+          '<div class=\"border rounded p-2 mb-2\">' +
+            '<div class=\"small text-body-secondary mb-2\">' + ts + ' · status ' + status + ' · ' + latency + '</div>' +
+            '<div class=\"row g-2\">' +
+              '<div class=\"col-md-6\"><div class=\"fw-semibold small mb-1\">Sent</div><div class=\"small\">' + sent + '</div></div>' +
+              '<div class=\"col-md-6\"><div class=\"fw-semibold small mb-1\">Received</div><div class=\"small\">' + recv + '</div></div>' +
+            '</div>' +
+            '<details class=\"mt-2\"><summary class=\"small\">Request payload / headers</summary><pre class=\"small mt-1 mb-1\"><code>' + reqPayload + '</code></pre><pre class=\"small mb-0\"><code>' + reqHeaders + '</code></pre></details>' +
+            '<details class=\"mt-2\"><summary class=\"small\">Response payload / headers</summary><pre class=\"small mt-1 mb-1\"><code>' + respPayload + '</code></pre><pre class=\"small mb-0\"><code>' + respHeaders + '</code></pre></details>' +
+          '</div>';
+      });
+      this.conversationDetailHtml = rows.join('');
+    },
+    renderMarkdown(input) {
+      const md = String(input || '').trim();
+      if (!md) return '<span class=\"text-body-secondary\">(empty)</span>';
+      try {
+        let html = '';
+        if (window.marked && typeof window.marked.parse === 'function') {
+          html = window.marked.parse(md, {gfm:true, breaks:true});
+        } else {
+          html = this.escapeHtml(md).replaceAll('\\n', '<br>');
+        }
+        if (window.DOMPurify && typeof window.DOMPurify.sanitize === 'function') {
+          html = window.DOMPurify.sanitize(html);
+        }
+        return html;
+      } catch (_) {
+        return this.escapeHtml(md).replaceAll('\\n', '<br>');
       }
     },
     async saveAccessToken() {

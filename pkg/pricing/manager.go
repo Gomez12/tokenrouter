@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lkarlslund/tokenrouter/pkg/assets"
 	"github.com/lkarlslund/tokenrouter/pkg/cache"
 	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
@@ -58,7 +59,14 @@ type Manager struct {
 
 const pricingRefreshInterval = 12 * time.Hour
 
-var cerebrasPublicModelsURL = "https://api.cerebras.ai/public/v1/models"
+const defaultCerebrasPricingModelsURL = "https://api.cerebras.ai/public/v1/models"
+const defaultGoogleGeminiPricingURL = "https://ai.google.dev/gemini-api/docs/pricing"
+const defaultOpenCodeZenPricingURL = "https://opencode.ai/docs/zen/"
+
+var (
+	popularProvidersOnce sync.Once
+	popularProvidersByID map[string]assets.PopularProvider
+)
 
 func NewManager(path string) (*Manager, error) {
 	m := &Manager{path: path}
@@ -261,6 +269,61 @@ func (m *Manager) fetchProviderPricing(ctx context.Context, p config.ProviderCon
 	return nil, "", fmt.Errorf("no pricing source matched provider %q", p.Name)
 }
 
+func providerTypeOrName(p config.ProviderConfig) string {
+	if v := strings.TrimSpace(p.ProviderType); v != "" {
+		return strings.ToLower(v)
+	}
+	return strings.ToLower(strings.TrimSpace(p.Name))
+}
+
+func loadPopularProvidersByID() map[string]assets.PopularProvider {
+	popularProvidersOnce.Do(func() {
+		popularProvidersByID = map[string]assets.PopularProvider{}
+		popular, err := assets.LoadPopularProviders()
+		if err != nil {
+			return
+		}
+		for _, p := range popular {
+			id := strings.ToLower(strings.TrimSpace(p.Name))
+			if id == "" {
+				continue
+			}
+			popularProvidersByID[id] = p
+		}
+	})
+	return popularProvidersByID
+}
+
+func popularProviderFor(p config.ProviderConfig) (assets.PopularProvider, bool) {
+	byID := loadPopularProvidersByID()
+	if len(byID) == 0 {
+		return assets.PopularProvider{}, false
+	}
+	pp, ok := byID[providerTypeOrName(p)]
+	return pp, ok
+}
+
+func pricingDocsURLFor(p config.ProviderConfig, fallback string) string {
+	if preset, ok := popularProviderFor(p); ok {
+		if v := strings.TrimSpace(preset.PricingURL); v != "" {
+			return v
+		}
+	}
+	return fallback
+}
+
+func pricingModelsURLFor(p config.ProviderConfig, fallback string) string {
+	if v := strings.TrimSpace(p.ModelListURL); v != "" {
+		return v
+	}
+	if preset, ok := popularProviderFor(p); ok {
+		if v := strings.TrimSpace(preset.PricingModelsURL); v != "" {
+			return v
+		}
+	}
+	return fallback
+}
+
 type ProviderPricingSource interface {
 	Name() string
 	Match(config.ProviderConfig) bool
@@ -331,12 +394,14 @@ type OpenCodeZenPricingSource struct{}
 func (s *OpenCodeZenPricingSource) Name() string { return "opencode-zen-docs" }
 
 func (s *OpenCodeZenPricingSource) Match(p config.ProviderConfig) bool {
+	if providerTypeOrName(p) == "opencode-zen" {
+		return true
+	}
 	base := strings.ToLower(strings.TrimSpace(p.BaseURL))
-	name := strings.ToLower(strings.TrimSpace(p.Name))
 	if strings.Contains(base, "opencode.ai/zen") {
 		return true
 	}
-	if strings.Contains(base, "opencode.ai") && (strings.Contains(name, "opencode") || strings.Contains(name, "zen")) {
+	if strings.Contains(base, "opencode.ai") {
 		return true
 	}
 	return false
@@ -348,7 +413,8 @@ func (s *OpenCodeZenPricingSource) Fetch(ctx context.Context, p config.ProviderC
 		timeout = 60
 	}
 	cli := &http.Client{Timeout: time.Duration(timeout) * time.Second}
-	docsReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://opencode.ai/docs/zen/", nil)
+	docsURL := pricingDocsURLFor(p, defaultOpenCodeZenPricingURL)
+	docsReq, err := http.NewRequestWithContext(ctx, http.MethodGet, docsURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -404,7 +470,7 @@ func (s *OpenCodeZenPricingSource) Fetch(ctx context.Context, p config.ProviderC
 	if len(out) == 0 {
 		return nil, "", fmt.Errorf("no pricing rows matched model IDs")
 	}
-	return out, "https://opencode.ai/docs/zen/", nil
+	return out, docsURL, nil
 }
 
 type GoogleGeminiDocsPricingSource struct{}
@@ -412,9 +478,11 @@ type GoogleGeminiDocsPricingSource struct{}
 func (s *GoogleGeminiDocsPricingSource) Name() string { return "google-gemini-docs" }
 
 func (s *GoogleGeminiDocsPricingSource) Match(p config.ProviderConfig) bool {
-	name := strings.ToLower(strings.TrimSpace(p.Name))
+	if providerTypeOrName(p) == "google-gemini" {
+		return true
+	}
 	base := strings.ToLower(strings.TrimSpace(p.BaseURL))
-	return name == "google-gemini" || strings.Contains(base, "generativelanguage.googleapis.com")
+	return strings.Contains(base, "generativelanguage.googleapis.com")
 }
 
 func (s *GoogleGeminiDocsPricingSource) Fetch(ctx context.Context, p config.ProviderConfig) ([]ModelPricing, string, error) {
@@ -423,7 +491,8 @@ func (s *GoogleGeminiDocsPricingSource) Fetch(ctx context.Context, p config.Prov
 		timeout = 60
 	}
 	cli := &http.Client{Timeout: time.Duration(timeout) * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://ai.google.dev/gemini-api/docs/pricing", nil)
+	docsURL := pricingDocsURLFor(p, defaultGoogleGeminiPricingURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, docsURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -453,7 +522,7 @@ func (s *GoogleGeminiDocsPricingSource) Fetch(ctx context.Context, p config.Prov
 			OutputPer1M: r.OutputPer1M,
 		})
 	}
-	return out, "https://ai.google.dev/gemini-api/docs/pricing", nil
+	return out, docsURL, nil
 }
 
 type NvidiaNIMPricingSource struct{}
@@ -461,11 +530,10 @@ type NvidiaNIMPricingSource struct{}
 func (s *NvidiaNIMPricingSource) Name() string { return "nvidia-nim-trial-pricing" }
 
 func (s *NvidiaNIMPricingSource) Match(p config.ProviderConfig) bool {
-	name := strings.ToLower(strings.TrimSpace(p.Name))
-	base := strings.ToLower(strings.TrimSpace(p.BaseURL))
-	if name == "nvidia" {
+	if providerTypeOrName(p) == "nvidia" {
 		return true
 	}
+	base := strings.ToLower(strings.TrimSpace(p.BaseURL))
 	return strings.Contains(base, "integrate.api.nvidia.com")
 }
 
@@ -499,9 +567,12 @@ type CerebrasPublicPricingSource struct{}
 func (s *CerebrasPublicPricingSource) Name() string { return "cerebras-public-models" }
 
 func (s *CerebrasPublicPricingSource) Match(p config.ProviderConfig) bool {
+	if providerTypeOrName(p) == "cerebras" {
+		return true
+	}
 	name := strings.ToLower(strings.TrimSpace(p.Name))
 	base := strings.ToLower(strings.TrimSpace(p.BaseURL))
-	if name == "cerebras" || strings.Contains(name, "cerebras") {
+	if strings.Contains(name, "cerebras") {
 		return true
 	}
 	return strings.Contains(base, "api.cerebras.ai")
@@ -513,7 +584,8 @@ func (s *CerebrasPublicPricingSource) Fetch(ctx context.Context, p config.Provid
 		timeout = 60
 	}
 	cli := &http.Client{Timeout: time.Duration(timeout) * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cerebrasPublicModelsURL, nil)
+	modelsURL := pricingModelsURLFor(p, defaultCerebrasPricingModelsURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -552,7 +624,7 @@ func (s *CerebrasPublicPricingSource) Fetch(ctx context.Context, p config.Provid
 	if len(out) == 0 {
 		return nil, "", fmt.Errorf("no cerebras pricing rows parsed")
 	}
-	return out, cerebrasPublicModelsURL, nil
+	return out, modelsURL, nil
 }
 
 func parsePricingFields(item map[string]any) (inputPer1M, outputPer1M float64, ok bool) {
@@ -870,7 +942,10 @@ func (m modelMatchIndex) Match(label string) (string, bool) {
 	for _, id := range m.modelIDs {
 		nid := normalizeName(id)
 		if strings.Contains(n, nid) || strings.Contains(nid, n) {
-			score := min(len(n), len(nid))
+			score := len(n)
+			if len(nid) < score {
+				score = len(nid)
+			}
 			if score > bestScore {
 				bestScore = score
 				best = id
@@ -904,13 +979,6 @@ func tokenSignature(s string) string {
 	}
 	sort.Strings(toks)
 	return strings.Join(toks, "|")
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func parseNumber(v any) (float64, bool) {
