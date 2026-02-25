@@ -117,6 +117,7 @@ function adminApp() {
     draft: {name:'',provider_type:'',base_url:'',api_key:'',auth_token:'',refresh_token:'',token_expires_at:'',account_id:'',device_auth_url:'',device_code:'',device_auth_id:'',device_code_url:'',device_token_url:'',device_client_id:'',device_scope:'',device_grant_type:'',oauth_authorize_url:'',oauth_token_url:'',oauth_client_id:'',oauth_client_secret:'',oauth_scope:'',enabled:true,timeout_seconds:60},
     oauthAdvanced: false,
     init() {
+      this.restoreLocalStorageFromHandoff();
       window.__adminSortModels = (col) => this.sortModelsBy(col);
       window.__adminProvidersFirstPage = () => this.setProvidersPage(1);
       window.__adminProvidersPrevPage = () => this.setProvidersPage(this.providersPage - 1);
@@ -2125,7 +2126,8 @@ function adminApp() {
         }
         const redirectURL = String(confirmBody.redirect_url || '').trim();
         if (redirectURL) {
-          window.location = redirectURL;
+          const payload = this.buildLocalStorageHandoffPayload();
+          window.location = this.appendLocalStorageHandoffToURL(redirectURL, payload);
           return;
         }
         window.location.reload();
@@ -2166,6 +2168,62 @@ function adminApp() {
         } catch (_) {}
       }
       return false;
+    },
+    buildLocalStorageHandoffPayload() {
+      try {
+        const data = {};
+        const maxItems = 64;
+        let count = 0;
+        for (let i = 0; i < window.localStorage.length; i++) {
+          if (count >= maxItems) break;
+          const k = String(window.localStorage.key(i) || '');
+          if (!k.startsWith('opp_')) continue;
+          const v = window.localStorage.getItem(k);
+          if (v === null || v === undefined) continue;
+          data[k] = String(v);
+          count++;
+        }
+        const raw = JSON.stringify({v:1, t:Date.now(), data});
+        const encoded = btoa(unescape(encodeURIComponent(raw))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        if (encoded.length > 7000) return '';
+        return encoded;
+      } catch (_) {
+        return '';
+      }
+    },
+    appendLocalStorageHandoffToURL(url, payload) {
+      const target = String(url || '').trim();
+      const p = String(payload || '').trim();
+      if (!target || !p) return target;
+      const sep = target.includes('#') ? '&' : '#';
+      return target + sep + 'lsm=' + encodeURIComponent(p);
+    },
+    restoreLocalStorageFromHandoff() {
+      try {
+        const hash = String(window.location.hash || '');
+        if (!hash || hash.indexOf('lsm=') === -1) return;
+        const params = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
+        const token = String(params.get('lsm') || '').trim();
+        if (!token) return;
+        const normalized = token.replace(/-/g, '+').replace(/_/g, '/');
+        const pad = normalized.length % 4 === 0 ? '' : '='.repeat(4 - (normalized.length % 4));
+        const decoded = decodeURIComponent(escape(atob(normalized + pad)));
+        const parsed = JSON.parse(decoded);
+        const data = parsed && typeof parsed === 'object' ? parsed.data : null;
+        if (data && typeof data === 'object') {
+          Object.keys(data).forEach((k) => {
+            const key = String(k || '');
+            if (!key.startsWith('opp_')) return;
+            const val = data[k];
+            if (val === null || val === undefined) return;
+            try { window.localStorage.setItem(key, String(val)); } catch (_) {}
+          });
+        }
+        params.delete('lsm');
+        const rest = params.toString();
+        const next = window.location.pathname + window.location.search + (rest ? ('#' + rest) : '');
+        window.history.replaceState(null, '', next);
+      } catch (_) {}
     },
     async loadVersion() {
       const r = await this.apiFetch('/admin/api/version', {headers:this.headers()});
