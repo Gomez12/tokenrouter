@@ -90,6 +90,10 @@
           this.handleRealtimeRefresh(true);
           return;
         }
+        if (msg.type === 'changed') {
+          this.handleRealtimeChange(String(msg.scope || '').trim().toLowerCase());
+          return;
+        }
         if (msg.type === 'conversation_append' && this.activeTab === 'conversations') {
           this.loadConversations(false);
         }
@@ -144,6 +148,45 @@
     }
   }
 
+  function handleRealtimeChange(scope) {
+    const s = String(scope || '').trim().toLowerCase();
+    if (s === 'stats') {
+      if (this.activeTab === 'status' || this.activeTab === 'quota' || this.activeTab === 'access') {
+        this.loadStats(true);
+      }
+      return;
+    }
+    if (s === 'providers') {
+      if (this.activeTab === 'providers') this.loadProviders();
+      return;
+    }
+    if (s === 'access') {
+      if (this.activeTab === 'access') {
+        this.loadAccessTokens();
+        this.loadSecuritySettings();
+        this.loadTLSSettings();
+      }
+      return;
+    }
+    if (s === 'models') {
+      if (this.activeTab === 'models') this.loadModelsCatalog(false);
+      return;
+    }
+    if (s === 'conversations') {
+      if (this.activeTab === 'conversations') this.loadConversations(false);
+      return;
+    }
+    if (s === 'log') {
+      if (this.activeTab === 'log') this.loadLogs();
+      return;
+    }
+    if (s === 'network') {
+      if (this.activeTab === 'network') this.loadTLSSettings();
+      return;
+    }
+    this.handleRealtimeRefresh(true);
+  }
+
   window.AdminRealtime = {
     startRealtimeUpdates,
     stopRealtimeUpdates,
@@ -156,6 +199,7 @@
     connectRealtimeWebSocket,
     sendWSSubscription,
     noteWSFailure,
-    handleRealtimeRefresh
+    handleRealtimeRefresh,
+    handleRealtimeChange
   };
 })();

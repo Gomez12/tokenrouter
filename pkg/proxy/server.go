@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -43,6 +45,8 @@ type Server struct {
 	providerHealthChecker *ProviderHealthChecker
 	adminHandler          *AdminHandler
 	httpServer            *http.Server
+	listenerMu            sync.Mutex
+	httpListeners         map[string]net.Listener
 	modelsCachePath       string
 	modelsCached          atomic.Pointer[[]ModelCard]
 	activeProxyRequests   atomic.Int64
@@ -60,6 +64,7 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 		store:           store,
 		resolver:        resolver,
 		stats:           stats,
+		httpListeners:   map[string]net.Listener{},
 		modelsCachePath: config.DefaultModelsCachePath(),
 		conversations: conversations.NewStore(config.DefaultConversationsPath(), conversations.Settings{
 			Enabled:    cfg.Conversations.Enabled,
@@ -115,6 +120,7 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 	adminHandler.conversations = s.conversations
 	adminHandler.logs = s.logs
 	s.adminHandler = adminHandler
+	adminHandler.SetNetworkListenerControl(s.addHTTPListener, s.removeHTTPListener, s.listHTTPListeners)
 	adminHandler.RegisterRoutes(r)
 
 	s.httpServer = &http.Server{
@@ -190,9 +196,8 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	go func() {
-		log.Infof("proxy listening on %s", cfg.ListenAddr)
-		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("proxy server: %w", err)
+		if err := s.addHTTPListener(cfg.ListenAddr); err != nil {
+			errCh <- fmt.Errorf("proxy listener: %w", err)
 		}
 	}()
 
@@ -203,6 +208,78 @@ func (s *Server) Run(ctx context.Context) error {
 	defer cancel()
 	_ = s.httpServer.Shutdown(shutdownCtx)
 	return firstErr(errCh)
+}
+
+func (s *Server) addHTTPListener(addr string) error {
+	listenAddr := strings.TrimSpace(addr)
+	if listenAddr == "" {
+		return fmt.Errorf("listen address required")
+	}
+	s.listenerMu.Lock()
+	if _, ok := s.httpListeners[listenAddr]; ok {
+		s.listenerMu.Unlock()
+		return nil
+	}
+	s.listenerMu.Unlock()
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return err
+	}
+
+	s.listenerMu.Lock()
+	if _, ok := s.httpListeners[listenAddr]; ok {
+		s.listenerMu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
+	s.httpListeners[listenAddr] = ln
+	s.listenerMu.Unlock()
+
+	log.Infof("proxy listening on %s", listenAddr)
+	go func(addr string, l net.Listener) {
+		err := s.httpServer.Serve(l)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			log.Warn("proxy listener stopped", "addr", addr, "error", err)
+		}
+		s.listenerMu.Lock()
+		if cur, ok := s.httpListeners[addr]; ok && cur == l {
+			delete(s.httpListeners, addr)
+		}
+		s.listenerMu.Unlock()
+	}(listenAddr, ln)
+	return nil
+}
+
+func (s *Server) removeHTTPListener(addr string) error {
+	listenAddr := strings.TrimSpace(addr)
+	if listenAddr == "" {
+		return fmt.Errorf("listen address required")
+	}
+	s.listenerMu.Lock()
+	ln, ok := s.httpListeners[listenAddr]
+	if !ok {
+		s.listenerMu.Unlock()
+		return nil
+	}
+	if len(s.httpListeners) <= 1 {
+		s.listenerMu.Unlock()
+		return fmt.Errorf("cannot remove last active listener")
+	}
+	delete(s.httpListeners, listenAddr)
+	s.listenerMu.Unlock()
+	return ln.Close()
+}
+
+func (s *Server) listHTTPListeners() []string {
+	s.listenerMu.Lock()
+	defer s.listenerMu.Unlock()
+	out := make([]string, 0, len(s.httpListeners))
+	for addr := range s.httpListeners {
+		out = append(out, addr)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (s *Server) runMaintenanceScheduler(ctx context.Context) {

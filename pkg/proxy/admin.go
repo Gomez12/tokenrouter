@@ -45,25 +45,30 @@ const adminSessionCookie = "opp_admin_session"
 const adminInstanceHeader = "X-OPP-Instance-ID"
 
 type AdminHandler struct {
-	store         *config.ServerConfigStore
-	stats         *StatsStore
-	resolver      *ProviderResolver
-	pricing       *pricing.Manager
-	conversations *conversations.Store
-	logs          *logstore.Store
-	healthChecker *ProviderHealthChecker
-	instance      string
-	oauthMu       sync.Mutex
-	oauthPending  map[string]*oauthSession
-	oauthSrvMu    sync.Mutex
-	oauthSrv      *http.Server
-	oauthSrvAddr  string
-	quotaMu       sync.Mutex
-	quotaCache    *cache.TTLMap[string, quotaCacheValue]
-	statsCache    *cache.TTLMap[int64, StatsSummary]
-	wsMu          sync.Mutex
-	wsClients     map[*adminWSClient]struct{}
-	statsNotifyAt time.Time
+	store          *config.ServerConfigStore
+	stats          *StatsStore
+	resolver       *ProviderResolver
+	pricing        *pricing.Manager
+	conversations  *conversations.Store
+	logs           *logstore.Store
+	healthChecker  *ProviderHealthChecker
+	instance       string
+	oauthMu        sync.Mutex
+	oauthPending   map[string]*oauthSession
+	oauthSrvMu     sync.Mutex
+	oauthSrv       *http.Server
+	oauthSrvAddr   string
+	quotaMu        sync.Mutex
+	quotaCache     *cache.TTLMap[string, quotaCacheValue]
+	statsCache     *cache.TTLMap[int64, StatsSummary]
+	wsMu           sync.Mutex
+	wsClients      map[*adminWSClient]struct{}
+	statsNotifyAt  time.Time
+	networkMu      sync.Mutex
+	networkSwitch  map[string]pendingNetworkSwitch
+	addListener    func(string) error
+	removeListener func(string) error
+	listListeners  func() []string
 }
 
 type adminWSClient struct {
@@ -71,6 +76,13 @@ type adminWSClient struct {
 	updateEvery time.Duration
 	lastRefresh time.Time
 	realtime    bool
+}
+
+type pendingNetworkSwitch struct {
+	ID      string
+	OldAddr string
+	NewAddr string
+	Created time.Time
 }
 
 type adminAuthContextKey struct{}
@@ -132,9 +144,21 @@ func NewAdminHandler(store *config.ServerConfigStore, stats *StatsStore, resolve
 		quotaCache:    cache.NewTTLMap[string, quotaCacheValue](),
 		statsCache:    cache.NewTTLMap[int64, StatsSummary](),
 		wsClients:     map[*adminWSClient]struct{}{},
+		networkSwitch: map[string]pendingNetworkSwitch{},
 	}
 	go h.runWSScheduler()
 	return h
+}
+
+func (h *AdminHandler) SetNetworkListenerControl(add func(string) error, remove func(string) error, list func() []string) {
+	if h == nil {
+		return
+	}
+	h.networkMu.Lock()
+	h.addListener = add
+	h.removeListener = remove
+	h.listListeners = list
+	h.networkMu.Unlock()
 }
 
 func (h *AdminHandler) RegisterRoutes(r chi.Router) {
@@ -151,6 +175,10 @@ func (h *AdminHandler) RegisterRoutes(r chi.Router) {
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/settings/security", h.securitySettingsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/settings/tls", h.tlsSettingsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/settings/tls", h.tlsSettingsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/settings/network", h.networkSettingsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/settings/network/apply", h.networkApplyAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/settings/network/confirm", h.networkConfirmAPI)
+	r.With(h.withRuntimeInstanceHeader).Get("/admin/api/network/probe", h.networkProbeAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/settings/tls/test-certificate", h.tlsTestCertificateAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/settings/tls/renew", h.tlsRenewCertificateAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/version", h.versionAPI)
@@ -408,7 +436,21 @@ func (h *AdminHandler) NotifyStatsChanged() {
 	}
 	h.statsNotifyAt = now
 	h.wsMu.Unlock()
-	h.broadcastAdminEvent(map[string]any{"type": "refresh"})
+	h.notifyAdminChanged("stats")
+}
+
+func (h *AdminHandler) notifyAdminChanged(scope string) {
+	if h == nil {
+		return
+	}
+	s := strings.TrimSpace(strings.ToLower(scope))
+	if s == "" {
+		s = "all"
+	}
+	h.broadcastAdminEvent(map[string]any{
+		"type":  "changed",
+		"scope": s,
+	})
 }
 
 func (h *AdminHandler) withRuntimeInstanceHeader(next http.Handler) http.Handler {
@@ -3173,10 +3215,266 @@ func (h *AdminHandler) tlsSettingsAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		h.notifyAdminChanged("network")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (h *AdminHandler) networkSettingsAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg := h.store.Snapshot()
+	bindMode, customBind, port := decomposeListenAddr(strings.TrimSpace(cfg.ListenAddr))
+	active := []string{}
+	h.networkMu.Lock()
+	if h.listListeners != nil {
+		active = h.listListeners()
+	}
+	var pending map[string]any
+	for _, sw := range h.networkSwitch {
+		pending = map[string]any{
+			"id":         sw.ID,
+			"old_addr":   sw.OldAddr,
+			"new_addr":   sw.NewAddr,
+			"created_at": sw.Created.Format(time.RFC3339),
+		}
+		break
+	}
+	h.networkMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"bind_mode":   bindMode,
+		"custom_bind": customBind,
+		"port":        port,
+		"listen_addr": strings.TrimSpace(cfg.ListenAddr),
+		"active":      active,
+		"pending":     pending,
+	})
+}
+
+func (h *AdminHandler) networkApplyAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg := h.store.Snapshot()
+	if cfg.TLS.Enabled {
+		http.Error(w, "network apply is not supported while TLS listener mode is enabled", http.StatusBadRequest)
+		return
+	}
+	var payload struct {
+		BindMode   string `json:"bind_mode"`
+		CustomBind string `json:"custom_bind"`
+		Port       int    `json:"port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	newAddr, bindMode, customBind, port, err := composeListenAddr(payload.BindMode, payload.CustomBind, payload.Port)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	oldAddr := strings.TrimSpace(cfg.ListenAddr)
+	if oldAddr == "" {
+		oldAddr = "127.0.0.1:8080"
+	}
+
+	h.networkMu.Lock()
+	addFn := h.addListener
+	h.networkMu.Unlock()
+	if addFn == nil {
+		http.Error(w, "listener control unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err := addFn(newAddr); err != nil {
+		http.Error(w, "failed to add listener: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	id, err := randomURLSafe(12)
+	if err != nil {
+		http.Error(w, "failed to create switch id", http.StatusInternalServerError)
+		return
+	}
+	sw := pendingNetworkSwitch{
+		ID:      id,
+		OldAddr: oldAddr,
+		NewAddr: newAddr,
+		Created: time.Now().UTC(),
+	}
+	h.networkMu.Lock()
+	h.networkSwitch = map[string]pendingNetworkSwitch{id: sw}
+	h.networkMu.Unlock()
+	h.notifyAdminChanged("network")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "pending_probe",
+		"switch_id":   id,
+		"instance_id": h.instance,
+		"bind_mode":   bindMode,
+		"custom_bind": customBind,
+		"port":        port,
+		"new_addr":    newAddr,
+		"old_addr":    oldAddr,
+	})
+}
+
+func (h *AdminHandler) networkConfirmAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var payload struct {
+		SwitchID string `json:"switch_id"`
+		ProbeOK  bool   `json:"probe_ok"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	switchID := strings.TrimSpace(payload.SwitchID)
+	if switchID == "" {
+		http.Error(w, "switch_id is required", http.StatusBadRequest)
+		return
+	}
+	h.networkMu.Lock()
+	sw, ok := h.networkSwitch[switchID]
+	removeFn := h.removeListener
+	delete(h.networkSwitch, switchID)
+	h.networkMu.Unlock()
+	if !ok {
+		http.Error(w, "switch not found", http.StatusBadRequest)
+		return
+	}
+	if !payload.ProbeOK {
+		if removeFn != nil {
+			_ = removeFn(sw.NewAddr)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "cancelled"})
+		return
+	}
+	if err := h.store.Update(func(c *config.ServerConfig) error {
+		c.ListenAddr = sw.NewAddr
+		return nil
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if removeFn != nil && strings.TrimSpace(sw.OldAddr) != "" && sw.OldAddr != sw.NewAddr {
+		_ = removeFn(sw.OldAddr)
+	}
+	h.notifyAdminChanged("network")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       "ok",
+		"listen_addr":  sw.NewAddr,
+		"redirect_url": redirectURLForNewListener(r, sw.NewAddr),
+	})
+}
+
+func (h *AdminHandler) networkProbeAPI(w http.ResponseWriter, r *http.Request) {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
+	}
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"instance": h.instance,
+	})
+}
+
+func decomposeListenAddr(listenAddr string) (bindMode string, customBind string, port int) {
+	host, p := splitHostPortLoose(strings.TrimSpace(listenAddr))
+	if p <= 0 {
+		p = 8080
+	}
+	switch strings.TrimSpace(host) {
+	case "", "0.0.0.0", "::":
+		return "all", "", p
+	case "127.0.0.1", "localhost":
+		return "localhost", "", p
+	default:
+		return "custom", host, p
+	}
+}
+
+func composeListenAddr(bindMode, customBind string, port int) (listenAddr string, normalizedMode string, normalizedCustom string, normalizedPort int, err error) {
+	mode := strings.ToLower(strings.TrimSpace(bindMode))
+	if mode == "" {
+		mode = "localhost"
+	}
+	if port <= 0 || port > 65535 {
+		return "", "", "", 0, fmt.Errorf("port must be between 1 and 65535")
+	}
+	host := ""
+	switch mode {
+	case "localhost":
+		host = "127.0.0.1"
+	case "all":
+		host = "0.0.0.0"
+	case "custom":
+		host = strings.TrimSpace(customBind)
+		if host == "" {
+			return "", "", "", 0, fmt.Errorf("custom bind host is required")
+		}
+	default:
+		return "", "", "", 0, fmt.Errorf("bind_mode must be localhost, all, or custom")
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), mode, host, port, nil
+}
+
+func splitHostPortLoose(addr string) (host string, port int) {
+	a := strings.TrimSpace(addr)
+	if a == "" {
+		return "", 8080
+	}
+	if strings.HasPrefix(a, ":") {
+		if n, err := strconv.Atoi(strings.TrimPrefix(a, ":")); err == nil {
+			return "", n
+		}
+		return "", 8080
+	}
+	h, p, err := net.SplitHostPort(a)
+	if err != nil {
+		return a, 8080
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(p))
+	return strings.TrimSpace(h), n
+}
+
+func redirectURLForNewListener(r *http.Request, listenAddr string) string {
+	host, port := splitHostPortLoose(listenAddr)
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	currentHost := strings.TrimSpace(r.Host)
+	currentName := currentHost
+	if h, _, err := net.SplitHostPort(currentHost); err == nil {
+		currentName = h
+	}
+	targetHost := strings.TrimSpace(host)
+	if targetHost == "" || targetHost == "0.0.0.0" || targetHost == "::" {
+		targetHost = currentName
+		if targetHost == "" {
+			targetHost = "127.0.0.1"
+		}
+	}
+	return fmt.Sprintf("%s://%s/admin", scheme, net.JoinHostPort(targetHost, strconv.Itoa(port)))
 }
 
 func (h *AdminHandler) conversationsSettingsAPI(w http.ResponseWriter, r *http.Request) {
@@ -3217,6 +3515,7 @@ func (h *AdminHandler) conversationsSettingsAPI(w http.ResponseWriter, r *http.R
 			MaxItems:   cfg.Conversations.MaxItems,
 			MaxAgeDays: cfg.Conversations.MaxAgeDays,
 		})
+		h.notifyAdminChanged("conversations")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -3253,6 +3552,7 @@ func (h *AdminHandler) logsSettingsAPI(w http.ResponseWriter, r *http.Request) {
 		h.logs.UpdateSettings(logstore.Settings{
 			MaxLines: cfg.Logs.MaxLines,
 		})
+		h.notifyAdminChanged("log")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -3268,6 +3568,7 @@ func (h *AdminHandler) logsAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodDelete {
 		h.logs.Clear()
+		h.notifyAdminChanged("log")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 		return
 	}
@@ -3679,6 +3980,7 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		h.notifyAdminChanged("access")
 		writeJSON(w, http.StatusCreated, map[string]string{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -3773,6 +4075,7 @@ func (h *AdminHandler) accessTokenByIDAPI(w http.ResponseWriter, r *http.Request
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		h.notifyAdminChanged("access")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
@@ -3814,17 +4117,43 @@ func (h *AdminHandler) accessTokenByIDAPI(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	h.notifyAdminChanged("access")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (h *AdminHandler) providersAPI(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		providers := h.catalogProviders()
 		cfg := h.store.Snapshot()
 		configuredByName := make(map[string]struct{}, len(cfg.Providers))
+		configuredEnabled := make(map[string]bool, len(cfg.Providers))
 		for _, p := range cfg.Providers {
 			configuredByName[p.Name] = struct{}{}
+			configuredEnabled[p.Name] = p.Enabled
+		}
+		activeProviders := h.catalogProviders()
+		activeByName := make(map[string]config.ProviderConfig, len(activeProviders))
+		for _, p := range activeProviders {
+			activeByName[p.Name] = p
+		}
+		providers := make([]config.ProviderConfig, 0, len(cfg.Providers)+len(activeProviders))
+		seen := make(map[string]struct{}, len(cfg.Providers)+len(activeProviders))
+		// Always include configured providers, including disabled ones.
+		for _, p := range cfg.Providers {
+			if ap, ok := activeByName[p.Name]; ok {
+				providers = append(providers, ap)
+			} else {
+				providers = append(providers, h.applyPresetProviderDefaults(p))
+			}
+			seen[p.Name] = struct{}{}
+		}
+		// Then include auto-merged providers.
+		for _, p := range activeProviders {
+			if _, ok := seen[p.Name]; ok {
+				continue
+			}
+			providers = append(providers, p)
+			seen[p.Name] = struct{}{}
 		}
 		if h.pricing != nil {
 			h.pricing.SetProviders(providers)
@@ -3875,13 +4204,17 @@ func (h *AdminHandler) providersAPI(w http.ResponseWriter, r *http.Request) {
 				item.DisplayName = dn
 			}
 			_, item.Managed = configuredByName[p.Name]
-			item.Status = "unknown"
-			if h.healthChecker != nil {
-				if snap, ok := h.healthChecker.Snapshot(p.Name); ok {
-					item.Status = snap.Status
-					item.ModelCount = snap.ModelCount
-					item.ResponseMS = snap.ResponseMS
-					item.CheckedAt = snap.CheckedAt.Format(time.RFC3339)
+			if item.Managed && !configuredEnabled[p.Name] {
+				item.Status = "disabled"
+			} else {
+				item.Status = "unknown"
+				if h.healthChecker != nil {
+					if snap, ok := h.healthChecker.Snapshot(p.Name); ok {
+						item.Status = snap.Status
+						item.ModelCount = snap.ModelCount
+						item.ResponseMS = snap.ResponseMS
+						item.CheckedAt = snap.CheckedAt.Format(time.RFC3339)
+					}
 				}
 			}
 			if st, ok := pricingSnapshot.ProviderStates[p.Name]; ok && !st.LastUpdate.IsZero() {
@@ -3932,6 +4265,7 @@ func (h *AdminHandler) providersAPI(w http.ResponseWriter, r *http.Request) {
 		if h.healthChecker != nil {
 			h.healthChecker.Trigger()
 		}
+		h.notifyAdminChanged("providers")
 		writeJSON(w, http.StatusCreated, map[string]string{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -4869,6 +5203,7 @@ func (h *AdminHandler) providerByNameAPI(w http.ResponseWriter, r *http.Request)
 		if h.healthChecker != nil {
 			h.healthChecker.Trigger()
 		}
+		h.notifyAdminChanged("providers")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case http.MethodDelete:
 		err := h.store.Update(func(c *config.ServerConfig) error {
@@ -4900,6 +5235,7 @@ func (h *AdminHandler) providerByNameAPI(w http.ResponseWriter, r *http.Request)
 		if h.healthChecker != nil {
 			h.healthChecker.Trigger()
 		}
+		h.notifyAdminChanged("providers")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

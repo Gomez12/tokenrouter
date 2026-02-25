@@ -349,11 +349,20 @@
     <div class="card shadow-sm mb-3">
       <div class="card-body">
         <div class="d-flex align-items-center justify-content-between mb-2">
-          <h2 class="h5 mb-0">Provider Quotas</h2>
-          <button class="btn btn-sm btn-outline-primary" :disabled="quotaRefreshInProgress" @click="refreshQuota()">
-            <span x-show="!quotaRefreshInProgress">Refresh</span>
-            <span x-show="quotaRefreshInProgress">Refreshing...</span>
-          </button>
+          <h2 class="h5 mb-0">Available Quotas</h2>
+          <div class="d-flex align-items-center gap-2">
+            <input
+              class="form-control form-control-sm"
+              style="width:280px;"
+              placeholder="Filter quotas..."
+              x-model.trim="quotaSearch"
+              @input="quotaSummaryHtml = renderQuotaPanel((stats && stats.provider_quotas) || {})"
+            />
+            <button class="btn btn-sm btn-outline-primary" :disabled="quotaRefreshInProgress" @click="refreshQuota()">
+              <span x-show="!quotaRefreshInProgress">Refresh</span>
+              <span x-show="quotaRefreshInProgress">Refreshing...</span>
+            </button>
+          </div>
         </div>
         <div x-html="quotaSummaryHtml"></div>
       </div>
@@ -401,6 +410,37 @@
   <div x-show="activeTab==='network'" style="display:none;">
     <div class="card shadow-sm mb-3">
       <div class="card-body">
+        <div class="mb-3">
+          <h2 class="h5 mb-2">Network Binding</h2>
+          <div class="row g-2 align-items-end">
+            <div class="col-md-4">
+              <label class="form-label">Bind</label>
+              <select class="form-select" x-model="networkBindMode">
+                <option value="localhost">localhost</option>
+                <option value="all">all (0.0.0.0)</option>
+                <option value="custom">custom</option>
+              </select>
+            </div>
+            <div class="col-md-4" x-show="networkBindMode==='custom'" style="display:none;">
+              <label class="form-label">Custom host</label>
+              <input class="form-control" placeholder="e.g. 192.168.1.10" x-model="networkCustomBind" />
+            </div>
+            <div class="col-md-2">
+              <label class="form-label">Port</label>
+              <input class="form-control" type="number" min="1" max="65535" step="1" x-model.number="networkPort" />
+            </div>
+            <div class="col-md-2 d-grid">
+              <button class="btn btn-primary" :disabled="networkApplyInProgress" @click="applyNetworkSettings()">
+                <span x-show="!networkApplyInProgress">Apply</span>
+                <span x-show="networkApplyInProgress">Applying...</span>
+              </button>
+            </div>
+          </div>
+          <div class="small text-body-secondary mt-2">
+            Active listeners:
+            <span x-text="(networkActiveAddrs && networkActiveAddrs.length) ? networkActiveAddrs.join(', ') : 'none'"></span>
+          </div>
+        </div>
         <div class="mb-2"><h2 class="h5 mb-0">Let's Encrypt TLS</h2></div>
         <div class="form-check form-switch mb-2">
           <input class="form-check-input" type="checkbox" id="tlsEnabled" x-model="tlsSettings.enabled">

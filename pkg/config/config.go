@@ -157,7 +157,7 @@ func DefaultLogsPath() string {
 
 func NewDefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		ListenAddr:                 ":8080",
+		ListenAddr:                 "127.0.0.1:8080",
 		IncomingTokens:             []IncomingAPIToken{},
 		DefaultProvider:            "",
 		Providers:                  []ProviderConfig{},

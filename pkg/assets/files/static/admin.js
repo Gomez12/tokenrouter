@@ -35,11 +35,18 @@ function adminApp() {
     autoRemoveExpiredTokens: true,
     autoRemoveEmptyQuotaTokens: false,
     securitySaveInProgress: false,
+    networkBindMode: 'localhost',
+    networkCustomBind: '',
+    networkPort: 8080,
+    networkActiveAddrs: [],
+    networkPending: null,
+    networkApplyInProgress: false,
     tlsSettings: {enabled:false, domain:'', email:'', cache_dir:''},
     tlsSaveInProgress: false,
     tlsActionInProgress: false,
     statsSummaryHtml: '',
     quotaSummaryHtml: '',
+    quotaSearch: '',
     statsRangeHours: '8',
     statusUpdateSpeed: 'realtime',
     usageChartGroupBy: 'model',
@@ -148,6 +155,7 @@ function adminApp() {
       this.loadAccessTokens();
       this.loadPopularProviders();
       this.loadSecuritySettings();
+      this.loadNetworkSettings();
       this.loadTLSSettings();
       this.loadVersion();
       this.startRealtimeUpdates();
@@ -172,6 +180,7 @@ function adminApp() {
     sendWSSubscription() { return window.AdminRealtime.sendWSSubscription.call(this); },
     noteWSFailure() { return window.AdminRealtime.noteWSFailure.call(this); },
     handleRealtimeRefresh(forceStats) { return window.AdminRealtime.handleRealtimeRefresh.call(this, forceStats); },
+    handleRealtimeChange(scope) { return window.AdminRealtime.handleRealtimeChange.call(this, scope); },
     headers() { return {'Content-Type':'application/json'}; },
     toast(type, message, duration) {
       const msg = String(message || '').trim();
@@ -226,6 +235,9 @@ function adminApp() {
         this.loadAccessTokens();
         this.loadSecuritySettings();
         this.loadTLSSettings();
+      } else if (tab === 'network') {
+        this.loadNetworkSettings();
+        this.loadTLSSettings();
       } else if (tab === 'conversations') {
         this.loadConversationsSettings();
         this.loadConversations(true);
@@ -251,6 +263,9 @@ function adminApp() {
       } else if (this.activeTab === 'log') {
         this.loadLogSettings();
         this.loadLogs();
+      } else if (this.activeTab === 'network') {
+        this.loadNetworkSettings();
+        this.loadTLSSettings();
       }
     },
     persistActiveTab() {
@@ -1329,6 +1344,7 @@ function adminApp() {
     renderQuotaChart(quotaMap) {
       const items = Object.values(quotaMap || {});
       if (!items.length) return '';
+      const quotaSearch = String(this.quotaSearch || '').trim().toLowerCase();
       const groupField = String(this.usageChartGroupBy || 'model').trim().toLowerCase();
       const groups = {};
       items.forEach((q) => {
@@ -1361,7 +1377,19 @@ function adminApp() {
           else groups[key].other.push(m);
         });
       });
-      const cards = Object.values(groups).sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''))).map((g) => {
+      const visibleGroups = Object.values(groups)
+        .filter((g) => {
+          if (!quotaSearch) return true;
+          const haystack = [
+            String(g.name || ''),
+            String(g.provider || ''),
+            String(g.status || ''),
+            String(g.error || '')
+          ].join(' ').toLowerCase();
+          return haystack.includes(quotaSearch);
+        })
+        .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+      const cards = visibleGroups.map((g) => {
         if (String(g.status || '').toLowerCase() !== 'ok') {
           const msg = this.escapeHtml(String(g.error || g.status || 'quota unavailable'));
           return '<div class="border rounded p-2 bg-body">' +
@@ -1425,7 +1453,8 @@ function adminApp() {
           '<div class="d-flex flex-wrap gap-3 align-items-center mt-2">' + (dualCircle + reqCircle + tokCircle + fallbackCircle) + '</div>' +
         '</div>';
       }).join('');
-      return '<div class="mt-2" style="width:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.5rem;align-items:stretch;">' + (cards || '<div class="small text-body-secondary">No quota data.</div>') + '</div>';
+      const emptyMsg = quotaSearch ? 'No matching quotas.' : 'No quota data.';
+      return '<div class="mt-2" style="width:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.5rem;align-items:stretch;">' + (cards || ('<div class="small text-body-secondary">' + this.escapeHtml(emptyMsg) + '</div>')) + '</div>';
     },
     renderUsageChart(sourceMap, title) {
       const colors = ['#0d6efd', '#198754', '#dc3545', '#fd7e14', '#20c997', '#6f42c1', '#0dcaf0', '#ffc107', '#6c757d', '#6610f2'];
@@ -2020,6 +2049,123 @@ function adminApp() {
         email: String(body.email || '').trim(),
         cache_dir: String(body.cache_dir || '').trim()
       };
+    },
+    async loadNetworkSettings() {
+      const r = await this.apiFetch('/admin/api/settings/network', {headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) return;
+      const body = await r.json().catch(() => ({}));
+      const mode = String(body.bind_mode || '').trim().toLowerCase();
+      this.networkBindMode = (mode === 'localhost' || mode === 'all' || mode === 'custom') ? mode : 'localhost';
+      this.networkCustomBind = String(body.custom_bind || '').trim();
+      const p = Number(body.port || 8080);
+      this.networkPort = (Number.isFinite(p) && p > 0) ? Math.trunc(p) : 8080;
+      this.networkActiveAddrs = Array.isArray(body.active) ? body.active.map((x) => String(x || '').trim()).filter(Boolean) : [];
+      this.networkPending = (body.pending && typeof body.pending === 'object') ? body.pending : null;
+    },
+    async applyNetworkSettings() {
+      if (this.networkApplyInProgress) return;
+      const mode = String(this.networkBindMode || '').trim().toLowerCase();
+      const port = Math.trunc(Number(this.networkPort || 0));
+      if (mode !== 'localhost' && mode !== 'all' && mode !== 'custom') {
+        this.toastError('Bind mode must be localhost, all, or custom.');
+        return;
+      }
+      if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        this.toastError('Port must be between 1 and 65535.');
+        return;
+      }
+      if (mode === 'custom' && !String(this.networkCustomBind || '').trim()) {
+        this.toastError('Custom bind host is required.');
+        return;
+      }
+      this.networkApplyInProgress = true;
+      try {
+        const payload = {
+          bind_mode: mode,
+          custom_bind: String(this.networkCustomBind || '').trim(),
+          port
+        };
+        const applyResp = await this.apiFetch('/admin/api/settings/network/apply', {
+          method: 'POST',
+          headers: this.headers(),
+          body: JSON.stringify(payload)
+        });
+        if (applyResp.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+        if (!applyResp.ok) {
+          const txt = await applyResp.text();
+          this.toastError(txt || 'Failed to apply network settings.');
+          return;
+        }
+        const applyBody = await applyResp.json().catch(() => ({}));
+        const switchID = String(applyBody.switch_id || '').trim();
+        const expectedInstance = String(applyBody.instance_id || '').trim();
+        if (!switchID) {
+          this.toastError('Network apply did not return switch id.');
+          return;
+        }
+
+        const probeOK = await this.probeNewBinding(mode, String(applyBody.custom_bind || '').trim(), Number(applyBody.port || port), expectedInstance);
+        const confirmResp = await this.apiFetch('/admin/api/settings/network/confirm', {
+          method: 'POST',
+          headers: this.headers(),
+          body: JSON.stringify({switch_id: switchID, probe_ok: !!probeOK})
+        });
+        if (confirmResp.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+        if (!confirmResp.ok) {
+          const txt = await confirmResp.text();
+          this.toastError(txt || 'Failed to confirm network switch.');
+          return;
+        }
+        const confirmBody = await confirmResp.json().catch(() => ({}));
+        if (!probeOK) {
+          this.toastError('Could not verify new bind address; keeping existing listener.');
+          await this.loadNetworkSettings();
+          return;
+        }
+        const redirectURL = String(confirmBody.redirect_url || '').trim();
+        if (redirectURL) {
+          window.location = redirectURL;
+          return;
+        }
+        window.location.reload();
+      } finally {
+        this.networkApplyInProgress = false;
+      }
+    },
+    async probeNewBinding(mode, customHost, port, expectedInstance) {
+      const proto = window.location.protocol === 'https:' ? 'https:' : 'http:';
+      const currentHost = window.location.hostname || '127.0.0.1';
+      const hosts = [];
+      const pushHost = (h) => {
+        const v = String(h || '').trim();
+        if (!v) return;
+        if (!hosts.includes(v)) hosts.push(v);
+      };
+      if (mode === 'localhost') {
+        pushHost('127.0.0.1');
+        pushHost('localhost');
+      } else if (mode === 'all') {
+        pushHost(currentHost);
+        pushHost('127.0.0.1');
+        pushHost('localhost');
+      } else {
+        pushHost(customHost);
+      }
+      for (let i = 0; i < hosts.length; i++) {
+        const host = hosts[i];
+        const origin = proto + '//' + host + ':' + String(port);
+        const url = origin + '/admin/api/network/probe';
+        try {
+          const r = await fetch(url, {method:'GET', mode:'cors', cache:'no-store', credentials:'omit'});
+          if (!r.ok) continue;
+          const body = await r.json().catch(() => ({}));
+          const inst = String((body && body.instance) || '').trim();
+          const expect = String(expectedInstance || this.runtimeInstanceID || '').trim();
+          if (expect && inst && inst === expect) return true;
+        } catch (_) {}
+      }
+      return false;
     },
     async loadVersion() {
       const r = await this.apiFetch('/admin/api/version', {headers:this.headers()});
@@ -2710,6 +2856,7 @@ function adminApp() {
       const isEdit = String(this.editingProviderName || '').trim() !== '';
       const endpoint = isEdit ? ('/admin/api/providers/' + encodeURIComponent(this.editingProviderName)) : '/admin/api/providers';
       const method = isEdit ? 'PUT' : 'POST';
+      const isDisabling = !payload.enabled;
       if (this.authMode === 'oauth') {
         if (!String(payload.auth_token || '').trim()) {
           this.toastError('Run browser OAuth login first.');
@@ -2719,6 +2866,16 @@ function adminApp() {
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
         if (r.ok) this.toastSuccess('Provider ' + (isEdit ? 'updated' : 'added') + '.');
         else this.toastError('Failed to ' + (isEdit ? 'update' : 'add') + ' provider.');
+        if (!r.ok) return;
+        this.closeAddProviderModal();
+        this.loadProviders();
+        return;
+      }
+      if (isDisabling) {
+        const r = await this.apiFetch(endpoint, {method, headers:this.headers(), body:JSON.stringify(payload)});
+        if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+        if (r.ok) this.toastSuccess('Provider disabled.');
+        else this.toastError('Failed to disable provider.');
         if (!r.ok) return;
         this.closeAddProviderModal();
         this.loadProviders();
