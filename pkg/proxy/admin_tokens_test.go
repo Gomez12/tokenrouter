@@ -168,3 +168,80 @@ func TestAccessTokensAPIKeymasterOnlySeesAndManagesOwnSubordinates(t *testing.T)
 		t.Fatalf("expected 200 when deleting own child, got %d body=%s", delOwnW.Code, delOwnW.Body.String())
 	}
 }
+
+func TestAccessTokensAPIAdminCanSetQuota(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	h := &AdminHandler{store: store}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/access-tokens", strings.NewReader(`{
+		"name":"Quota Key",
+		"key":"quota-secret-key",
+		"role":"inferrer",
+		"quota":{"requests":{"limit":10,"interval_seconds":60},"tokens":{"limit":1000,"interval_seconds":0}}
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.accessTokensAPI(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/admin/api/access-tokens", nil)
+	listW := httptest.NewRecorder()
+	h.accessTokensAPI(listW, listReq)
+	if listW.Code != http.StatusOK {
+		t.Fatalf("expected 200 list, got %d body=%s", listW.Code, listW.Body.String())
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(listW.Body.Bytes(), &items); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	found := false
+	for _, it := range items {
+		if strings.TrimSpace(asString(it["name"])) != "Quota Key" {
+			continue
+		}
+		found = true
+		quota, ok := it["quota"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected quota in list item, got %v", it["quota"])
+		}
+		reqQ, ok := quota["requests"].(map[string]any)
+		if !ok || int(reqQ["limit"].(float64)) != 10 {
+			t.Fatalf("expected requests quota limit 10, got %v", quota["requests"])
+		}
+	}
+	if !found {
+		t.Fatal("expected quota key in token list")
+	}
+}
+
+func TestAccessTokensAPIKeymasterCannotSetQuota(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.IncomingTokens = []config.IncomingAPIToken{
+		{ID: "km-1", Name: "KM", Key: "km-key", Role: config.TokenRoleKeymaster},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	h := &AdminHandler{store: store}
+	actor := tokenAuthIdentity{
+		Role: config.TokenRoleKeymaster,
+		Token: config.IncomingAPIToken{
+			ID: "km-1",
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/access-tokens", strings.NewReader(`{
+		"name":"Child",
+		"key":"child-key",
+		"role":"inferrer",
+		"quota":{"requests":{"limit":5}}
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(context.WithValue(req.Context(), adminAuthContextKey{}, actor))
+	w := httptest.NewRecorder()
+	h.accessTokensAPI(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%s", w.Code, w.Body.String())
+	}
+}

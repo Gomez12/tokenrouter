@@ -708,6 +708,30 @@
             <label class="form-label">Custom Expiry (RFC3339)</label>
             <input class="form-control" x-model="accessTokenDraft.expires_at" placeholder="2026-12-31T23:59:59Z" />
           </div>
+          <div class="mt-3 border rounded p-3">
+            <div class="form-check form-switch mb-2">
+              <input class="form-check-input" type="checkbox" id="accessTokenQuotaEnabled" x-model="accessTokenDraft.quota_enabled">
+              <label class="form-check-label" for="accessTokenQuotaEnabled">Enable quota</label>
+            </div>
+            <div class="row g-2" x-show="accessTokenDraft.quota_enabled" style="display:none;">
+              <div class="col-md-6">
+                <label class="form-label">Requests limit</label>
+                <input class="form-control" type="number" min="1" step="1" x-model="accessTokenDraft.quota_requests_limit" placeholder="e.g. 10000" />
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Requests renew every (seconds, 0 = never)</label>
+                <input class="form-control" type="number" min="0" step="1" x-model="accessTokenDraft.quota_requests_interval_seconds" />
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Tokens limit</label>
+                <input class="form-control" type="number" min="1" step="1" x-model="accessTokenDraft.quota_tokens_limit" placeholder="e.g. 1000000" />
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Tokens renew every (seconds, 0 = never)</label>
+                <input class="form-control" type="number" min="0" step="1" x-model="accessTokenDraft.quota_tokens_interval_seconds" />
+              </div>
+            </div>
+          </div>
           <div class="mt-3" x-show="!accessTokenDraft.id" style="display:none;">
             <label class="form-label">Key</label>
             <div class="input-group">

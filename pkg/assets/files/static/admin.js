@@ -89,7 +89,7 @@ function adminApp() {
     accessTokens: [],
     requiresInitialTokenSetup: false,
     showAddAccessTokenModal: false,
-    accessTokenDraft: {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:''},
+    accessTokenDraft: {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0'},
     ws: null,
     wsReconnectTimer: null,
     wsBackoffMs: 1000,
@@ -1569,7 +1569,7 @@ function adminApp() {
     },
     openAddAccessTokenModal() {
       this.showAddAccessTokenModal = true;
-      this.accessTokenDraft = {id:'', name:'', key:this.randomTokenKey(), role:'inferrer', expiry_preset:'never', expires_at:''};
+      this.accessTokenDraft = {id:'', name:'', key:this.randomTokenKey(), role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0'};
       this.accessTokenStatusHtml = '';
     },
     openEditAccessTokenModal(id) {
@@ -1578,21 +1578,52 @@ function adminApp() {
       if (!t) return;
       const expiresAt = String(t.expires_at || '').trim();
       this.showAddAccessTokenModal = true;
+      const q = t && t.quota ? t.quota : {};
+      const qr = q && q.requests ? q.requests : {};
+      const qt = q && q.tokens ? q.tokens : {};
+      const hasQuota = Number(qr.limit || 0) > 0 || Number(qt.limit || 0) > 0;
       this.accessTokenDraft = {
         id: sid,
         name: String(t.name || '').trim(),
         key: '',
         role: String(t.role || 'inferrer').trim().toLowerCase() || 'inferrer',
         expiry_preset: expiresAt ? 'custom' : 'never',
-        expires_at: expiresAt
+        expires_at: expiresAt,
+        quota_enabled: hasQuota,
+        quota_requests_limit: Number(qr.limit || 0) > 0 ? String(qr.limit) : '',
+        quota_requests_interval_seconds: String(Number(qr.interval_seconds || 0)),
+        quota_tokens_limit: Number(qt.limit || 0) > 0 ? String(qt.limit) : '',
+        quota_tokens_interval_seconds: String(Number(qt.interval_seconds || 0))
       };
       this.accessTokenStatusHtml = '';
     },
     closeAddAccessTokenModal() {
       if (this.requiresInitialTokenSetup) return;
       this.showAddAccessTokenModal = false;
-      this.accessTokenDraft = {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:''};
+      this.accessTokenDraft = {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0'};
       this.accessTokenStatusHtml = '';
+    },
+    buildAccessTokenQuotaPayload() {
+      if (!this.accessTokenDraft.quota_enabled) return null;
+      const reqLimit = Math.max(0, Number(this.accessTokenDraft.quota_requests_limit || 0));
+      const reqInterval = Math.max(0, Number(this.accessTokenDraft.quota_requests_interval_seconds || 0));
+      const tokLimit = Math.max(0, Number(this.accessTokenDraft.quota_tokens_limit || 0));
+      const tokInterval = Math.max(0, Number(this.accessTokenDraft.quota_tokens_interval_seconds || 0));
+      const quota = {};
+      if (reqLimit > 0) {
+        quota.requests = {
+          limit: Math.floor(reqLimit),
+          interval_seconds: Math.floor(reqInterval)
+        };
+      }
+      if (tokLimit > 0) {
+        quota.tokens = {
+          limit: Math.floor(tokLimit),
+          interval_seconds: Math.floor(tokInterval)
+        };
+      }
+      if (!quota.requests && !quota.tokens) return null;
+      return quota;
     },
     regenerateAccessTokenKey() {
       this.accessTokenDraft.key = this.randomTokenKey();
@@ -2165,8 +2196,13 @@ function adminApp() {
         name,
         key,
         role,
-        expires_at: expiresAt
+        expires_at: expiresAt,
+        quota: this.buildAccessTokenQuotaPayload()
       };
+      if (this.accessTokenDraft.quota_enabled && !payload.quota) {
+        this.accessTokenStatusHtml = '<span class="text-danger">Set at least one quota limit.</span>';
+        return;
+      }
       const r = await this.apiFetch('/admin/api/access-tokens', {method:'POST', headers:this.headers(), body:JSON.stringify(payload)});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) {
@@ -2198,8 +2234,13 @@ function adminApp() {
       const payload = {
         name,
         role,
-        expires_at: expiresAt
+        expires_at: expiresAt,
+        quota: this.buildAccessTokenQuotaPayload()
       };
+      if (this.accessTokenDraft.quota_enabled && !payload.quota) {
+        this.accessTokenStatusHtml = '<span class="text-danger">Set at least one quota limit.</span>';
+        return;
+      }
       const r = await this.apiFetch('/admin/api/access-tokens/' + encodeURIComponent(id), {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) {

@@ -271,7 +271,7 @@ func (s *Server) authAPIMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "forbidden: token role cannot use inference api", http.StatusForbidden)
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(withAPIAuthIdentity(r.Context(), identity)))
 	})
 }
 
@@ -346,6 +346,26 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	identity, hasIdentity := apiAuthIdentityFromContext(r.Context())
+	quotaView := keyQuotaView{}
+	hasQuota := false
+	if hasIdentity {
+		qv, metered, qerr := s.reserveRequestQuota(identity)
+		if qerr != nil {
+			if errors.Is(qerr, errQuotaExceeded) {
+				writeQuotaExceededResponse(w, qv)
+				return
+			}
+			if errors.Is(qerr, errOwnerTokenMissing) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			http.Error(w, wrapQuotaInternalErr(qerr).Error(), http.StatusInternalServerError)
+			return
+		}
+		hasQuota = metered && qv.HasAny()
+		quotaView = qv
+	}
 	clientMeta := extractClientUsageMeta(r, s.store.Snapshot())
 	captureEnabled := isConversationCaptureEndpoint(r.URL.Path)
 	reqConversationID, reqPrevResponseID := parseConversationRequestIDs(body)
@@ -355,6 +375,9 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	if stream {
+		if hasQuota {
+			applyQuotaHeaders(w.Header(), quotaView)
+		}
 		statusCode, upstreamHeader, usage, initialLatency, err := s.forwardStreamingRequest(r.Context(), provider, r.URL.Path, mutatedBody, w)
 		latency := time.Since(start)
 		if err != nil {
@@ -374,6 +397,11 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 				usage.CompletionTokens = usage.EstimatedCompletionTokens
 			}
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		}
+		if hasIdentity && hasQuota && statusCode >= 200 && statusCode <= 299 {
+			if qv, metered, qerr := s.applyTokenUsageQuota(identity, int64(usage.TotalTokens)); qerr == nil && metered && qv.HasAny() {
+				quotaView = qv
+			}
 		}
 		promptTPS := usage.PromptTPS
 		genTPS := usage.GenTPS
@@ -435,6 +463,21 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		s.adminHandler.RecordQuotaFromResponse(provider, header)
 	}
 
+	promptTokens, completionTokens, totalTokens := parseUsageTokens(respBody)
+	metrics := parseProviderUsageMetrics(respBody)
+	if totalTokens == 0 {
+		promptTokens = estimatePromptTokensFromRequest(body)
+		completionTokens = estimateCompletionTokensFromResponse(respBody)
+		totalTokens = promptTokens + completionTokens
+	}
+	if hasIdentity && hasQuota && statusCode >= 200 && statusCode <= 299 {
+		if qv, metered, qerr := s.applyTokenUsageQuota(identity, int64(totalTokens)); qerr == nil && metered && qv.HasAny() {
+			quotaView = qv
+		}
+	}
+	if hasQuota {
+		respBody = injectQuotaIntoJSONBody(respBody, quotaView)
+	}
 	for k, vals := range header {
 		if strings.EqualFold(k, "content-length") {
 			continue
@@ -443,16 +486,12 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
+	if hasQuota {
+		applyQuotaHeaders(w.Header(), quotaView)
+	}
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(respBody)
 
-	promptTokens, completionTokens, totalTokens := parseUsageTokens(respBody)
-	metrics := parseProviderUsageMetrics(respBody)
-	if totalTokens == 0 {
-		promptTokens = estimatePromptTokensFromRequest(body)
-		completionTokens = estimateCompletionTokensFromResponse(respBody)
-		totalTokens = promptTokens + completionTokens
-	}
 	promptTPS := metrics.PromptTPS
 	genTPS := metrics.GenTPS
 	if !metrics.HasPromptTPS || !metrics.HasGenTPS {

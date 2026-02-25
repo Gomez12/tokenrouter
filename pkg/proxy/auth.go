@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"strings"
@@ -19,6 +20,8 @@ type dockerInternalCache struct {
 }
 
 var hostDockerInternalIPs dockerInternalCache
+
+type apiAuthContextKey struct{}
 
 func bearerToken(h http.Header) string {
 	auth := h.Get("Authorization")
@@ -84,6 +87,16 @@ func resolveIncomingToken(token string, tokens []config.IncomingAPIToken) (confi
 		return t, true
 	}
 	return config.IncomingAPIToken{}, false
+}
+
+func withAPIAuthIdentity(ctx context.Context, identity tokenAuthIdentity) context.Context {
+	return context.WithValue(ctx, apiAuthContextKey{}, identity)
+}
+
+func apiAuthIdentityFromContext(ctx context.Context) (tokenAuthIdentity, bool) {
+	v := ctx.Value(apiAuthContextKey{})
+	identity, ok := v.(tokenAuthIdentity)
+	return identity, ok
 }
 
 func requestIsLoopback(r *http.Request) bool {

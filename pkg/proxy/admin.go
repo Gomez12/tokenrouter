@@ -3026,12 +3026,13 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		cfg := h.store.Snapshot()
 		type tokenItem struct {
-			ID          string `json:"id"`
-			Name        string `json:"name"`
-			Role        string `json:"role,omitempty"`
-			ParentID    string `json:"parent_id,omitempty"`
-			RedactedKey string `json:"redacted_key"`
-			ExpiresAt   string `json:"expires_at,omitempty"`
+			ID          string             `json:"id"`
+			Name        string             `json:"name"`
+			Role        string             `json:"role,omitempty"`
+			ParentID    string             `json:"parent_id,omitempty"`
+			Quota       *config.TokenQuota `json:"quota,omitempty"`
+			RedactedKey string             `json:"redacted_key"`
+			ExpiresAt   string             `json:"expires_at,omitempty"`
 		}
 		out := make([]tokenItem, 0, len(cfg.IncomingTokens))
 		for _, t := range cfg.IncomingTokens {
@@ -3043,6 +3044,7 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 				Name:        strings.TrimSpace(t.Name),
 				Role:        config.NormalizeIncomingTokenRole(t.Role),
 				ParentID:    strings.TrimSpace(t.ParentID),
+				Quota:       t.Quota,
 				RedactedKey: redactAccessKey(strings.TrimSpace(t.Key)),
 				ExpiresAt:   strings.TrimSpace(t.ExpiresAt),
 			})
@@ -3054,6 +3056,7 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 			Key       string `json:"key"`
 			Role      string `json:"role,omitempty"`
 			ExpiresAt string `json:"expires_at,omitempty"`
+			Quota     any    `json:"quota,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
@@ -3076,6 +3079,20 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "name is required", http.StatusBadRequest)
 			return
 		}
+		var quota *config.TokenQuota
+		if payload.Quota != nil {
+			qb, err := json.Marshal(payload.Quota)
+			if err != nil {
+				http.Error(w, "invalid quota", http.StatusBadRequest)
+				return
+			}
+			var decoded config.TokenQuota
+			if err := json.Unmarshal(qb, &decoded); err != nil {
+				http.Error(w, "invalid quota", http.StatusBadRequest)
+				return
+			}
+			quota = &decoded
+		}
 		role := config.NormalizeIncomingTokenRole(payload.Role)
 		if role == "" {
 			role = config.TokenRoleInferrer
@@ -3084,6 +3101,10 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 		if actor.Role == config.TokenRoleKeymaster {
 			if role != config.TokenRoleInferrer {
 				http.Error(w, "keymaster can only create inferrer tokens", http.StatusForbidden)
+				return
+			}
+			if quota != nil {
+				http.Error(w, "subordinate tokens cannot define quota", http.StatusForbidden)
 				return
 			}
 			parentID = strings.TrimSpace(actor.Token.ID)
@@ -3102,6 +3123,7 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 				ParentID:  parentID,
 				ExpiresAt: expiresAt,
 				CreatedAt: now,
+				Quota:     quota,
 			})
 			return nil
 		}); err != nil {
@@ -3133,6 +3155,7 @@ func (h *AdminHandler) accessTokenByIDAPI(w http.ResponseWriter, r *http.Request
 			Name      string `json:"name"`
 			Role      string `json:"role,omitempty"`
 			ExpiresAt string `json:"expires_at,omitempty"`
+			Quota     any    `json:"quota,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
@@ -3155,6 +3178,20 @@ func (h *AdminHandler) accessTokenByIDAPI(w http.ResponseWriter, r *http.Request
 				return
 			}
 		}
+		var quota *config.TokenQuota
+		if payload.Quota != nil {
+			qb, err := json.Marshal(payload.Quota)
+			if err != nil {
+				http.Error(w, "invalid quota", http.StatusBadRequest)
+				return
+			}
+			var decoded config.TokenQuota
+			if err := json.Unmarshal(qb, &decoded); err != nil {
+				http.Error(w, "invalid quota", http.StatusBadRequest)
+				return
+			}
+			quota = &decoded
+		}
 		if err := h.store.Update(func(c *config.ServerConfig) error {
 			for i := range c.IncomingTokens {
 				t := &c.IncomingTokens[i]
@@ -3168,10 +3205,14 @@ func (h *AdminHandler) accessTokenByIDAPI(w http.ResponseWriter, r *http.Request
 					if role != config.TokenRoleInferrer {
 						return fmt.Errorf("keymaster can only set role inferrer")
 					}
+					if quota != nil {
+						return fmt.Errorf("subordinate tokens cannot define quota")
+					}
 				}
 				t.Name = name
 				t.Role = role
 				t.ExpiresAt = expiresAt
+				t.Quota = quota
 				return nil
 			}
 			return fmt.Errorf("token not found")

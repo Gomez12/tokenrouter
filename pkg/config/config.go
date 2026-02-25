@@ -55,15 +55,28 @@ type LogsConfig struct {
 	MaxLines int `toml:"max_lines,omitempty"`
 }
 
+type TokenQuotaBudget struct {
+	Limit           int64  `toml:"limit,omitempty" json:"limit,omitempty"`
+	IntervalSeconds int64  `toml:"interval_seconds,omitempty" json:"interval_seconds,omitempty"`
+	Used            int64  `toml:"used,omitempty" json:"used,omitempty"`
+	WindowStartedAt string `toml:"window_started_at,omitempty" json:"window_started_at,omitempty"`
+}
+
+type TokenQuota struct {
+	Requests *TokenQuotaBudget `toml:"requests,omitempty" json:"requests,omitempty"`
+	Tokens   *TokenQuotaBudget `toml:"tokens,omitempty" json:"tokens,omitempty"`
+}
+
 type IncomingAPIToken struct {
-	ID        string `toml:"id"`
-	Name      string `toml:"name"`
-	Role      string `toml:"role,omitempty"`
-	ParentID  string `toml:"parent_id,omitempty"`
-	Comment   string `toml:"comment,omitempty"`
-	Key       string `toml:"key"`
-	ExpiresAt string `toml:"expires_at,omitempty"`
-	CreatedAt string `toml:"created_at,omitempty"`
+	ID        string      `toml:"id"`
+	Name      string      `toml:"name"`
+	Role      string      `toml:"role,omitempty"`
+	ParentID  string      `toml:"parent_id,omitempty"`
+	Comment   string      `toml:"comment,omitempty"`
+	Key       string      `toml:"key"`
+	ExpiresAt string      `toml:"expires_at,omitempty"`
+	CreatedAt string      `toml:"created_at,omitempty"`
+	Quota     *TokenQuota `toml:"quota,omitempty" json:"quota,omitempty"`
 }
 
 type ServerConfig struct {
@@ -390,6 +403,7 @@ func (c *ServerConfig) Normalize() {
 		t.Key = strings.TrimSpace(t.Key)
 		t.ExpiresAt = strings.TrimSpace(t.ExpiresAt)
 		t.CreatedAt = strings.TrimSpace(t.CreatedAt)
+		t.Quota = normalizeTokenQuota(t.Quota)
 		if t.Key == "" {
 			continue
 		}
@@ -452,6 +466,14 @@ func (c *ServerConfig) Validate() error {
 		if t.CreatedAt != "" {
 			if _, err := time.Parse(time.RFC3339, t.CreatedAt); err != nil {
 				return fmt.Errorf("incoming token %q has invalid created_at (RFC3339 required)", t.ID)
+			}
+		}
+		if t.ParentID != "" && t.Quota != nil {
+			return fmt.Errorf("incoming token %q with parent_id cannot define quota", t.ID)
+		}
+		if t.Quota != nil {
+			if err := validateTokenQuota(t.ID, t.Quota); err != nil {
+				return err
 			}
 		}
 	}
@@ -520,7 +542,7 @@ func (s *ServerConfigStore) Snapshot() ServerConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	cp := *s.cfg
-	cp.IncomingTokens = append([]IncomingAPIToken(nil), s.cfg.IncomingTokens...)
+	cp.IncomingTokens = cloneIncomingTokens(s.cfg.IncomingTokens)
 	cp.Providers = append([]ProviderConfig(nil), s.cfg.Providers...)
 	return cp
 }
@@ -529,7 +551,7 @@ func (s *ServerConfigStore) Update(mutator func(*ServerConfig) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := *s.cfg
-	cp.IncomingTokens = append([]IncomingAPIToken(nil), s.cfg.IncomingTokens...)
+	cp.IncomingTokens = cloneIncomingTokens(s.cfg.IncomingTokens)
 	cp.Providers = append([]ProviderConfig(nil), s.cfg.Providers...)
 	if err := mutator(&cp); err != nil {
 		return err
@@ -542,6 +564,105 @@ func (s *ServerConfigStore) Update(mutator func(*ServerConfig) error) error {
 		return err
 	}
 	s.cfg = &cp
+	return nil
+}
+
+func cloneIncomingTokens(in []IncomingAPIToken) []IncomingAPIToken {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]IncomingAPIToken, len(in))
+	for i := range in {
+		out[i] = in[i]
+		out[i].Quota = cloneTokenQuota(in[i].Quota)
+	}
+	return out
+}
+
+func cloneTokenQuota(in *TokenQuota) *TokenQuota {
+	if in == nil {
+		return nil
+	}
+	out := &TokenQuota{}
+	if in.Requests != nil {
+		cp := *in.Requests
+		out.Requests = &cp
+	}
+	if in.Tokens != nil {
+		cp := *in.Tokens
+		out.Tokens = &cp
+	}
+	if out.Requests == nil && out.Tokens == nil {
+		return nil
+	}
+	return out
+}
+
+func normalizeTokenQuota(in *TokenQuota) *TokenQuota {
+	if in == nil {
+		return nil
+	}
+	out := cloneTokenQuota(in)
+	out.Requests = normalizeTokenQuotaBudget(out.Requests)
+	out.Tokens = normalizeTokenQuotaBudget(out.Tokens)
+	if out.Requests == nil && out.Tokens == nil {
+		return nil
+	}
+	return out
+}
+
+func normalizeTokenQuotaBudget(b *TokenQuotaBudget) *TokenQuotaBudget {
+	if b == nil {
+		return nil
+	}
+	cp := *b
+	cp.WindowStartedAt = strings.TrimSpace(cp.WindowStartedAt)
+	if cp.Limit <= 0 {
+		return nil
+	}
+	if cp.IntervalSeconds < 0 {
+		cp.IntervalSeconds = 0
+	}
+	if cp.Used < 0 {
+		cp.Used = 0
+	}
+	if cp.Used > cp.Limit {
+		cp.Used = cp.Limit
+	}
+	return &cp
+}
+
+func validateTokenQuota(tokenID string, q *TokenQuota) error {
+	if q == nil {
+		return nil
+	}
+	if err := validateTokenQuotaBudget(tokenID, "requests", q.Requests); err != nil {
+		return err
+	}
+	if err := validateTokenQuotaBudget(tokenID, "tokens", q.Tokens); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateTokenQuotaBudget(tokenID, name string, b *TokenQuotaBudget) error {
+	if b == nil {
+		return nil
+	}
+	if b.Limit <= 0 {
+		return fmt.Errorf("incoming token %q quota.%s.limit must be > 0", tokenID, name)
+	}
+	if b.IntervalSeconds < 0 {
+		return fmt.Errorf("incoming token %q quota.%s.interval_seconds must be >= 0", tokenID, name)
+	}
+	if b.Used < 0 {
+		return fmt.Errorf("incoming token %q quota.%s.used must be >= 0", tokenID, name)
+	}
+	if b.WindowStartedAt != "" {
+		if _, err := time.Parse(time.RFC3339, b.WindowStartedAt); err != nil {
+			return fmt.Errorf("incoming token %q quota.%s.window_started_at must be RFC3339", tokenID, name)
+		}
+	}
 	return nil
 }
 
