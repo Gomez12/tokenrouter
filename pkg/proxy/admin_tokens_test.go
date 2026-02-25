@@ -43,20 +43,16 @@ func TestAccessTokensAPIAddListDelete(t *testing.T) {
 		t.Fatalf("expected 2 tokens, got %d", len(items))
 	}
 	var addedID string
-	foundRedaction := false
 	for _, it := range items {
 		if strings.TrimSpace(asString(it["name"])) == "Dev" {
 			addedID = strings.TrimSpace(asString(it["id"]))
-			if strings.TrimSpace(asString(it["redacted_key"])) == "********" {
-				foundRedaction = true
+			if _, exists := it["redacted_key"]; exists {
+				t.Fatal("did not expect redacted_key field in token list response")
 			}
 		}
 	}
 	if addedID == "" {
 		t.Fatal("added token not found in list")
-	}
-	if !foundRedaction {
-		t.Fatal("expected redacted key to be fixed 8 asterisks")
 	}
 
 	delReq := httptest.NewRequest(http.MethodDelete, "/admin/api/access-tokens/"+addedID, nil)

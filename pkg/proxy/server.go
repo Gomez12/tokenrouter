@@ -49,6 +49,8 @@ type Server struct {
 	draining              atomic.Bool
 }
 
+const accessTokenCleanupInterval = 1 * time.Minute
+
 func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 	store := config.NewServerConfigStore(configPath, cfg)
 	resolver := NewProviderResolver(store)
@@ -142,6 +144,8 @@ func (s *Server) Run(ctx context.Context) error {
 	cfg := s.store.Snapshot()
 	errCh := make(chan error, 2)
 	go s.providerHealthChecker.Run(ctx)
+	go s.runMaintenanceScheduler(ctx)
+	s.runAccessTokenCleanupOnce()
 
 	if cfg.TLS.Enabled {
 		mgr := &autocert.Manager{
@@ -199,6 +203,122 @@ func (s *Server) Run(ctx context.Context) error {
 	defer cancel()
 	_ = s.httpServer.Shutdown(shutdownCtx)
 	return firstErr(errCh)
+}
+
+func (s *Server) runMaintenanceScheduler(ctx context.Context) {
+	t := time.NewTicker(accessTokenCleanupInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.runAccessTokenCleanupOnce()
+		}
+	}
+}
+
+type accessTokenCleanupResult struct {
+	ExpiredTokens    int
+	EmptyQuotaTokens int
+	OrphanedTokens   int
+}
+
+func (s *Server) runAccessTokenCleanupOnce() {
+	if s == nil || s.store == nil {
+		return
+	}
+	res, err := s.cleanupAccessTokens(nowUTC())
+	if err != nil {
+		log.Warn("access token cleanup failed", "error", err)
+		return
+	}
+	totalRemoved := res.ExpiredTokens + res.EmptyQuotaTokens + res.OrphanedTokens
+	if totalRemoved > 0 {
+		log.Info("access token cleanup completed",
+			"removed_total", totalRemoved,
+			"removed_expired", res.ExpiredTokens,
+			"removed_empty_non_reset_quota", res.EmptyQuotaTokens,
+			"removed_orphaned", res.OrphanedTokens,
+		)
+	}
+}
+
+func (s *Server) cleanupAccessTokens(now time.Time) (accessTokenCleanupResult, error) {
+	if s == nil || s.store == nil {
+		return accessTokenCleanupResult{}, nil
+	}
+	cfg := s.store.Snapshot()
+	enabledExpired := cfg.AutoRemoveExpiredTokens
+	enabledEmptyQuota := cfg.AutoRemoveEmptyQuotaTokens
+	if !enabledExpired && !enabledEmptyQuota {
+		return accessTokenCleanupResult{}, nil
+	}
+	var result accessTokenCleanupResult
+	err := s.store.Update(func(c *config.ServerConfig) error {
+		removedIDs := map[string]struct{}{}
+		next := make([]config.IncomingAPIToken, 0, len(c.IncomingTokens))
+		for _, tok := range c.IncomingTokens {
+			if enabledExpired && tokenIsExpired(tok, now) {
+				result.ExpiredTokens++
+				removedIDs[strings.TrimSpace(tok.ID)] = struct{}{}
+				continue
+			}
+			if enabledEmptyQuota && tokenHasEmptyNonResetQuota(tok) {
+				result.EmptyQuotaTokens++
+				removedIDs[strings.TrimSpace(tok.ID)] = struct{}{}
+				continue
+			}
+			next = append(next, tok)
+		}
+		if len(removedIDs) > 0 {
+			filtered := next[:0]
+			for _, tok := range next {
+				parentID := strings.TrimSpace(tok.ParentID)
+				if parentID != "" {
+					if _, orphaned := removedIDs[parentID]; orphaned {
+						result.OrphanedTokens++
+						continue
+					}
+				}
+				filtered = append(filtered, tok)
+			}
+			next = filtered
+		}
+		c.IncomingTokens = next
+		return nil
+	})
+	return result, err
+}
+
+func tokenIsExpired(tok config.IncomingAPIToken, now time.Time) bool {
+	expiresAt := strings.TrimSpace(tok.ExpiresAt)
+	if expiresAt == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		return false
+	}
+	return !now.Before(ts)
+}
+
+func tokenHasEmptyNonResetQuota(tok config.IncomingAPIToken) bool {
+	q := tok.Quota
+	if q == nil {
+		return false
+	}
+	return quotaBudgetExhaustedWithoutReset(q.Requests) || quotaBudgetExhaustedWithoutReset(q.Tokens)
+}
+
+func quotaBudgetExhaustedWithoutReset(b *config.TokenQuotaBudget) bool {
+	if b == nil || b.Limit <= 0 {
+		return false
+	}
+	if b.IntervalSeconds > 0 {
+		return false
+	}
+	return b.Used >= b.Limit
 }
 
 func redirectHTTPS(w http.ResponseWriter, r *http.Request) {

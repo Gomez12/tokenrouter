@@ -11,6 +11,7 @@ function adminApp() {
     conversationsSaveInProgress: false,
     showConversationsSettingsModal: false,
     showConversationDetailModal: false,
+    showLogSettingsModal: false,
     conversationsSearch: '',
     conversationsListHtml: '',
     conversationsPagerHtml: '',
@@ -18,6 +19,7 @@ function adminApp() {
     conversationsDebounceTimer: null,
     logEntries: [],
     logEntriesHtml: '',
+    logPagerHtml: '',
     logEntriesShownCount: 0,
     logEntriesTotalCount: 0,
     logLevelFilter: 'all',
@@ -30,6 +32,8 @@ function adminApp() {
     allowLocalhostNoAuth: false,
     allowHostDockerInternalNoAuth: false,
     autoEnablePublicFreeModels: false,
+    autoRemoveExpiredTokens: true,
+    autoRemoveEmptyQuotaTokens: false,
     securitySaveInProgress: false,
     tlsSettings: {enabled:false, domain:'', email:'', cache_dir:''},
     tlsSaveInProgress: false,
@@ -432,24 +436,10 @@ function adminApp() {
       return c + ' ' + n.toFixed(2);
     },
     formatAge(checkedAt) {
-      if (!checkedAt) return '';
-      const t = new Date(checkedAt);
-      if (Number.isNaN(t.getTime())) return '';
-      const sec = Math.max(0, Math.floor((Date.now() - t.getTime()) / 1000));
-      if (sec < 60) return sec + 's ago';
-      const min = Math.floor(sec / 60);
-      const rem = sec % 60;
-      if (min < 60) return min + 'm ' + rem + 's ago';
-      const hr = Math.floor(min / 60);
-      const remMin = min % 60;
-      return hr + 'h ' + remMin + 'm ago';
+      return this.formatRelativeShort(checkedAt, '');
     },
     formatRelativeAge(ts) {
-      const raw = String(ts || '').trim();
-      if (!raw) return '-';
-      const d = new Date(raw);
-      if (Number.isNaN(d.getTime())) return raw;
-      return this.formatAge(d.toISOString());
+      return this.formatRelativeShort(ts, '-');
     },
     conversationProviderDisplayName(providerName) {
       const provider = String(providerName || '').trim();
@@ -504,6 +494,22 @@ function adminApp() {
       }
       if (mins > 0) return 'in ' + mins + 'm';
       return 'in ' + sec + 's';
+    },
+    formatRelativeShort(raw, emptyValue) {
+      const s = String(raw || '').trim();
+      if (!s) return (emptyValue === undefined ? '' : emptyValue);
+      const t = new Date(s);
+      if (Number.isNaN(t.getTime())) return s;
+      const diffSec = Math.floor((t.getTime() - Date.now()) / 1000);
+      if (diffSec >= 0) return this.formatUntil(t.toISOString());
+      let sec = Math.abs(diffSec);
+      const day = 24 * 60 * 60;
+      const hour = 60 * 60;
+      const minute = 60;
+      if (sec >= day) return Math.floor(sec / day) + 'd ago';
+      if (sec >= hour) return Math.floor(sec / hour) + 'h ago';
+      if (sec >= minute) return Math.floor(sec / minute) + 'm ago';
+      return sec + 's ago';
     },
     parsePageSize(v) {
       const raw = String(v ?? '').trim().toLowerCase();
@@ -1365,7 +1371,7 @@ function adminApp() {
           : '';
         return '<div class="border rounded p-2 bg-body">' +
           subtitle +
-          '<div class="fw-semibold small text-break mb-2">' + this.escapeHtml(g.name || 'quota') + '</div>' +
+          '<div class="fw-semibold small mb-2" title="' + this.escapeHtml(g.name || 'quota') + '" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + this.escapeHtml(g.name || 'quota') + '</div>' +
           '<div class="d-flex flex-wrap gap-3 align-items-center mt-2">' + (dualCircle + reqCircle + tokCircle + fallbackCircle) + '</div>' +
         '</div>';
       }).join('');
@@ -1546,8 +1552,8 @@ function adminApp() {
         name: String(t.name || '').trim() || 'Token',
         role: String(t.role || '').trim().toLowerCase() || 'inferrer',
         parent_id: String(t.parent_id || '').trim(),
-        redacted_key: String(t.redacted_key || '').trim(),
-        expires_at: String(t.expires_at || '').trim()
+        expires_at: String(t.expires_at || '').trim(),
+        quota: (t && typeof t.quota === 'object' && t.quota) ? t.quota : null
       }));
       const byParent = {};
       items.forEach((t) => {
@@ -1570,18 +1576,63 @@ function adminApp() {
         if (r === 'keymaster') return '<span class="badge text-bg-warning text-dark">keymaster</span>';
         return '<span class="badge text-bg-secondary">inferrer</span>';
       };
+      const formatCountShort = (n) => {
+        const v = Number(n || 0);
+        if (!Number.isFinite(v) || v <= 0) return '0';
+        if (v >= 1000000000) return Math.round(v / 100000000) / 10 + 'b';
+        if (v >= 1000000) return Math.round(v / 100000) / 10 + 'm';
+        if (v >= 1000) return Math.round(v / 100) / 10 + 'k';
+        return String(Math.round(v));
+      };
+      const formatIntervalShort = (sec) => {
+        const s = Math.max(0, Number(sec || 0));
+        if (!Number.isFinite(s) || s <= 0) return '';
+        if (s % 86400 === 0) return (s / 86400) + 'd';
+        if (s % 3600 === 0) return (s / 3600) + 'h';
+        if (s % 60 === 0) return (s / 60) + 'm';
+        return s + 's';
+      };
+      const renderQuotaSummary = (quotaObj) => {
+        const q = quotaObj && typeof quotaObj === 'object' ? quotaObj : {};
+        const qr = q && q.requests ? q.requests : {};
+        const qt = q && q.tokens ? q.tokens : {};
+        const parts = [];
+        const full = [];
+        const reqLimit = Number(qr.limit || 0);
+        const reqInt = Number(qr.interval_seconds || 0);
+        if (Number.isFinite(reqLimit) && reqLimit > 0) {
+          const shortInt = formatIntervalShort(reqInt);
+          const left = formatCountShort(reqLimit) + ' req' + (shortInt ? ('/' + shortInt) : '');
+          parts.push(left);
+          full.push(Math.round(reqLimit) + ' requests' + (shortInt ? (' per ' + shortInt) : ''));
+        }
+        const tokLimit = Number(qt.limit || 0);
+        const tokInt = Number(qt.interval_seconds || 0);
+        if (Number.isFinite(tokLimit) && tokLimit > 0) {
+          const shortInt = formatIntervalShort(tokInt);
+          const left = formatCountShort(tokLimit) + ' tok' + (shortInt ? ('/' + shortInt) : '');
+          parts.push(left);
+          full.push(Math.round(tokLimit) + ' tokens' + (shortInt ? (' per ' + shortInt) : ''));
+        }
+        if (!parts.length) return {short: 'no quota', full: 'No quota'};
+        return {short: parts.join(', '), full: full.join(', ')};
+      };
       const renderRow = (t, depth) => {
         const id = this.escapeHtml(t.id);
         const name = this.escapeHtml(t.name);
-        const redacted = this.escapeHtml(t.redacted_key);
-        const expiry = this.escapeHtml(t.expires_at || '-');
+        const expiryRaw = String(t.expires_at || '').trim();
+        const expiry = this.escapeHtml(this.formatRelativeShort(expiryRaw, 'none'));
+        const expiryTitle = this.escapeHtml(this.formatTimestamp(expiryRaw));
+        const quota = renderQuotaSummary(t.quota);
+        const quotaShort = this.escapeHtml(quota.short);
+        const quotaFull = this.escapeHtml(quota.full);
         const indent = depth > 0 ? (' style="padding-left:' + (depth * 20) + 'px;"') : '';
         const marker = depth > 0 ? '<span class="text-body-secondary me-1">↳</span>' : '';
         const row = '<tr>' +
           '<td' + indent + '>' + marker + name + '</td>' +
           '<td>' + renderRoleBadge(t.role) + '</td>' +
-          '<td><code>' + redacted + '</code></td>' +
-          '<td>' + expiry + '</td>' +
+          '<td title="' + quotaFull + '">' + quotaShort + '</td>' +
+          '<td title="' + expiryTitle + '">' + expiry + '</td>' +
           '<td class="text-end">' +
             '<button class="icon-btn me-1" type="button" title="Edit token" aria-label="Edit token" data-token-id="' + id + '" onclick="window.__adminEditAccessToken(this.getAttribute(\'data-token-id\'))">' +
               '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M12.146.854a.5.5 0 0 1 .708 0l2.292 2.292a.5.5 0 0 1 0 .708l-8.5 8.5a.5.5 0 0 1-.168.11l-3 1.2a.5.5 0 0 1-.65-.65l1.2-3a.5.5 0 0 1 .11-.168zM11.5 2.207 4.545 9.162l-.733 1.833 1.833-.733L12.6 3.307z"/></svg>' +
@@ -1597,7 +1648,7 @@ function adminApp() {
       const rows = roots.map((t) => renderRow(t, 0)).join('');
       this.accessTokensTableHtml =
         '<table class="table table-sm align-middle mb-0">' +
-          '<thead><tr><th>Name</th><th>Type</th><th>Key</th><th>Expiry</th><th></th></tr></thead>' +
+          '<thead><tr><th>Name</th><th>Type</th><th>Quota</th><th>Expiry</th><th></th></tr></thead>' +
           '<tbody>' + (rows || '<tr><td colspan="5" class="text-body-secondary">No tokens found.</td></tr>') + '</tbody>' +
         '</table>';
       window.__adminDeleteAccessToken = (id) => this.removeAccessToken(id);
@@ -1771,19 +1822,15 @@ function adminApp() {
         this.renderModelsPager(page.totalRows, page.page, page.totalPages, page.pageSize);
     },
     renderModelsFreshness(fetchedAt, pricingUpdatedAt) {
-      const now = new Date();
       const fetched = fetchedAt ? new Date(fetchedAt) : null;
       const pricing = pricingUpdatedAt ? new Date(pricingUpdatedAt) : null;
       let fetchedText = 'unknown';
       if (fetched && !Number.isNaN(fetched.getTime())) {
-        const ageSec = Math.floor((now.getTime() - fetched.getTime()) / 1000);
-        fetchedText = fetched.toLocaleString() + ' (' + this.formatAge(fetched.toISOString()).replace(' ago', '') + ' ago)';
-        if (ageSec < 0) fetchedText = fetched.toLocaleString();
+        fetchedText = fetched.toLocaleString() + ' (' + this.formatRelativeShort(fetched.toISOString(), '-') + ')';
       }
       let pricingText = 'unknown';
       if (pricing && !Number.isNaN(pricing.getTime())) {
-        const ageMin = Math.floor((now.getTime() - pricing.getTime()) / 60000);
-        pricingText = pricing.toLocaleString() + ' (' + ageMin + 'm ago)';
+        pricingText = pricing.toLocaleString() + ' (' + this.formatRelativeShort(pricing.toISOString(), '-') + ')';
       }
       this.modelsFreshnessHtml = 'Catalog fetched: <strong>' + this.escapeHtml(fetchedText) + '</strong> · Pricing cache: <strong>' + this.escapeHtml(pricingText) + '</strong>';
     },
@@ -1852,6 +1899,8 @@ function adminApp() {
       this.allowLocalhostNoAuth = !!body.allow_localhost_no_auth;
       this.allowHostDockerInternalNoAuth = !!body.allow_host_docker_internal_no_auth;
       this.autoEnablePublicFreeModels = !!body.auto_enable_public_free_models;
+      this.autoRemoveExpiredTokens = !!body.auto_remove_expired_tokens;
+      this.autoRemoveEmptyQuotaTokens = !!body.auto_remove_empty_quota_tokens;
     },
     async saveSecuritySettings() {
       if (this.securitySaveInProgress) return;
@@ -1860,7 +1909,9 @@ function adminApp() {
         const payload = {
           allow_localhost_no_auth: !!this.allowLocalhostNoAuth,
           allow_host_docker_internal_no_auth: !!this.allowHostDockerInternalNoAuth,
-          auto_enable_public_free_models: !!this.autoEnablePublicFreeModels
+          auto_enable_public_free_models: !!this.autoEnablePublicFreeModels,
+          auto_remove_expired_tokens: !!this.autoRemoveExpiredTokens,
+          auto_remove_empty_quota_tokens: !!this.autoRemoveEmptyQuotaTokens
         };
         const r = await this.apiFetch('/admin/api/settings/security', {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
@@ -2008,7 +2059,7 @@ function adminApp() {
       const maxLines = Number(this.logMaxLines || 0);
       if (!Number.isFinite(maxLines) || maxLines < 100 || maxLines > 200000) {
         this.toastError('Max lines must be between 100 and 200000.');
-        return;
+        return false;
       }
       this.logSaveInProgress = true;
       try {
@@ -2021,14 +2072,27 @@ function adminApp() {
         if (!r.ok) {
           const txt = await r.text();
           this.toastError(txt || 'Failed to save log settings.');
-          return;
+          return false;
         }
         this.toastSuccess('Log settings saved.');
         await this.loadLogSettings();
         await this.loadLogs();
+        return true;
       } finally {
         this.logSaveInProgress = false;
       }
+    },
+    async openLogSettingsModal() {
+      await this.loadLogSettings();
+      this.showLogSettingsModal = true;
+    },
+    closeLogSettingsModal() {
+      if (this.logSaveInProgress) return;
+      this.showLogSettingsModal = false;
+    },
+    async saveLogSettingsFromModal() {
+      const ok = await this.saveLogSettings();
+      if (ok) this.showLogSettingsModal = false;
     },
     async loadLogs() {
       const params = new URLSearchParams();
@@ -2074,11 +2138,13 @@ function adminApp() {
           level === 'warn' ? 'text-bg-warning text-dark' :
           level === 'error' ? 'text-bg-danger' :
           level === 'fatal' ? 'text-bg-dark' : 'text-bg-secondary';
-        const ts = this.escapeHtml(this.formatTimestamp(e.timestamp));
+        const tsRaw = String(e.timestamp || '').trim();
+        const ts = this.escapeHtml(this.formatRelativeShort(tsRaw, '-'));
+        const tsTitle = this.escapeHtml(this.formatTimestamp(tsRaw));
         const msg = this.escapeHtml(String(e.message || '').trim());
         return '' +
           '<tr>' +
-            '<td class="small text-nowrap">' + ts + '</td>' +
+            '<td class="small text-nowrap" title="' + tsTitle + '">' + ts + '</td>' +
             '<td class="small text-nowrap"><span class="badge ' + badgeCls + '">' + this.escapeHtml(level || 'info') + '</span></td>' +
             '<td class="small"><code style="white-space:pre-wrap;">' + msg + '</code></td>' +
           '</tr>';
@@ -2092,8 +2158,8 @@ function adminApp() {
         '<table class="table table-sm align-middle mb-0">' +
           '<thead><tr><th style="width:220px;">Time</th><th style="width:90px;">Level</th><th>Message</th></tr></thead>' +
           '<tbody>' + (page.rows.join('') || '<tr><td colspan="3" class="text-body-secondary small">No log entries.</td></tr>') + '</tbody>' +
-        '</table>' +
-        this.renderPager(page.totalRows, page.page, page.totalPages, page.pageSize, 'Logs');
+        '</table>';
+      this.logPagerHtml = this.renderPager(page.totalRows, page.page, page.totalPages, page.pageSize, 'Logs');
     },
     formatTimestamp(raw) {
       const s = String(raw || '').trim();

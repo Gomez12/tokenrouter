@@ -85,6 +85,8 @@ type ServerConfig struct {
 	AllowLocalhostNoAuth          bool                `toml:"allow_localhost_no_auth"`
 	AllowHostDockerInternalNoAuth bool                `toml:"allow_host_docker_internal_no_auth"`
 	AutoEnablePublicFreeModels    bool                `toml:"auto_enable_public_free_models"`
+	AutoRemoveExpiredTokens       bool                `toml:"auto_remove_expired_tokens"`
+	AutoRemoveEmptyQuotaTokens    bool                `toml:"auto_remove_empty_quota_tokens"`
 	DefaultProvider               string              `toml:"default_provider"`
 	Providers                     []ProviderConfig    `toml:"providers"`
 	Conversations                 ConversationsConfig `toml:"conversations"`
@@ -155,11 +157,13 @@ func DefaultLogsPath() string {
 
 func NewDefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		ListenAddr:                  ":8080",
-		IncomingTokens:              []IncomingAPIToken{},
-		DefaultProvider:             "",
-		Providers:                   []ProviderConfig{},
-		AutoEnablePublicFreeModels:  true,
+		ListenAddr:                 ":8080",
+		IncomingTokens:             []IncomingAPIToken{},
+		DefaultProvider:            "",
+		Providers:                  []ProviderConfig{},
+		AutoEnablePublicFreeModels: true,
+		AutoRemoveExpiredTokens:    true,
+		AutoRemoveEmptyQuotaTokens: false,
 		Conversations: ConversationsConfig{
 			Enabled:    true,
 			MaxItems:   5000,

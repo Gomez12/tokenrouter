@@ -101,6 +101,12 @@
       cursor: default;
       pointer-events: none;
     }
+
+    .nav-tabs .nav-link.active {
+      box-shadow:
+        -6px 0 10px -8px color-mix(in srgb, var(--bs-primary) 45%, transparent),
+        6px 0 10px -8px color-mix(in srgb, var(--bs-primary) 45%, transparent);
+    }
   </style>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
@@ -136,25 +142,25 @@
 
   <ul class="nav nav-tabs mb-0">
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='status' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('status')">Status</button>
+      <button class="nav-link rounded-top" :class="activeTab==='status' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('status')">Status</button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='conversations' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('conversations')">Conversations</button>
+      <button class="nav-link rounded-top" :class="activeTab==='quota' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('quota')">Quota</button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='log' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('log')">Log</button>
+      <button class="nav-link rounded-top" :class="activeTab==='providers' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('providers')">Providers</button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='quota' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('quota')">Quota</button>
+      <button class="nav-link rounded-top" :class="activeTab==='access' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('access')">Access</button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='providers' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('providers')">Providers</button>
+      <button class="nav-link rounded-top" :class="activeTab==='models' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('models')">Models</button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='access' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('access')">Access</button>
+      <button class="nav-link rounded-top" :class="activeTab==='conversations' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('conversations')">Conversations</button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='models' ? 'active fw-semibold' : 'text-body-secondary'" @click="selectTab('models')">Models</button>
+      <button class="nav-link rounded-top" :class="activeTab==='log' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('log')">Log</button>
     </li>
   </ul>
 
@@ -262,6 +268,7 @@
         <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
           <h2 class="h5 mb-0">Log</h2>
           <div class="d-flex flex-wrap align-items-center gap-2">
+            <button class="icon-btn" title="Log settings" aria-label="Log settings" @click="openLogSettingsModal()">⚙</button>
             <select class="form-select form-select-sm" style="width:auto;" x-model="logLevelFilter" @change="loadLogs()">
               <option value="all">all</option>
               <option value="debug">debug</option>
@@ -271,17 +278,37 @@
               <option value="fatal">fatal</option>
             </select>
             <input class="form-control form-control-sm" style="width:320px;" placeholder="Filter log entries..." x-model.trim="logSearch" @input="debouncedLoadLogs()" />
-            <input class="form-control form-control-sm" style="width:130px;" type="number" min="100" max="200000" step="100" x-model.number="logMaxLines" />
-            <button class="btn btn-sm btn-outline-primary" :disabled="logSaveInProgress" @click="saveLogSettings()">
-              <span x-show="!logSaveInProgress">Save</span>
-              <span x-show="logSaveInProgress">Saving...</span>
-            </button>
             <button class="btn btn-sm btn-outline-danger" @click="clearLogs()" :disabled="!logEntries || logEntries.length === 0">Clear log</button>
             <button class="btn btn-sm btn-outline-primary" @click="loadLogs()">Refresh</button>
           </div>
         </div>
         <div class="small text-body-secondary mb-2">Entries shown: <span x-text="logEntriesShownCount"></span> of <span x-text="logEntriesTotalCount"></span></div>
         <div class="border rounded p-2" style="max-height:70vh; overflow:auto;" x-html="logEntriesHtml"></div>
+        <div x-html="logPagerHtml"></div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="showLogSettingsModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeLogSettingsModal()">
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeLogSettingsModal()"></div>
+    <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
+      <div class="card shadow" style="width:100%;max-width:520px;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="h5 mb-0">Log Settings</h3>
+          <button class="icon-btn" :disabled="logSaveInProgress" @click="closeLogSettingsModal()" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="card-body">
+          <label class="form-label">Max lines</label>
+          <input class="form-control" type="number" min="100" max="200000" step="100" x-model.number="logMaxLines" />
+          <div class="small text-body-secondary mt-2">Controls how many log lines are persisted.</div>
+          <div class="d-flex justify-content-end gap-2 mt-3">
+            <button class="btn btn-outline-secondary" :disabled="logSaveInProgress" @click="closeLogSettingsModal()">Cancel</button>
+            <button class="btn btn-primary" :disabled="logSaveInProgress" @click="saveLogSettingsFromModal()">
+              <span x-show="!logSaveInProgress">Save</span>
+              <span x-show="logSaveInProgress">Saving...</span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -415,6 +442,16 @@
             <label class="form-check-label" for="allowHostDockerInternalNoAuthModal">Allow unauthenticated API access from host.docker.internal</label>
           </div>
           <div class="small text-body-secondary mt-2">When enabled, requests from the IP resolved by <code>host.docker.internal</code> bypass API key checks.</div>
+          <div class="form-check form-switch mt-3">
+            <input class="form-check-input" type="checkbox" id="autoRemoveExpiredTokensModal" x-model="autoRemoveExpiredTokens">
+            <label class="form-check-label" for="autoRemoveExpiredTokensModal">Auto remove expired access tokens</label>
+          </div>
+          <div class="small text-body-secondary mt-2">Periodically deletes tokens whose <code>expires_at</code> is in the past.</div>
+          <div class="form-check form-switch mt-3">
+            <input class="form-check-input" type="checkbox" id="autoRemoveEmptyQuotaTokensModal" x-model="autoRemoveEmptyQuotaTokens">
+            <label class="form-check-label" for="autoRemoveEmptyQuotaTokensModal">Auto remove empty non-reset quota tokens</label>
+          </div>
+          <div class="small text-body-secondary mt-2">Periodically deletes quota-backed tokens that are exhausted and have no reset interval.</div>
           <div class="d-flex justify-content-end gap-2 mt-3">
             <button class="btn btn-outline-secondary" :disabled="securitySaveInProgress" @click="closeAccessSettingsModal()">Cancel</button>
             <button class="btn btn-primary" :disabled="securitySaveInProgress" @click="saveAccessSettings()">

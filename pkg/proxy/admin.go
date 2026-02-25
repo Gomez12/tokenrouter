@@ -2793,12 +2793,16 @@ func (h *AdminHandler) securitySettingsAPI(w http.ResponseWriter, r *http.Reques
 			"allow_localhost_no_auth":            cfg.AllowLocalhostNoAuth,
 			"allow_host_docker_internal_no_auth": cfg.AllowHostDockerInternalNoAuth,
 			"auto_enable_public_free_models":     cfg.AutoEnablePublicFreeModels,
+			"auto_remove_expired_tokens":         cfg.AutoRemoveExpiredTokens,
+			"auto_remove_empty_quota_tokens":     cfg.AutoRemoveEmptyQuotaTokens,
 		})
 	case http.MethodPut:
 		var payload struct {
 			AllowLocalhostNoAuth          bool `json:"allow_localhost_no_auth"`
 			AllowHostDockerInternalNoAuth bool `json:"allow_host_docker_internal_no_auth"`
 			AutoEnablePublicFreeModels    bool `json:"auto_enable_public_free_models"`
+			AutoRemoveExpiredTokens       bool `json:"auto_remove_expired_tokens"`
+			AutoRemoveEmptyQuotaTokens    bool `json:"auto_remove_empty_quota_tokens"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
@@ -2808,6 +2812,8 @@ func (h *AdminHandler) securitySettingsAPI(w http.ResponseWriter, r *http.Reques
 			c.AllowLocalhostNoAuth = payload.AllowLocalhostNoAuth
 			c.AllowHostDockerInternalNoAuth = payload.AllowHostDockerInternalNoAuth
 			c.AutoEnablePublicFreeModels = payload.AutoEnablePublicFreeModels
+			c.AutoRemoveExpiredTokens = payload.AutoRemoveExpiredTokens
+			c.AutoRemoveEmptyQuotaTokens = payload.AutoRemoveEmptyQuotaTokens
 			return nil
 		}); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -3263,13 +3269,12 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		cfg := h.store.Snapshot()
 		type tokenItem struct {
-			ID          string             `json:"id"`
-			Name        string             `json:"name"`
-			Role        string             `json:"role,omitempty"`
-			ParentID    string             `json:"parent_id,omitempty"`
-			Quota       *config.TokenQuota `json:"quota,omitempty"`
-			RedactedKey string             `json:"redacted_key"`
-			ExpiresAt   string             `json:"expires_at,omitempty"`
+			ID        string             `json:"id"`
+			Name      string             `json:"name"`
+			Role      string             `json:"role,omitempty"`
+			ParentID  string             `json:"parent_id,omitempty"`
+			Quota     *config.TokenQuota `json:"quota,omitempty"`
+			ExpiresAt string             `json:"expires_at,omitempty"`
 		}
 		out := make([]tokenItem, 0, len(cfg.IncomingTokens))
 		for _, t := range cfg.IncomingTokens {
@@ -3277,13 +3282,12 @@ func (h *AdminHandler) accessTokensAPI(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			out = append(out, tokenItem{
-				ID:          strings.TrimSpace(t.ID),
-				Name:        strings.TrimSpace(t.Name),
-				Role:        config.NormalizeIncomingTokenRole(t.Role),
-				ParentID:    strings.TrimSpace(t.ParentID),
-				Quota:       t.Quota,
-				RedactedKey: redactAccessKey(strings.TrimSpace(t.Key)),
-				ExpiresAt:   strings.TrimSpace(t.ExpiresAt),
+				ID:        strings.TrimSpace(t.ID),
+				Name:      strings.TrimSpace(t.Name),
+				Role:      config.NormalizeIncomingTokenRole(t.Role),
+				ParentID:  strings.TrimSpace(t.ParentID),
+				Quota:     t.Quota,
+				ExpiresAt: strings.TrimSpace(t.ExpiresAt),
 			})
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -3503,14 +3507,6 @@ func (h *AdminHandler) accessTokenByIDAPI(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-func redactAccessKey(key string) string {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return ""
-	}
-	return strings.Repeat("*", 8)
 }
 
 func (h *AdminHandler) providersAPI(w http.ResponseWriter, r *http.Request) {
