@@ -134,7 +134,7 @@ func (s *Store) List(filter ListFilter) []Entry {
 	out := make([]Entry, 0, min(limit, len(s.entries)))
 	for i := len(s.entries) - 1; i >= 0; i-- {
 		e := s.entries[i]
-		if level != "" && level != "all" && e.Level != level {
+		if !logLevelMatchesFilter(level, e.Level) {
 			continue
 		}
 		if query != "" {
@@ -149,6 +149,39 @@ func (s *Store) List(filter ListFilter) []Entry {
 		}
 	}
 	return out
+}
+
+func logLevelMatchesFilter(filterLevel, entryLevel string) bool {
+	f := normalizeLevel(filterLevel)
+	if f == "" || f == "all" {
+		return true
+	}
+	ev := normalizeLevel(entryLevel)
+	if ev == "" {
+		return false
+	}
+	// Dropdown order is trace -> debug -> info -> warn -> error -> fatal.
+	// "selected and below" means selected plus items below in that list.
+	return logLevelRank(ev) >= logLevelRank(f)
+}
+
+func logLevelRank(level string) int {
+	switch normalizeLevel(level) {
+	case "trace":
+		return 0
+	case "debug":
+		return 1
+	case "info":
+		return 2
+	case "warn":
+		return 3
+	case "error":
+		return 4
+	case "fatal":
+		return 5
+	default:
+		return -1
+	}
 }
 
 func (s *Store) Flush() {
@@ -193,7 +226,7 @@ func (w *Sink) consumeLine(line string) {
 	if line == "" {
 		return
 	}
-	w.store.Add(extractLevel(line), line, time.Now().UTC())
+	w.store.Add(extractLevel(line), extractMessage(line), time.Now().UTC())
 }
 
 func (s *Store) load() {
@@ -249,15 +282,17 @@ func (s *Store) saveLocked(force bool) {
 
 func normalizeLevel(level string) string {
 	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "debug":
+	case "trace", "trac":
+		return "trace"
+	case "debug", "debu":
 		return "debug"
-	case "info":
+	case "info", "inf":
 		return "info"
-	case "warn", "warning":
+	case "warn", "warning", "wrn":
 		return "warn"
-	case "error":
+	case "error", "erro", "err":
 		return "error"
-	case "fatal":
+	case "fatal", "fata":
 		return "fatal"
 	case "all":
 		return "all"
@@ -268,20 +303,107 @@ func normalizeLevel(level string) string {
 
 func extractLevel(line string) string {
 	u := strings.ToUpper(stripANSI(line))
+	normalized := strings.ReplaceAll(u, "\t", " ")
+	normalized = " " + normalized + " "
 	switch {
-	case strings.Contains(u, " DEBUG "), strings.HasPrefix(u, "DEBUG "):
+	case strings.Contains(normalized, " LEVEL=TRACE "), strings.Contains(normalized, " LEVEL=TRAC "),
+		strings.Contains(normalized, " TRACE "), strings.Contains(normalized, " TRAC "),
+		strings.HasPrefix(strings.TrimSpace(u), "TRACE "), strings.HasPrefix(strings.TrimSpace(u), "TRAC "):
+		return "trace"
+	case strings.Contains(normalized, " LEVEL=DEBUG "), strings.Contains(normalized, " LEVEL=DEBU "),
+		strings.Contains(normalized, " DEBUG "), strings.Contains(normalized, " DEBU "),
+		strings.HasPrefix(strings.TrimSpace(u), "DEBUG "), strings.HasPrefix(strings.TrimSpace(u), "DEBU "):
 		return "debug"
-	case strings.Contains(u, " INFO "), strings.HasPrefix(u, "INFO "):
+	case strings.Contains(normalized, " LEVEL=INFO "),
+		strings.Contains(normalized, " INFO "),
+		strings.HasPrefix(strings.TrimSpace(u), "INFO "):
 		return "info"
-	case strings.Contains(u, " WARN "), strings.Contains(u, " WARNING "), strings.HasPrefix(u, "WARN "):
+	case strings.Contains(normalized, " LEVEL=WARN "), strings.Contains(normalized, " LEVEL=WARNING "),
+		strings.Contains(normalized, " WARN "), strings.Contains(normalized, " WARNING "),
+		strings.HasPrefix(strings.TrimSpace(u), "WARN "):
 		return "warn"
-	case strings.Contains(u, " ERROR "), strings.HasPrefix(u, "ERROR "):
+	case strings.Contains(normalized, " LEVEL=ERROR "), strings.Contains(normalized, " LEVEL=ERRO "),
+		strings.Contains(normalized, " ERROR "), strings.Contains(normalized, " ERRO "),
+		strings.HasPrefix(strings.TrimSpace(u), "ERROR "), strings.HasPrefix(strings.TrimSpace(u), "ERRO "):
 		return "error"
-	case strings.Contains(u, " FATAL "), strings.HasPrefix(u, "FATAL "):
+	case strings.Contains(normalized, " LEVEL=FATAL "), strings.Contains(normalized, " LEVEL=FATA "),
+		strings.Contains(normalized, " FATAL "), strings.Contains(normalized, " FATA "),
+		strings.HasPrefix(strings.TrimSpace(u), "FATAL "), strings.HasPrefix(strings.TrimSpace(u), "FATA "):
 		return "fatal"
 	default:
 		return "info"
 	}
+}
+
+func extractMessage(line string) string {
+	s := strings.TrimSpace(stripANSI(line))
+	if s == "" {
+		return ""
+	}
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return s
+	}
+
+	// Structured log lines often encode time/level as key-value pairs.
+	if strings.Contains(strings.ToLower(s), "level=") || strings.Contains(strings.ToLower(s), "time=") {
+		out := make([]string, 0, len(fields))
+		for _, f := range fields {
+			fl := strings.ToLower(strings.TrimSpace(f))
+			switch {
+			case strings.HasPrefix(fl, "time="),
+				strings.HasPrefix(fl, "timestamp="),
+				strings.HasPrefix(fl, "ts="),
+				strings.HasPrefix(fl, "level="):
+				continue
+			default:
+				out = append(out, f)
+			}
+		}
+		if len(out) > 0 {
+			return strings.TrimSpace(strings.Join(out, " "))
+		}
+	}
+
+	// Plain text format: "<timestamp> <level> message..."
+	if len(fields) >= 2 && looksTimestampToken(fields[0]) && looksLevelToken(fields[1]) {
+		return strings.TrimSpace(strings.Join(fields[2:], " "))
+	}
+	// Plain text format with split date/time: "<date> <time> <level> message..."
+	if len(fields) >= 3 && looksTimestampToken(fields[0]+" "+fields[1]) && looksLevelToken(fields[2]) {
+		return strings.TrimSpace(strings.Join(fields[3:], " "))
+	}
+	// Plain text format: "<level> message..."
+	if len(fields) >= 1 && looksLevelToken(fields[0]) {
+		return strings.TrimSpace(strings.Join(fields[1:], " "))
+	}
+	return s
+}
+
+func looksTimestampToken(v string) bool {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, "T") && strings.Contains(s, ":") {
+		return true
+	}
+	if strings.Contains(s, "/") && strings.Contains(s, ":") {
+		return true
+	}
+	if strings.Contains(s, "-") && strings.Contains(s, ":") {
+		return true
+	}
+	return false
+}
+
+func looksLevelToken(v string) bool {
+	s := strings.ToUpper(strings.TrimSpace(v))
+	switch s {
+	case "TRACE", "TRAC", "DEBUG", "DEBU", "INFO", "WARN", "WARNING", "ERROR", "ERRO", "FATAL", "FATA":
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(v)), "level=")
 }
 
 func stripANSI(s string) string {

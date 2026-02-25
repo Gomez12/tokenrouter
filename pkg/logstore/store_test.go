@@ -28,15 +28,42 @@ func TestStorePersistsAndRetainsMaxLines(t *testing.T) {
 func TestSinkParsesLevelsAndFilters(t *testing.T) {
 	s := NewStore("", Settings{MaxLines: 100})
 	w := s.Writer()
-	_, _ = w.Write([]byte("2026-01-01T00:00:00Z DEBUG hello\n"))
+	_, _ = w.Write([]byte("2026-01-01T00:00:00Z TRAC ultra\n"))
+	_, _ = w.Write([]byte("2026-01-01T00:00:00Z DEBU hello\n"))
 	_, _ = w.Write([]byte("2026-01-01T00:00:01Z INFO world\n"))
+	_, _ = w.Write([]byte("2026-01-01T00:00:02Z ERRO fail\n"))
+
+	traceEntries := s.List(ListFilter{Level: "trace", Limit: 10})
+	if len(traceEntries) != 4 {
+		t.Fatalf("expected 4 entries for trace-and-below filter, got %d", len(traceEntries))
+	}
+	if traceEntries[3].Level != "trace" {
+		t.Fatalf("expected oldest entry to be trace, got %+v", traceEntries[3])
+	}
 
 	debugEntries := s.List(ListFilter{Level: "debug", Limit: 10})
-	if len(debugEntries) != 1 {
-		t.Fatalf("expected 1 debug entry, got %d", len(debugEntries))
+	if len(debugEntries) != 3 {
+		t.Fatalf("expected 3 entries for debug-and-below filter, got %d", len(debugEntries))
 	}
 	if debugEntries[0].Message == "" {
 		t.Fatal("expected debug message")
+	}
+	infoEntries := s.List(ListFilter{Level: "info", Limit: 10})
+	if len(infoEntries) != 2 {
+		t.Fatalf("expected 2 entries for info-and-below filter, got %d", len(infoEntries))
+	}
+	seenInfo := false
+	seenError := false
+	for _, e := range infoEntries {
+		if e.Level == "info" {
+			seenInfo = true
+		}
+		if e.Level == "error" {
+			seenError = true
+		}
+	}
+	if !seenInfo || !seenError {
+		t.Fatalf("expected info and error levels, got %+v", infoEntries)
 	}
 	query := s.List(ListFilter{Level: "all", Query: "world", Limit: 10})
 	if len(query) != 1 {

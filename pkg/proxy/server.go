@@ -125,6 +125,7 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 	adminHandler.conversations = s.conversations
 	adminHandler.logs = s.logs
 	s.adminHandler = adminHandler
+	adminHandler.SetAccessTokenCleanup(s.runAccessTokenCleanupOnce)
 	adminHandler.SetNetworkListenerControl(s.addHTTPListener, s.removeHTTPListener, s.listHTTPListeners)
 	adminHandler.RegisterRoutes(r)
 
@@ -306,8 +307,11 @@ func (s *Server) removeHTTPListener(addr string) error {
 		return nil
 	}
 	if len(s.httpListeners) <= 1 {
-		s.listenerMu.Unlock()
-		return fmt.Errorf("cannot remove last active listener")
+		cfg := s.store.Snapshot()
+		if !cfg.TLS.Enabled {
+			s.listenerMu.Unlock()
+			return fmt.Errorf("cannot remove last active listener")
+		}
 	}
 	delete(s.httpListeners, listenAddr)
 	s.listenerMu.Unlock()

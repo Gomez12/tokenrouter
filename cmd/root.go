@@ -34,7 +34,7 @@ func init() {
 		}
 		return nil
 	}
-	rootCmd.PersistentFlags().StringVar(&rootLogLevel, "loglevel", "info", "Log level (debug, info, warn, error, fatal)")
+	rootCmd.PersistentFlags().StringVar(&rootLogLevel, "loglevel", "info", "Log level (trace, debug, info, warn, error, fatal)")
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "version",

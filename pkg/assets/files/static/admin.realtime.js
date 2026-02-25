@@ -146,8 +146,11 @@
     } else if (this.activeTab === 'log') {
       this.loadLogs();
     } else if (this.activeTab === 'network') {
-      this.loadNetworkSettings();
-      this.loadTLSSettings();
+      if (typeof this.refreshNetworkTabFromConfig === 'function') this.refreshNetworkTabFromConfig();
+      else {
+        this.loadNetworkSettings();
+        this.loadTLSSettings();
+      }
     }
   }
 
@@ -185,8 +188,11 @@
     }
     if (s === 'network') {
       if (this.activeTab === 'network') {
-        this.loadNetworkSettings();
-        this.loadTLSSettings();
+        if (typeof this.refreshNetworkTabFromConfig === 'function') this.refreshNetworkTabFromConfig();
+        else {
+          this.loadNetworkSettings();
+          this.loadTLSSettings();
+        }
       }
       return;
     }

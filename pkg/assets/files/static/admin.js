@@ -62,6 +62,7 @@ function adminApp() {
     usageChart: null,
     providersTableHtml: '',
     accessTokensTableHtml: '',
+    accessTokensPagerHtml: '',
     modelsTableHtml: '',
     modelsFreshnessHtml: '',
     modalStatusHtml: '',
@@ -84,6 +85,8 @@ function adminApp() {
     modelsFreeOnly: false,
     providersPage: 1,
     providersPageSize: 25,
+    accessPage: 1,
+    accessPageSize: 25,
     modelsPage: 1,
     modelsPageSize: 25,
     conversationsPage: 1,
@@ -108,6 +111,7 @@ function adminApp() {
     usageChartGroupCacheKey: 'opp_usage_chart_group_v1',
     statsRangeCacheKey: 'opp_stats_range_hours_v1',
     statusUpdateSpeedCacheKey: 'opp_status_update_speed_v1',
+    logLevelFilterCacheKey: 'opp_log_level_filter_v1',
     accessTokens: [],
     requiresInitialTokenSetup: false,
     showAddAccessTokenModal: false,
@@ -134,6 +138,12 @@ function adminApp() {
       window.__adminProvidersLastPage = () => this.setProvidersPage(Number.MAX_SAFE_INTEGER);
       window.__adminSetProvidersPage = (v) => this.setProvidersPage(v);
       window.__adminSetProvidersPageSize = (v) => this.setProvidersPageSize(v);
+      window.__adminAccessFirstPage = () => this.setAccessPage(1);
+      window.__adminAccessPrevPage = () => this.setAccessPage(this.accessPage - 1);
+      window.__adminAccessNextPage = () => this.setAccessPage(this.accessPage + 1);
+      window.__adminAccessLastPage = () => this.setAccessPage(Number.MAX_SAFE_INTEGER);
+      window.__adminSetAccessPage = (v) => this.setAccessPage(v);
+      window.__adminSetAccessPageSize = (v) => this.setAccessPageSize(v);
       window.__adminModelsFirstPage = () => this.setModelsPage(1);
       window.__adminModelsPrevPage = () => this.setModelsPage(this.modelsPage - 1);
       window.__adminModelsNextPage = () => this.setModelsPage(this.modelsPage + 1);
@@ -159,14 +169,14 @@ function adminApp() {
       this.restoreUsageChartGroup();
       this.restoreStatsRangeHours();
       this.restoreStatusUpdateSpeed();
+      this.restoreLogLevelFilter();
       this.restoreActiveTab();
       this.loadStats(false);
       this.loadProviders();
       this.loadAccessTokens();
       this.loadPopularProviders();
       this.loadSecuritySettings();
-      this.loadNetworkSettings();
-      this.loadTLSSettings();
+      this.refreshNetworkTabFromConfig();
       this.loadVersion();
       this.startRealtimeUpdates();
       if (window.matchMedia) {
@@ -246,8 +256,7 @@ function adminApp() {
         this.loadSecuritySettings();
         this.loadTLSSettings();
       } else if (tab === 'network') {
-        this.loadNetworkSettings();
-        this.loadTLSSettings();
+        this.refreshNetworkTabFromConfig();
       } else if (tab === 'conversations') {
         this.loadConversationsSettings();
         this.loadConversations(true);
@@ -274,8 +283,7 @@ function adminApp() {
         this.loadLogSettings();
         this.loadLogs();
       } else if (this.activeTab === 'network') {
-        this.loadNetworkSettings();
-        this.loadTLSSettings();
+        this.refreshNetworkTabFromConfig();
       }
     },
     persistActiveTab() {
@@ -327,6 +335,26 @@ function adminApp() {
       this.statusUpdateSpeed = raw;
       this.persistStatusUpdateSpeed();
       this.configureStatusUpdates();
+    },
+    restoreLogLevelFilter() {
+      try {
+        const raw = String(window.localStorage.getItem(this.logLevelFilterCacheKey) || '').trim().toLowerCase();
+        if (raw === 'all' || raw === 'trace' || raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error' || raw === 'fatal') {
+          this.logLevelFilter = raw;
+        }
+      } catch (_) {}
+    },
+    persistLogLevelFilter() {
+      try {
+        window.localStorage.setItem(this.logLevelFilterCacheKey, String(this.logLevelFilter || 'all'));
+      } catch (_) {}
+    },
+    setLogLevelFilter(v) {
+      const raw = String(v || '').trim().toLowerCase();
+      if (raw !== 'all' && raw !== 'trace' && raw !== 'debug' && raw !== 'info' && raw !== 'warn' && raw !== 'error' && raw !== 'fatal') return;
+      this.logLevelFilter = raw;
+      this.persistLogLevelFilter();
+      this.loadLogs();
     },
     restoreStatsRangeHours() {
       try {
@@ -594,6 +622,17 @@ function adminApp() {
       this.modelsPage = Math.max(1, Math.floor(n));
       this.renderModelsCatalog();
     },
+    setAccessPage(v) {
+      let n = Number(v);
+      if (!Number.isFinite(n)) n = 1;
+      this.accessPage = Math.max(1, Math.floor(n));
+      this.renderAccessTokens();
+    },
+    setAccessPageSize(v) {
+      this.accessPageSize = this.parsePageSize(v);
+      this.accessPage = 1;
+      this.renderAccessTokens();
+    },
     setModelsPageSize(v) {
       this.modelsPageSize = this.parsePageSize(v);
       this.modelsPage = 1;
@@ -686,6 +725,9 @@ function adminApp() {
     },
     renderModelsPager(totalRows, page, totalPages, pageSize) {
       return this.renderPager(totalRows, page, totalPages, pageSize, 'Models');
+    },
+    renderAccessPager(totalRows, page, totalPages, pageSize) {
+      return this.renderPager(totalRows, page, totalPages, pageSize, 'Access');
     },
     resetDraft() {
       this.cancelOAuthPolling();
@@ -1263,6 +1305,34 @@ function adminApp() {
       }
       return false;
     },
+    hasAnyProviderFailing() {
+      const list = Array.isArray(this.providers) ? this.providers : [];
+      for (let i = 0; i < list.length; i++) {
+        const p = list[i] || {};
+        if (!p.managed) continue;
+        if (this.providerHasProblem(p)) return true;
+      }
+      return false;
+    },
+    providersFailureTooltip() {
+      const list = Array.isArray(this.providers) ? this.providers : [];
+      const failing = [];
+      for (let i = 0; i < list.length; i++) {
+        const p = list[i] || {};
+        if (!p.managed) continue;
+        if (!this.providerHasProblem(p)) continue;
+        const name = String((p.display_name || p.name) || '').trim() || 'provider';
+        const status = String(p.status || '').trim().toLowerCase() || 'unknown';
+        failing.push(name + ' (' + status + ')');
+      }
+      if (!failing.length) return 'No managed provider failures.';
+      return 'Failing providers: ' + failing.join(', ');
+    },
+    providerHasProblem(provider) {
+      const p = provider || {};
+      const s = String((p && p.status) || '').trim().toLowerCase();
+      return s === 'offline' || s === 'auth problem' || s === 'blocked';
+    },
     chartColor(seed) {
       let h = 0;
       const str = String(seed || '');
@@ -1584,7 +1654,15 @@ function adminApp() {
       '</div>';
     },
     renderProviders() {
-      const rows = (this.providers || []).map((p) => {
+      const sortedProviders = (Array.isArray(this.providers) ? this.providers.slice() : []).sort((a, b) => {
+        const ap = this.providerHasProblem(a) ? 1 : 0;
+        const bp = this.providerHasProblem(b) ? 1 : 0;
+        if (ap !== bp) return bp - ap;
+        const an = String((a && (a.display_name || a.name)) || '').toLowerCase();
+        const bn = String((b && (b.display_name || b.name)) || '').toLowerCase();
+        return an.localeCompare(bn);
+      });
+      const rows = sortedProviders.map((p) => {
         const rawName = String(p.name || '').trim();
         const name = this.escapeHtml(rawName);
         const display = this.escapeHtml(p.display_name || p.name);
@@ -1612,8 +1690,7 @@ function adminApp() {
           const detail = [responseMS, ageText].filter(Boolean).join(' ');
           status = this.escapeHtml(detail || 'online');
         }
-        const statusNorm = String(statusRaw || '').trim().toLowerCase();
-        const statusProblem = (statusNorm === 'offline' || statusNorm === 'auth problem' || statusNorm === 'blocked');
+        const statusProblem = this.providerHasProblem(p);
         const statusAlert = statusProblem
           ? '<span class="ms-1 d-inline-flex align-items-center justify-content-center rounded-circle bg-danger text-white fw-bold align-middle" style="width:1.05rem;height:1.05rem;line-height:1.05rem;font-size:0.74rem;" title="Provider has a problem">!</span>'
           : '';
@@ -1645,6 +1722,102 @@ function adminApp() {
         '</table>' +
         this.renderProvidersPager(page.totalRows, page.page, page.totalPages, page.pageSize);
     },
+    renderAccessTokenRoleBadge(role) {
+      const r = String(role || '').trim().toLowerCase();
+      if (r === 'admin') return '<span class="badge text-bg-danger">admin</span>';
+      if (r === 'keymaster') return '<span class="badge text-bg-info">keymaster</span>';
+      return '<span class="badge text-bg-secondary">inferrer</span>';
+    },
+    formatAccessTokenCountShort(n) {
+      const v = Number(n || 0);
+      if (!Number.isFinite(v) || v <= 0) return '0';
+      if (v >= 1000000000) return Math.round(v / 100000000) / 10 + 'b';
+      if (v >= 1000000) return Math.round(v / 100000) / 10 + 'm';
+      if (v >= 1000) return Math.round(v / 100) / 10 + 'k';
+      return String(Math.round(v));
+    },
+    formatAccessTokenIntervalShort(sec) {
+      const s = Math.max(0, Number(sec || 0));
+      if (!Number.isFinite(s) || s <= 0) return '';
+      if (s % 86400 === 0) return (s / 86400) + 'd';
+      if (s % 3600 === 0) return (s / 3600) + 'h';
+      if (s % 60 === 0) return (s / 60) + 'm';
+      return s + 's';
+    },
+    renderAccessTokenQuotaSummary(quotaObj) {
+      const q = quotaObj && typeof quotaObj === 'object' ? quotaObj : {};
+      const qr = q && q.requests ? q.requests : {};
+      const qt = q && q.tokens ? q.tokens : {};
+      const parts = [];
+      const full = [];
+      const reqLimit = Number(qr.limit || 0);
+      const reqInt = Number(qr.interval_seconds || 0);
+      if (Number.isFinite(reqLimit) && reqLimit > 0) {
+        const shortInt = this.formatAccessTokenIntervalShort(reqInt);
+        const left = this.formatAccessTokenCountShort(reqLimit) + ' req' + (shortInt ? ('/' + shortInt) : '');
+        parts.push(left);
+        full.push(Math.round(reqLimit) + ' requests' + (shortInt ? (' per ' + shortInt) : ''));
+      }
+      const tokLimit = Number(qt.limit || 0);
+      const tokInt = Number(qt.interval_seconds || 0);
+      if (Number.isFinite(tokLimit) && tokLimit > 0) {
+        const shortInt = this.formatAccessTokenIntervalShort(tokInt);
+        const left = this.formatAccessTokenCountShort(tokLimit) + ' tok' + (shortInt ? ('/' + shortInt) : '');
+        parts.push(left);
+        full.push(Math.round(tokLimit) + ' tokens' + (shortInt ? (' per ' + shortInt) : ''));
+      }
+      if (!parts.length) return {short: 'no quota', full: 'No quota'};
+      return {short: parts.join(', '), full: full.join(', ')};
+    },
+    flattenAccessTokens(items) {
+      const byParent = {};
+      const byID = {};
+      items.forEach((t) => {
+        const parent = t.parent_id;
+        if (!byParent[parent]) byParent[parent] = [];
+        byParent[parent].push(t);
+        if (t.id) byID[t.id] = t;
+      });
+      const roots = items.filter((t) => !t.parent_id || !byID[t.parent_id]);
+      roots.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+      Object.keys(byParent).forEach((k) => {
+        byParent[k].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+      });
+      const out = [];
+      const walk = (token, depth) => {
+        out.push({token, depth});
+        (byParent[token.id] || []).forEach((child) => walk(child, depth + 1));
+      };
+      roots.forEach((r) => walk(r, 0));
+      return out;
+    },
+    renderAccessTokenRow(token, depth) {
+      const t = token || {};
+      const id = this.escapeHtml(t.id);
+      const name = this.escapeHtml(t.name);
+      const expiryRaw = String(t.expires_at || '').trim();
+      const expiry = this.escapeHtml(this.formatRelativeShort(expiryRaw, 'none'));
+      const expiryTitle = this.escapeHtml(this.formatTimestamp(expiryRaw));
+      const quota = this.renderAccessTokenQuotaSummary(t.quota);
+      const quotaShort = this.escapeHtml(quota.short);
+      const quotaFull = this.escapeHtml(quota.full);
+      const indent = depth > 0 ? (' style="padding-left:' + (depth * 20) + 'px;"') : '';
+      const marker = depth > 0 ? '<span class="text-body-secondary me-1">↳</span>' : '';
+      return '<tr>' +
+        '<td' + indent + '>' + marker + name + '</td>' +
+        '<td>' + this.renderAccessTokenRoleBadge(t.role) + '</td>' +
+        '<td title="' + quotaFull + '">' + quotaShort + '</td>' +
+        '<td title="' + expiryTitle + '">' + expiry + '</td>' +
+        '<td class="text-end">' +
+          '<button class="icon-btn me-1" type="button" title="Edit token" aria-label="Edit token" data-token-id="' + id + '" onclick="window.__adminEditAccessToken(this.getAttribute(\'data-token-id\'))">' +
+            this.editActionIconSVG() +
+          '</button>' +
+          '<button class="icon-btn icon-btn-danger" type="button" title="Delete token" aria-label="Delete token" data-token-id="' + id + '" onclick="window.__adminDeleteAccessToken(this.getAttribute(\'data-token-id\'))">' +
+            '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z"/></svg>' +
+          '</button>' +
+        '</td>' +
+      '</tr>';
+    },
     renderAccessTokens() {
       const items = (this.accessTokens || []).map((t) => ({
         id: String(t.id || '').trim(),
@@ -1654,102 +1827,17 @@ function adminApp() {
         expires_at: String(t.expires_at || '').trim(),
         quota: (t && typeof t.quota === 'object' && t.quota) ? t.quota : null
       }));
-      const byParent = {};
-      items.forEach((t) => {
-        const parent = t.parent_id;
-        if (!byParent[parent]) byParent[parent] = [];
-        byParent[parent].push(t);
-      });
-      const byID = {};
-      items.forEach((t) => { if (t.id) byID[t.id] = t; });
-
-      const roots = items.filter((t) => !t.parent_id || !byID[t.parent_id]);
-      roots.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
-      Object.keys(byParent).forEach((k) => {
-        byParent[k].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
-      });
-
-      const renderRoleBadge = (role) => {
-        const r = String(role || '').trim().toLowerCase();
-        if (r === 'admin') return '<span class="badge text-bg-danger">admin</span>';
-        if (r === 'keymaster') return '<span class="badge text-bg-info">keymaster</span>';
-        return '<span class="badge text-bg-secondary">inferrer</span>';
-      };
-      const formatCountShort = (n) => {
-        const v = Number(n || 0);
-        if (!Number.isFinite(v) || v <= 0) return '0';
-        if (v >= 1000000000) return Math.round(v / 100000000) / 10 + 'b';
-        if (v >= 1000000) return Math.round(v / 100000) / 10 + 'm';
-        if (v >= 1000) return Math.round(v / 100) / 10 + 'k';
-        return String(Math.round(v));
-      };
-      const formatIntervalShort = (sec) => {
-        const s = Math.max(0, Number(sec || 0));
-        if (!Number.isFinite(s) || s <= 0) return '';
-        if (s % 86400 === 0) return (s / 86400) + 'd';
-        if (s % 3600 === 0) return (s / 3600) + 'h';
-        if (s % 60 === 0) return (s / 60) + 'm';
-        return s + 's';
-      };
-      const renderQuotaSummary = (quotaObj) => {
-        const q = quotaObj && typeof quotaObj === 'object' ? quotaObj : {};
-        const qr = q && q.requests ? q.requests : {};
-        const qt = q && q.tokens ? q.tokens : {};
-        const parts = [];
-        const full = [];
-        const reqLimit = Number(qr.limit || 0);
-        const reqInt = Number(qr.interval_seconds || 0);
-        if (Number.isFinite(reqLimit) && reqLimit > 0) {
-          const shortInt = formatIntervalShort(reqInt);
-          const left = formatCountShort(reqLimit) + ' req' + (shortInt ? ('/' + shortInt) : '');
-          parts.push(left);
-          full.push(Math.round(reqLimit) + ' requests' + (shortInt ? (' per ' + shortInt) : ''));
-        }
-        const tokLimit = Number(qt.limit || 0);
-        const tokInt = Number(qt.interval_seconds || 0);
-        if (Number.isFinite(tokLimit) && tokLimit > 0) {
-          const shortInt = formatIntervalShort(tokInt);
-          const left = formatCountShort(tokLimit) + ' tok' + (shortInt ? ('/' + shortInt) : '');
-          parts.push(left);
-          full.push(Math.round(tokLimit) + ' tokens' + (shortInt ? (' per ' + shortInt) : ''));
-        }
-        if (!parts.length) return {short: 'no quota', full: 'No quota'};
-        return {short: parts.join(', '), full: full.join(', ')};
-      };
-      const renderRow = (t, depth) => {
-        const id = this.escapeHtml(t.id);
-        const name = this.escapeHtml(t.name);
-        const expiryRaw = String(t.expires_at || '').trim();
-        const expiry = this.escapeHtml(this.formatRelativeShort(expiryRaw, 'none'));
-        const expiryTitle = this.escapeHtml(this.formatTimestamp(expiryRaw));
-        const quota = renderQuotaSummary(t.quota);
-        const quotaShort = this.escapeHtml(quota.short);
-        const quotaFull = this.escapeHtml(quota.full);
-        const indent = depth > 0 ? (' style="padding-left:' + (depth * 20) + 'px;"') : '';
-        const marker = depth > 0 ? '<span class="text-body-secondary me-1">↳</span>' : '';
-        const row = '<tr>' +
-          '<td' + indent + '>' + marker + name + '</td>' +
-          '<td>' + renderRoleBadge(t.role) + '</td>' +
-          '<td title="' + quotaFull + '">' + quotaShort + '</td>' +
-          '<td title="' + expiryTitle + '">' + expiry + '</td>' +
-          '<td class="text-end">' +
-            '<button class="icon-btn me-1" type="button" title="Edit token" aria-label="Edit token" data-token-id="' + id + '" onclick="window.__adminEditAccessToken(this.getAttribute(\'data-token-id\'))">' +
-              this.editActionIconSVG() +
-            '</button>' +
-            '<button class="icon-btn icon-btn-danger" type="button" title="Delete token" aria-label="Delete token" data-token-id="' + id + '" onclick="window.__adminDeleteAccessToken(this.getAttribute(\'data-token-id\'))">' +
-              '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z"/></svg>' +
-            '</button>' +
-          '</td>' +
-          '</tr>';
-        const kids = (byParent[t.id] || []).map((c) => renderRow(c, depth + 1)).join('');
-        return row + kids;
-      };
-      const rows = roots.map((t) => renderRow(t, 0)).join('');
+      const flattened = this.flattenAccessTokens(items);
+      const allRows = flattened.map((entry) => this.renderAccessTokenRow(entry.token, entry.depth));
+      const page = this.paginateRows(allRows, this.accessPage, this.accessPageSize);
+      this.accessPage = page.page;
+      this.accessPageSize = page.pageSize;
       this.accessTokensTableHtml =
         '<table class="table table-sm align-middle mb-0">' +
           '<thead><tr><th>Name</th><th>Type</th><th>Quota</th><th>Expiry</th><th></th></tr></thead>' +
-          '<tbody>' + (rows || '<tr><td colspan="5" class="text-body-secondary">No tokens found.</td></tr>') + '</tbody>' +
+          '<tbody>' + (page.rows.join('') || '<tr><td colspan="5" class="text-body-secondary">No tokens found.</td></tr>') + '</tbody>' +
         '</table>';
+      this.accessTokensPagerHtml = this.renderAccessPager(page.totalRows, page.page, page.totalPages, page.pageSize);
       window.__adminDeleteAccessToken = (id) => this.removeAccessToken(id);
       window.__adminEditAccessToken = (id) => this.openEditAccessTokenModal(id);
     },
@@ -2017,8 +2105,15 @@ function adminApp() {
         const r = await this.apiFetch('/admin/api/settings/security', {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
         if (r.ok) {
-          this.allowLocalhostNoAuthEffective = !!payload.allow_localhost_no_auth;
-          this.allowHostDockerInternalNoAuthEffective = !!payload.allow_host_docker_internal_no_auth;
+          const body = await r.json().catch(() => ({}));
+          this.allowLocalhostNoAuthEffective = !!body.allow_localhost_no_auth;
+          this.allowHostDockerInternalNoAuthEffective = !!body.allow_host_docker_internal_no_auth;
+          this.allowLocalhostNoAuth = this.allowLocalhostNoAuthEffective;
+          this.allowHostDockerInternalNoAuth = this.allowHostDockerInternalNoAuthEffective;
+          this.autoEnablePublicFreeModels = !!body.auto_enable_public_free_models;
+          this.autoRemoveExpiredTokens = !!body.auto_remove_expired_tokens;
+          this.autoRemoveEmptyQuotaTokens = !!body.auto_remove_empty_quota_tokens;
+          await this.loadAccessTokens();
           this.toastSuccess('Security settings saved.');
           return true;
         }
@@ -2080,6 +2175,10 @@ function adminApp() {
         cert_configured: !!body.cert_configured,
         key_configured: !!body.key_configured
       };
+    },
+    async refreshNetworkTabFromConfig() {
+      await this.loadNetworkSettings();
+      await this.loadTLSSettings();
     },
     async loadNetworkSettings() {
       const r = await this.apiFetch('/admin/api/settings/network', {headers:this.headers()});
@@ -2182,8 +2281,22 @@ function adminApp() {
         });
         if (applyResp.status === 401) { window.location = '/admin/login?next=/admin'; return 'redirect'; }
         if (!applyResp.ok) {
-          const txt = await applyResp.text();
-          this.toastError(txt || 'Failed to apply network settings.');
+          const body = await applyResp.json().catch(() => ({}));
+          const status = String(body.status || '').trim();
+          const redirectURL = String(body.https_url || body.http_url || '').trim();
+          if (applyResp.status === 409 && status === 'transition_required' && redirectURL) {
+            this.openConfirmModal({
+              title: 'Switch Admin URL',
+              message: String(body.error || 'Switch admin URL before applying network changes.'),
+              confirmLabel: 'Switch'
+            }, async () => {
+              const payload = this.buildLocalStorageHandoffPayload();
+              window.location = this.appendLocalStorageHandoffToURL(redirectURL, payload);
+            });
+            return 'failed';
+          }
+          const msg = String(body.error || '').trim();
+          this.toastError(msg || 'Failed to apply network settings.');
           return 'failed';
         }
         const applyBody = await applyResp.json().catch(() => ({}));
@@ -2534,10 +2647,31 @@ function adminApp() {
       this.renderLogs();
       this.toastSuccess('Log cleared.');
     },
+    formatStructuredLogMessage(input) {
+      const raw = String(input || '').trim();
+      if (!raw) return '';
+      const tokens = raw.split(/\s+/);
+      let structured = 0;
+      const out = tokens.map((tok) => {
+        const idx = tok.indexOf('=');
+        if (idx > 0) {
+          const key = tok.slice(0, idx);
+          const val = tok.slice(idx + 1);
+          if (/^[A-Za-z_][A-Za-z0-9_.:-]*$/.test(key)) {
+            structured++;
+            return '<span class="text-body-secondary">' + this.escapeHtml(key) + '=</span><span class="text-info-emphasis">' + this.escapeHtml(val) + '</span>';
+          }
+        }
+        return this.escapeHtml(tok);
+      });
+      if (structured === 0) return this.escapeHtml(raw);
+      return out.join(' ');
+    },
     renderLogs() {
       const allRows = (this.logEntries || []).map((e) => {
         const level = String(e.level || 'info').trim().toLowerCase();
         const badgeCls =
+          level === 'trace' ? 'text-bg-light border text-dark' :
           level === 'debug' ? 'text-bg-secondary' :
           level === 'info' ? 'text-bg-primary' :
           level === 'warn' ? 'text-bg-warning text-dark' :
@@ -2546,12 +2680,13 @@ function adminApp() {
         const tsRaw = String(e.timestamp || '').trim();
         const ts = this.escapeHtml(this.formatRelativeShort(tsRaw, '-'));
         const tsTitle = this.escapeHtml(this.formatTimestamp(tsRaw));
-        const msg = this.escapeHtml(String(e.message || '').trim());
+        const msgRaw = String(e.message || '').trim();
+        const msg = this.formatStructuredLogMessage(msgRaw);
         return '' +
           '<tr>' +
             '<td class="small text-nowrap" title="' + tsTitle + '">' + ts + '</td>' +
             '<td class="small text-nowrap"><span class="badge ' + badgeCls + '">' + this.escapeHtml(level || 'info') + '</span></td>' +
-            '<td class="small"><code style="white-space:pre-wrap;">' + msg + '</code></td>' +
+            '<td class="small" title="' + this.escapeHtml(msgRaw) + '"><code style="white-space:pre-wrap;">' + msg + '</code></td>' +
           '</tr>';
       });
       const page = this.paginateRows(allRows, this.logsPage, this.logsPageSize);
@@ -2561,7 +2696,7 @@ function adminApp() {
       this.logEntriesTotalCount = page.totalRows;
       this.logEntriesHtml =
         '<table class="table table-sm align-middle mb-0">' +
-          '<thead><tr><th style="width:220px;">Time</th><th style="width:90px;">Level</th><th>Message</th></tr></thead>' +
+          '<thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead>' +
           '<tbody>' + (page.rows.join('') || '<tr><td colspan="3" class="text-body-secondary small">No log entries.</td></tr>') + '</tbody>' +
         '</table>';
       this.logPagerHtml = this.renderPager(page.totalRows, page.page, page.totalPages, page.pageSize, 'Logs');

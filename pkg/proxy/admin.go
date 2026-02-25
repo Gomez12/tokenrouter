@@ -45,30 +45,31 @@ const adminSessionCookie = "opp_admin_session"
 const adminInstanceHeader = "X-OPP-Instance-ID"
 
 type AdminHandler struct {
-	store          *config.ServerConfigStore
-	stats          *StatsStore
-	resolver       *ProviderResolver
-	pricing        *pricing.Manager
-	conversations  *conversations.Store
-	logs           *logstore.Store
-	healthChecker  *ProviderHealthChecker
-	instance       string
-	oauthMu        sync.Mutex
-	oauthPending   map[string]*oauthSession
-	oauthSrvMu     sync.Mutex
-	oauthSrv       *http.Server
-	oauthSrvAddr   string
-	quotaMu        sync.Mutex
-	quotaCache     *cache.TTLMap[string, quotaCacheValue]
-	statsCache     *cache.TTLMap[int64, StatsSummary]
-	wsMu           sync.Mutex
-	wsClients      map[*adminWSClient]struct{}
-	statsNotifyAt  time.Time
-	networkMu      sync.Mutex
-	networkSwitch  map[string]pendingNetworkSwitch
-	addListener    func(string) error
-	removeListener func(string) error
-	listListeners  func() []string
+	store                 *config.ServerConfigStore
+	stats                 *StatsStore
+	resolver              *ProviderResolver
+	pricing               *pricing.Manager
+	conversations         *conversations.Store
+	logs                  *logstore.Store
+	healthChecker         *ProviderHealthChecker
+	instance              string
+	oauthMu               sync.Mutex
+	oauthPending          map[string]*oauthSession
+	oauthSrvMu            sync.Mutex
+	oauthSrv              *http.Server
+	oauthSrvAddr          string
+	quotaMu               sync.Mutex
+	quotaCache            *cache.TTLMap[string, quotaCacheValue]
+	statsCache            *cache.TTLMap[int64, StatsSummary]
+	wsMu                  sync.Mutex
+	wsClients             map[*adminWSClient]struct{}
+	statsNotifyAt         time.Time
+	networkMu             sync.Mutex
+	networkSwitch         map[string]pendingNetworkSwitch
+	addListener           func(string) error
+	removeListener        func(string) error
+	listListeners         func() []string
+	runAccessTokenCleanup func()
 }
 
 type adminWSClient struct {
@@ -159,6 +160,15 @@ func (h *AdminHandler) SetNetworkListenerControl(add func(string) error, remove 
 	h.addListener = add
 	h.removeListener = remove
 	h.listListeners = list
+	h.networkMu.Unlock()
+}
+
+func (h *AdminHandler) SetAccessTokenCleanup(run func()) {
+	if h == nil {
+		return
+	}
+	h.networkMu.Lock()
+	h.runAccessTokenCleanup = run
 	h.networkMu.Unlock()
 }
 
@@ -781,6 +791,7 @@ func (h *AdminHandler) statsAPI(w http.ResponseWriter, r *http.Request) {
 	if !force {
 		if summary, ok := h.statsCache.GetFresh(periodKey, now); ok {
 			providers := h.catalogProviders()
+			quotaProviders := h.quotaProviders()
 			names := make([]string, 0, len(providers))
 			for _, p := range providers {
 				names = append(names, p.Name)
@@ -790,7 +801,7 @@ func (h *AdminHandler) statsAPI(w http.ResponseWriter, r *http.Request) {
 			} else {
 				summary.ProvidersAvailable = len(names)
 			}
-			summary.ProviderQuotas = h.readProviderQuotas(r.Context(), providers)
+			summary.ProviderQuotas = h.readProviderQuotas(r.Context(), quotaProviders)
 			writeJSON(w, http.StatusOK, summary)
 			return
 		}
@@ -798,6 +809,7 @@ func (h *AdminHandler) statsAPI(w http.ResponseWriter, r *http.Request) {
 
 	summary := h.stats.Summary(period)
 	providers := h.catalogProviders()
+	quotaProviders := h.quotaProviders()
 	names := make([]string, 0, len(providers))
 	for _, p := range providers {
 		names = append(names, p.Name)
@@ -807,7 +819,7 @@ func (h *AdminHandler) statsAPI(w http.ResponseWriter, r *http.Request) {
 	} else {
 		summary.ProvidersAvailable = len(names)
 	}
-	summary.ProviderQuotas = h.readProviderQuotas(r.Context(), providers)
+	summary.ProviderQuotas = h.readProviderQuotas(r.Context(), quotaProviders)
 	h.statsCache.SetWithTTL(periodKey, summary, now, statsRefreshInterval)
 	writeJSON(w, http.StatusOK, summary)
 }
@@ -826,6 +838,13 @@ func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []confi
 				ProviderConfig: config.ProviderConfig{Name: providerType},
 				DisplayName:    p.Name,
 			}
+		}
+		if !p.Enabled {
+			snap := newProviderQuotaSnapshot(time.Now().UTC(), p, preset, quotaReaderFromPreset(preset))
+			snap.Status = "disabled"
+			snap.Error = "provider disabled"
+			out[p.Name] = snap
+			continue
 		}
 		snap := h.readProviderQuotaCached(ctx, p, preset)
 		out[p.Name] = snap
@@ -3170,9 +3189,18 @@ func (h *AdminHandler) securitySettingsAPI(w http.ResponseWriter, r *http.Reques
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		cfg := h.store.Snapshot()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "ok",
+			"status":                              "ok",
+			"allow_localhost_no_auth":            cfg.AllowLocalhostNoAuth,
+			"allow_host_docker_internal_no_auth": cfg.AllowHostDockerInternalNoAuth,
+			"auto_enable_public_free_models":     cfg.AutoEnablePublicFreeModels,
+			"auto_remove_expired_tokens":         cfg.AutoRemoveExpiredTokens,
+			"auto_remove_empty_quota_tokens":     cfg.AutoRemoveEmptyQuotaTokens,
 		})
+		if h.runAccessTokenCleanup != nil {
+			h.runAccessTokenCleanup()
+		}
 		if h.healthChecker != nil {
 			h.healthChecker.Trigger()
 		}
@@ -3355,6 +3383,17 @@ func (h *AdminHandler) networkApplyAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "http_mode must be one of enabled, when_required, disabled", http.StatusBadRequest)
 		return
 	}
+	if httpMode == "disabled" && r.TLS == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status": "error",
+			"error":  "don't saw off your ui legs",
+		})
+		return
+	}
+	if httpMode == "disabled" && !cfg.TLS.Enabled {
+		http.Error(w, "cannot disable http listener while tls is not enabled", http.StatusBadRequest)
+		return
+	}
 	if cfg.TLS.Enabled && strings.ToLower(strings.TrimSpace(cfg.TLS.Mode)) == "letsencrypt" && httpMode == "disabled" {
 		http.Error(w, "http_mode cannot be disabled while letsencrypt tls is enabled", http.StatusBadRequest)
 		return
@@ -3368,10 +3407,57 @@ func (h *AdminHandler) networkApplyAPI(w http.ResponseWriter, r *http.Request) {
 	if oldAddr == "" {
 		oldAddr = "127.0.0.1:8080"
 	}
+	if newAddr == oldAddr && httpMode == strings.ToLower(strings.TrimSpace(cfg.HTTPMode)) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":      "ok",
+			"http_mode":   httpMode,
+			"bind_mode":   bindMode,
+			"custom_bind": customBind,
+			"port":        port,
+			"new_addr":    newAddr,
+			"old_addr":    oldAddr,
+		})
+		return
+	}
 	if cfg.TLS.Enabled {
 		if newAddr != oldAddr {
 			http.Error(w, "network bind/port apply is not supported while TLS listener mode is enabled", http.StatusBadRequest)
 			return
+		}
+		if httpMode == "disabled" && r.TLS == nil {
+			tlsAddr := strings.TrimSpace(cfg.TLS.ListenAddr)
+			if tlsAddr == "" {
+				tlsAddr = ":443"
+			}
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"status":    "transition_required",
+				"error":     "switch admin to https before disabling http listener",
+				"https_url": redirectURLForListenerWithScheme(r, tlsAddr, "https"),
+			})
+			return
+		}
+		h.networkMu.Lock()
+		addFn := h.addListener
+		removeFn := h.removeListener
+		h.networkMu.Unlock()
+		if httpMode == "enabled" {
+			if addFn == nil {
+				http.Error(w, "listener control unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if err := addFn(oldAddr); err != nil {
+				http.Error(w, "failed to enable http listener: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+		} else {
+			if removeFn == nil {
+				http.Error(w, "listener control unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if err := removeFn(oldAddr); err != nil {
+				http.Error(w, "failed to disable http listener: "+err.Error(), http.StatusBadGateway)
+				return
+			}
 		}
 		if err := h.store.Update(func(c *config.ServerConfig) error {
 			c.HTTPMode = httpMode
@@ -5745,6 +5831,35 @@ func quotaModelIsIncluded(providerName, providerType, modelID string, quota map[
 
 func (h *AdminHandler) catalogProviders() []config.ProviderConfig {
 	return h.resolver.ListProviders()
+}
+
+func (h *AdminHandler) quotaProviders() []config.ProviderConfig {
+	active := h.catalogProviders()
+	out := make([]config.ProviderConfig, 0, len(active))
+	seen := map[string]struct{}{}
+	for _, p := range active {
+		out = append(out, p)
+		if n := strings.TrimSpace(p.Name); n != "" {
+			seen[n] = struct{}{}
+		}
+	}
+	cfg := h.store.Snapshot()
+	for _, p := range cfg.Providers {
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		resolved := h.applyPresetProviderDefaults(p)
+		if strings.TrimSpace(resolved.Name) == "" {
+			resolved.Name = name
+		}
+		out = append(out, resolved)
+		seen[name] = struct{}{}
+	}
+	return out
 }
 
 func (h *AdminHandler) applyPresetProviderDefaults(p config.ProviderConfig) config.ProviderConfig {
