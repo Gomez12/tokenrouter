@@ -393,6 +393,12 @@
     "docs_url": "https://docs.api.nvidia.com/nim/reference/llm-apis",
     "api_key_env": "NVIDIA_API_KEY",
     "compatibility": "openai-compatible",
+    "quota_reader": "nvidia_unknown",
+    "quota_free_models_by_plan": {
+      "*": [
+        "*"
+      ]
+    },
     "free_tier_with_key": true,
     "trial_credits": true,
     "get_api_key_url": "https://build.nvidia.com/settings/api-keys",
@@ -485,6 +491,7 @@
     "docs_url": "https://openrouter.ai/docs/quickstart",
     "api_key_env": "OPENROUTER_API_KEY",
     "compatibility": "openai-compatible",
+    "quota_reader": "openrouter_key",
     "free_tier_with_key": true,
     "get_api_key_url": "https://openrouter.ai/settings/keys",
     "auth_portal_url": "https://openrouter.ai/settings/keys",

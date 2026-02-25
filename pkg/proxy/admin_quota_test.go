@@ -156,6 +156,69 @@ func TestReadProviderQuotaCachedUsesTTL(t *testing.T) {
 	}
 }
 
+func TestReadAutoHeaderQuotaAllowsPublicNoAuthProviderWithoutKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"claude-sonnet-4-5"}]}`))
+		case "/v1/chat/completions":
+			http.Error(w, `{"error":"missing api key"}`, http.StatusUnauthorized)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:         "opencode-zen",
+		ProviderType: "opencode-zen",
+		BaseURL:      srv.URL + "/v1",
+	}
+	snap := h.readAutoHeaderQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "opencode-zen",
+		Reader:       "header_auto",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if snap.Error != "" {
+		t.Fatalf("expected empty error, got %q", snap.Error)
+	}
+	if snap.PlanType != "public" {
+		t.Fatalf("expected public plan type, got %q", snap.PlanType)
+	}
+	if snap.LeftPercent != 100 {
+		t.Fatalf("expected left percent 100, got %v", snap.LeftPercent)
+	}
+}
+
+func TestReadAutoHeaderQuotaRequiresKeyForNonPublicProvider(t *testing.T) {
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:         "nvidia",
+		ProviderType: "nvidia",
+		BaseURL:      "https://integrate.api.nvidia.com/v1",
+	}
+	snap := h.readAutoHeaderQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "nvidia",
+		Reader:       "header_auto",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "error" {
+		t.Fatalf("expected error status, got %+v", snap)
+	}
+	if snap.Error != "missing api key" {
+		t.Fatalf("expected missing api key, got %q", snap.Error)
+	}
+}
+
 func TestReadGoogleAntigravityQuotaParsesMetrics(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1internal:loadCodeAssist" {
@@ -814,6 +877,179 @@ func TestReadHuggingFaceQuotaTinyChatTriesMultipleModels(t *testing.T) {
 	}
 	if len(snap.Metrics) == 0 {
 		t.Fatalf("expected quota metrics, got none")
+	}
+}
+
+func TestReadOpenRouterQuotaParsesKeyPayload(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/key" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-or-test" {
+			t.Fatalf("unexpected auth header: %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"is_free_tier": false,
+				"limit": 25,
+				"limit_remaining": 20,
+				"limit_reset": "3600",
+				"rate_limit": {"requests": 60, "interval": "1m"}
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "openrouter-main",
+		BaseURL: srv.URL + "/api/v1",
+		APIKey:  "sk-or-test",
+	}
+	snap := h.readOpenRouterQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "openrouter",
+		Reader:       "openrouter_key",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if snap.PlanType != "paid" {
+		t.Fatalf("expected paid plan type, got %q", snap.PlanType)
+	}
+	if snap.LeftPercent != 80 {
+		t.Fatalf("expected left percent 80, got %v", snap.LeftPercent)
+	}
+	if snap.ResetAt == "" {
+		t.Fatal("expected reset_at to be set")
+	}
+	if len(snap.Metrics) < 1 {
+		t.Fatalf("expected quota metrics, got %+v", snap.Metrics)
+	}
+}
+
+func TestReadOpenRouterQuotaSupportsUnlimitedKeyPayload(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"is_free_tier": true,
+				"limit": null,
+				"limit_remaining": null,
+				"limit_reset": null,
+				"rate_limit": {"requests": -1, "interval": "10s"}
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "openrouter-main",
+		BaseURL: srv.URL + "/api/v1",
+		APIKey:  "sk-or-test",
+	}
+	snap := h.readOpenRouterQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "openrouter",
+		Reader:       "openrouter_key",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if snap.PlanType != "free" {
+		t.Fatalf("expected free plan type, got %q", snap.PlanType)
+	}
+	if snap.LeftPercent != 100 {
+		t.Fatalf("expected left percent 100 for unlimited key, got %v", snap.LeftPercent)
+	}
+}
+
+func TestReadOpenRouterQuotaParsesCalendarResetHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"is_free_tier": false,
+				"limit": 100,
+				"limit_remaining": 70,
+				"limit_reset": "monthly"
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "openrouter-main",
+		BaseURL: srv.URL + "/api/v1",
+		APIKey:  "sk-or-test",
+	}
+	snap := h.readOpenRouterQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "openrouter",
+		Reader:       "openrouter_key",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if snap.ResetAt == "" {
+		t.Fatal("expected reset_at for monthly reset hint")
+	}
+}
+
+func TestReadNVIDIAUnknownQuotaRequiresKey(t *testing.T) {
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:         "nvidia-main",
+		ProviderType: "nvidia",
+		BaseURL:      "https://integrate.api.nvidia.com/v1",
+	}
+	snap := h.readNVIDIAUnknownQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "nvidia",
+		Reader:       "nvidia_unknown",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "error" {
+		t.Fatalf("expected error status without key, got %+v", snap)
+	}
+	if snap.Error != "missing api key" {
+		t.Fatalf("expected missing api key, got %q", snap.Error)
+	}
+}
+
+func TestReadNVIDIAUnknownQuotaReturnsUnknownWithKey(t *testing.T) {
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:         "nvidia-main",
+		ProviderType: "nvidia",
+		BaseURL:      "https://integrate.api.nvidia.com/v1",
+		APIKey:       "nvapi-test",
+	}
+	snap := h.readNVIDIAUnknownQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "nvidia",
+		Reader:       "nvidia_unknown",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status with key, got %+v", snap)
+	}
+	if snap.PlanType != "unknown" {
+		t.Fatalf("expected unknown plan type, got %q", snap.PlanType)
+	}
+	if snap.Error != "" {
+		t.Fatalf("expected empty error, got %q", snap.Error)
 	}
 }
 

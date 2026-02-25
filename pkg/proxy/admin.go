@@ -95,6 +95,7 @@ type oauthSession struct {
 
 type quotaCacheValue struct {
 	Snapshot   ProviderQuotaSnapshot
+	LastGood   ProviderQuotaSnapshot
 	Refreshing bool
 }
 
@@ -783,18 +784,6 @@ func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []confi
 				DisplayName:    p.Name,
 			}
 		}
-		reader := quotaReaderFromPreset(preset)
-		if reader == "" {
-			if cached, _, ok := h.quotaCache.Get(p.Name); ok && cached.Snapshot.Provider != "" {
-				out[p.Name] = cached.Snapshot
-			} else {
-				snap := newProviderQuotaSnapshot(time.Now().UTC(), p, preset, reader)
-				snap.Status = "unsupported"
-				snap.Error = "quota reader unavailable"
-				out[p.Name] = snap
-			}
-			continue
-		}
 		snap := h.readProviderQuotaCached(ctx, p, preset)
 		out[p.Name] = snap
 	}
@@ -805,7 +794,11 @@ func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []confi
 }
 
 func quotaReaderFromPreset(preset assets.PopularProvider) string {
-	return strings.TrimSpace(preset.QuotaReader)
+	reader := strings.TrimSpace(preset.QuotaReader)
+	if reader == "" {
+		return "header_auto"
+	}
+	return reader
 }
 
 func popularProvidersByName() (map[string]assets.PopularProvider, error) {
@@ -852,6 +845,12 @@ func (h *AdminHandler) runQuotaReader(ctx context.Context, p config.ProviderConf
 		return h.readOpenAICodexQuota(ctx, p, snap)
 	case "google_antigravity":
 		return h.readGoogleAntigravityQuota(ctx, p, snap)
+	case "openrouter_key":
+		return h.readOpenRouterQuota(ctx, p, snap)
+	case "nvidia_unknown":
+		return h.readNVIDIAUnknownQuota(ctx, p, snap)
+	case "header_auto":
+		return h.readAutoHeaderQuota(ctx, p, snap)
 	case "groq_headers":
 		return h.readGroqQuota(ctx, p, snap)
 	case "mistral_headers":
@@ -861,8 +860,286 @@ func (h *AdminHandler) runQuotaReader(ctx context.Context, p config.ProviderConf
 	case "cerebras_headers":
 		return h.readCerebrasQuota(ctx, p, snap)
 	default:
-		snap.Error = "unsupported quota reader"
+		return h.readAutoHeaderQuota(ctx, p, snap)
+	}
+}
+
+func (h *AdminHandler) readAutoHeaderQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
+	preset, _ := presetForProvider(p)
+	token := providerTokenPreferAPIKey(p)
+	allowNoAuth := token == "" && preset.PublicFreeNoAuth
+	if token == "" && !allowNoAuth {
+		snap.Error = "missing api key"
 		return snap
+	}
+	baseURL := providerBaseURLOrPreset(p, preset)
+	if baseURL == "" {
+		snap.Error = "base_url is required"
+		return snap
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		snap.Error = "invalid base_url"
+		return snap
+	}
+	u.Path = joinProviderPath(u.Path, "/v1/models")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		snap.Error = "failed to build request"
+		return snap
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		if allowNoAuth {
+			snap.Status = "ok"
+			snap.Error = ""
+			snap.PlanType = "public"
+			snap.LeftPercent = 100
+			return snap
+		}
+		snap.Error = err.Error()
+		return snap
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		if allowNoAuth {
+			snap.Status = "ok"
+			snap.Error = ""
+			snap.PlanType = "public"
+			snap.LeftPercent = 100
+			return snap
+		}
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = fmt.Sprintf("status %d", resp.StatusCode)
+		}
+		snap.Error = msg
+		return snap
+	}
+
+	metrics := autoQuotaMetricsFromHeaders(resp.Header)
+	if len(metrics) == 0 {
+		candidates := quotaProbeModelCandidates(preset, body)
+		if len(candidates) > 0 {
+			probeResp, probeErr := sendTinyChatProbe(ctx, baseURL, token, candidates[0])
+			if probeErr == nil {
+				_, _ = io.ReadAll(io.LimitReader(probeResp.Body, 8*1024))
+				metrics = autoQuotaMetricsFromHeaders(probeResp.Header)
+				probeResp.Body.Close()
+			}
+		}
+	}
+	if len(metrics) == 0 {
+		if allowNoAuth {
+			snap.Status = "ok"
+			snap.Error = ""
+			snap.PlanType = "public"
+			snap.LeftPercent = 100
+			return snap
+		}
+		snap.Error = "quota headers unavailable"
+		return snap
+	}
+	best := metrics[0]
+	for _, m := range metrics {
+		if strings.Contains(strings.ToLower(m.MeteredFeature), "request") {
+			best = m
+			break
+		}
+	}
+	snap.Status = "ok"
+	snap.Error = ""
+	snap.Metrics = metrics
+	snap.LeftPercent = best.LeftPercent
+	snap.ResetAt = best.ResetAt
+	snap.PlanType = "auto"
+	return snap
+}
+
+func (h *AdminHandler) readOpenRouterQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
+	token := providerTokenPreferAPIKey(p)
+	if token == "" {
+		snap.Error = "missing api key"
+		return snap
+	}
+	preset, _ := presetForProvider(p)
+	baseURL := providerBaseURLOrPreset(p, preset)
+	if baseURL == "" {
+		snap.Error = "base_url is required"
+		return snap
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		snap.Error = "invalid base_url"
+		return snap
+	}
+	u.Path = joinProviderPath(u.Path, "/key")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		snap.Error = "failed to build request"
+		return snap
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		snap.Error = err.Error()
+		return snap
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = fmt.Sprintf("status %d", resp.StatusCode)
+		}
+		snap.Error = msg
+		return snap
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		snap.Error = "invalid quota payload"
+		return snap
+	}
+	data := asMap(payload["data"])
+	if len(data) == 0 {
+		data = payload
+	}
+
+	now := time.Now().UTC()
+	metrics := make([]ProviderQuotaMetric, 0, 2)
+	planType := "paid"
+	if b, ok := data["is_free_tier"].(bool); ok && b {
+		planType = "free"
+	}
+
+	limit, hasLimit := asFloat(firstMapValue(data, "limit"))
+	remaining, hasRemaining := asFloat(firstMapValue(data, "limit_remaining", "remaining"))
+	if !hasRemaining && hasLimit {
+		if usage, ok := asFloat(firstMapValue(data, "usage")); ok {
+			remaining = limit - usage
+			hasRemaining = true
+		}
+	}
+	resetAt := parseRateLimitResetAt(now, asString(firstMapValue(data, "limit_reset", "reset_at", "resetAt")))
+	if resetAt == "" {
+		resetAt = parseOpenRouterResetAt(now, asString(firstMapValue(data, "limit_reset", "reset_at", "resetAt")))
+	}
+	if hasLimit && limit > 0 && hasRemaining {
+		if remaining < 0 {
+			remaining = 0
+		}
+		if remaining > limit {
+			remaining = limit
+		}
+		used := limit - remaining
+		if used < 0 {
+			used = 0
+		}
+		leftPercent := (remaining / limit) * 100
+		metrics = append(metrics, ProviderQuotaMetric{
+			Key:            "openrouter:spend",
+			MeteredFeature: "credits",
+			Window:         "quota",
+			LeftPercent:    leftPercent,
+			UsedValue:      used,
+			RemainingValue: remaining,
+			LimitValue:     limit,
+			Unit:           "usd",
+			ResetAt:        resetAt,
+		})
+		snap.LeftPercent = leftPercent
+		snap.ResetAt = resetAt
+	} else {
+		// OpenRouter allows unbounded keys; avoid presenting this as an error.
+		snap.LeftPercent = 100
+		snap.ResetAt = resetAt
+	}
+
+	if rate := asMap(data["rate_limit"]); len(rate) > 0 {
+		reqLimit, hasReqLimit := asFloat(firstMapValue(rate, "requests", "limit"))
+		if hasReqLimit && reqLimit > 0 {
+			interval := asString(firstMapValue(rate, "interval", "window"))
+			var windowSeconds int64
+			if d, ok := parseDurationLike(interval); ok && d > 0 {
+				windowSeconds = int64(d / time.Second)
+			}
+			window := normalizeQuotaWindowLabel(interval, windowSeconds)
+			metrics = append(metrics, ProviderQuotaMetric{
+				Key:            "openrouter:requests-rate",
+				MeteredFeature: "requests",
+				Window:         window,
+				WindowSeconds:  windowSeconds,
+				LeftPercent:    100,
+				UsedValue:      0,
+				RemainingValue: reqLimit,
+				LimitValue:     reqLimit,
+				Unit:           "requests",
+			})
+		}
+	}
+
+	snap.Status = "ok"
+	snap.Error = ""
+	snap.Metrics = metrics
+	snap.PlanType = planType
+	return snap
+}
+
+func (h *AdminHandler) readNVIDIAUnknownQuota(ctx context.Context, p config.ProviderConfig, snap ProviderQuotaSnapshot) ProviderQuotaSnapshot {
+	_ = ctx
+	token := providerTokenPreferAPIKey(p)
+	if token == "" {
+		snap.Error = "missing api key"
+		return snap
+	}
+	// NVIDIA requires an API key, but available quota/reset values are not reliably exposed.
+	snap.Status = "ok"
+	snap.Error = ""
+	snap.PlanType = "unknown"
+	snap.LeftPercent = 100
+	snap.ResetAt = ""
+	snap.Metrics = nil
+	return snap
+}
+
+func parseOpenRouterResetAt(now time.Time, raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return ""
+	}
+	base := now.UTC()
+	switch s {
+	case "hour", "hourly":
+		return base.Truncate(time.Hour).Add(time.Hour).Format(time.RFC3339)
+	case "day", "daily":
+		start := time.Date(base.Year(), base.Month(), base.Day(), 0, 0, 0, 0, time.UTC)
+		return start.Add(24 * time.Hour).Format(time.RFC3339)
+	case "week", "weekly":
+		// Normalize to next Monday 00:00 UTC.
+		start := time.Date(base.Year(), base.Month(), base.Day(), 0, 0, 0, 0, time.UTC)
+		weekday := int(start.Weekday())
+		// Go weekday: Sunday=0. Convert to ISO weekday with Monday=1..Sunday=7.
+		isoWeekday := weekday
+		if isoWeekday == 0 {
+			isoWeekday = 7
+		}
+		daysUntilMonday := 8 - isoWeekday
+		return start.Add(time.Duration(daysUntilMonday) * 24 * time.Hour).Format(time.RFC3339)
+	case "month", "monthly":
+		start := time.Date(base.Year(), base.Month(), 1, 0, 0, 0, 0, time.UTC)
+		return start.AddDate(0, 1, 0).Format(time.RFC3339)
+	case "year", "yearly", "annual", "annually":
+		start := time.Date(base.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+		return start.AddDate(1, 0, 0).Format(time.RFC3339)
+	default:
+		return ""
 	}
 }
 
@@ -875,6 +1152,9 @@ func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.Pro
 		snap := val.Snapshot
 		if snap.Provider == "" {
 			snap = newProviderQuotaSnapshot(now, p, preset, reader)
+		}
+		if strings.ToLower(strings.TrimSpace(snap.Status)) != "ok" && val.LastGood.Provider != "" {
+			snap = val.LastGood
 		}
 		if !val.Refreshing && !expiry.IsZero() && !now.Before(expiry) {
 			val.Refreshing = true
@@ -889,6 +1169,7 @@ func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.Pro
 	snap.Error = ""
 	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
 		Snapshot:   snap,
+		LastGood:   ProviderQuotaSnapshot{},
 		Refreshing: true,
 	}, now, quotaRefreshError)
 	h.quotaMu.Unlock()
@@ -928,13 +1209,20 @@ func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, pre
 
 	nextDelay := quotaRefreshError
 	storeSnap := snap
-	if snap.Status != "ok" {
-		if prev, _, ok := h.quotaCache.Get(p.Name); ok {
-			if strings.EqualFold(strings.TrimSpace(prev.Snapshot.Status), "ok") {
-				// Preserve last known-good quota snapshot and retry in background.
-				storeSnap = prev.Snapshot
-			}
+	lastGood := ProviderQuotaSnapshot{}
+	if prev, _, ok := h.quotaCache.Get(p.Name); ok {
+		lastGood = prev.LastGood
+		if lastGood.Provider == "" && strings.EqualFold(strings.TrimSpace(prev.Snapshot.Status), "ok") {
+			lastGood = prev.Snapshot
 		}
+	}
+	if snap.Status != "ok" {
+		if lastGood.Provider != "" {
+			// Preserve last known-good quota snapshot and retry in background.
+			storeSnap = lastGood
+		}
+	} else {
+		lastGood = snap
 	}
 	if snap.Status == "ok" {
 		nextDelay = quotaRefreshOK
@@ -942,6 +1230,7 @@ func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, pre
 	h.quotaMu.Lock()
 	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
 		Snapshot:   storeSnap,
+		LastGood:   lastGood,
 		Refreshing: false,
 	}, now, nextDelay)
 	h.quotaMu.Unlock()
@@ -1019,6 +1308,7 @@ func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header h
 	h.quotaMu.Lock()
 	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
 		Snapshot:   snap,
+		LastGood:   snap,
 		Refreshing: false,
 	}, now, quotaRefreshOK)
 	h.quotaMu.Unlock()
@@ -1809,7 +2099,9 @@ func sendTinyChatProbe(ctx context.Context, baseURL string, token string, modelI
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
