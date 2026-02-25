@@ -2,8 +2,14 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	neturl "net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/lkarlslund/tokenrouter/pkg/config"
 	"github.com/lkarlslund/tokenrouter/pkg/provider"
@@ -44,6 +50,20 @@ type ProviderResolver struct {
 	store *config.ServerConfigStore
 }
 
+const autoProviderProbeTTL = 20 * time.Second
+
+var autoProviderProbeFn = probeAutoProviderOnline
+
+var autoProviderProbeState struct {
+	mu    sync.Mutex
+	byKey map[string]autoProviderProbeResult
+}
+
+type autoProviderProbeResult struct {
+	checkedAt time.Time
+	online    bool
+}
+
 func NewProviderResolver(store *config.ServerConfigStore) *ProviderResolver {
 	return &ProviderResolver{store: store}
 }
@@ -76,12 +96,155 @@ func (r *ProviderResolver) ListProviders() []config.ProviderConfig {
 				if _, ok := seen[p.Name]; ok {
 					continue
 				}
-				out = append(out, p.AsProviderConfig())
+				candidate := p.AsProviderConfig()
+				if !autoProviderOnline(candidate) {
+					// Keep auto public-free providers virtually disabled until endpoint is reachable.
+					continue
+				}
+				out = append(out, candidate)
 				seen[p.Name] = struct{}{}
 			}
 		}
 	}
 	return out
+}
+
+func autoLMStudioOnline(p config.ProviderConfig) bool {
+	return autoProviderOnline(p)
+}
+
+func autoProviderOnline(p config.ProviderConfig) bool {
+	now := time.Now().UTC()
+	key := strings.ToLower(strings.TrimSpace(p.Name)) + "|" + strings.TrimSpace(p.BaseURL)
+	autoProviderProbeState.mu.Lock()
+	if autoProviderProbeState.byKey == nil {
+		autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+	}
+	if prev, ok := autoProviderProbeState.byKey[key]; ok && !prev.checkedAt.IsZero() && now.Sub(prev.checkedAt) < autoProviderProbeTTL {
+		online := prev.online
+		autoProviderProbeState.mu.Unlock()
+		return online
+	}
+	autoProviderProbeState.mu.Unlock()
+
+	online := false
+	if autoProviderProbeFn != nil {
+		online = autoProviderProbeFn(p)
+	}
+
+	autoProviderProbeState.mu.Lock()
+	autoProviderProbeState.byKey[key] = autoProviderProbeResult{
+		checkedAt: now,
+		online:    online,
+	}
+	autoProviderProbeState.mu.Unlock()
+	return online
+}
+
+func probeAutoProviderOnline(p config.ProviderConfig) bool {
+	name := strings.ToLower(strings.TrimSpace(p.Name))
+	switch name {
+	case "lmstudio":
+		return probeLMStudioOnline(p)
+	case "ollama":
+		return probeOllamaOnline(p)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+	_, err := NewProviderClient(p).ListModels(ctx)
+	return err == nil
+}
+
+func probeLMStudioOnline(p config.ProviderConfig) bool {
+	baseURL := strings.TrimSpace(p.BaseURL)
+	if baseURL == "" {
+		return false
+	}
+	u, err := neturl.Parse(baseURL)
+	if err != nil || strings.TrimSpace(u.Scheme) == "" || strings.TrimSpace(u.Host) == "" {
+		return false
+	}
+	root := &neturl.URL{Scheme: u.Scheme, Host: u.Host}
+	cli := &http.Client{Timeout: 1200 * time.Millisecond}
+
+	// Reject known Ollama signature quickly; avoids false auto-enable on :1234.
+	ollamaURL := *root
+	ollamaURL.Path = "/api/tags"
+	if req, err := http.NewRequest(http.MethodGet, ollamaURL.String(), nil); err == nil {
+		if resp, err := cli.Do(req); err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8*1024))
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+				return false
+			}
+		}
+	}
+
+	// Require LM Studio native endpoint to be present.
+	lmsURL := *root
+	lmsURL.Path = "/api/v0/models"
+	req, err := http.NewRequest(http.MethodGet, lmsURL.String(), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return false
+	}
+	var decoded any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return false
+	}
+	switch decoded.(type) {
+	case []any, map[string]any:
+		return true
+	default:
+		return false
+	}
+}
+
+func probeOllamaOnline(p config.ProviderConfig) bool {
+	baseURL := strings.TrimSpace(p.BaseURL)
+	if baseURL == "" {
+		return false
+	}
+	u, err := neturl.Parse(baseURL)
+	if err != nil || strings.TrimSpace(u.Scheme) == "" || strings.TrimSpace(u.Host) == "" {
+		return false
+	}
+	root := &neturl.URL{Scheme: u.Scheme, Host: u.Host}
+	cli := &http.Client{Timeout: 1200 * time.Millisecond}
+	tagsURL := *root
+	tagsURL.Path = "/api/tags"
+	req, err := http.NewRequest(http.MethodGet, tagsURL.String(), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	var out struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return false
+	}
+	return out.Models != nil
 }
 
 func resolveProviderWithDefaults(p config.ProviderConfig, preset config.ProviderConfig) config.ProviderConfig {

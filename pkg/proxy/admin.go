@@ -778,12 +778,20 @@ func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []confi
 		providerType := providerTypeOrName(p)
 		preset, ok := byName[providerType]
 		if !ok {
-			continue
+			preset = assets.PopularProvider{
+				ProviderConfig: config.ProviderConfig{Name: providerType},
+				DisplayName:    p.Name,
+			}
 		}
 		reader := quotaReaderFromPreset(preset)
 		if reader == "" {
 			if cached, _, ok := h.quotaCache.Get(p.Name); ok && cached.Snapshot.Provider != "" {
 				out[p.Name] = cached.Snapshot
+			} else {
+				snap := newProviderQuotaSnapshot(time.Now().UTC(), p, preset, reader)
+				snap.Status = "unsupported"
+				snap.Error = "quota reader unavailable"
+				out[p.Name] = snap
 			}
 			continue
 		}
@@ -859,6 +867,7 @@ func (h *AdminHandler) runQuotaReader(ctx context.Context, p config.ProviderConf
 }
 
 func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider) ProviderQuotaSnapshot {
+	_ = ctx
 	now := time.Now().UTC()
 	reader := quotaReaderFromPreset(preset)
 	h.quotaMu.Lock()
@@ -875,9 +884,16 @@ func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.Pro
 		h.quotaMu.Unlock()
 		return snap
 	}
+	snap := newProviderQuotaSnapshot(now, p, preset, reader)
+	snap.Status = "loading"
+	snap.Error = ""
+	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
+		Snapshot:   snap,
+		Refreshing: true,
+	}, now, quotaRefreshError)
 	h.quotaMu.Unlock()
-	// First lookup is synchronous so callers get immediate usable data.
-	return h.computeProviderQuotaAndStore(p, preset)
+	go h.refreshProviderQuota(p, preset)
+	return snap
 }
 
 func newProviderQuotaSnapshot(now time.Time, p config.ProviderConfig, preset assets.PopularProvider, reader string) ProviderQuotaSnapshot {
@@ -3588,6 +3604,10 @@ func (h *AdminHandler) providersAPI(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			// Auto-merged providers should be silent when offline.
+			if !item.Managed && strings.EqualFold(strings.TrimSpace(item.Status), "offline") {
+				continue
+			}
 			out = append(out, item)
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -4609,6 +4629,11 @@ func (h *AdminHandler) refreshModelsAPI(w http.ResponseWriter, r *http.Request) 
 
 func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) {
 	providers := h.catalogProviders()
+	cfg := h.store.Snapshot()
+	configuredByName := make(map[string]struct{}, len(cfg.Providers))
+	for _, p := range cfg.Providers {
+		configuredByName[p.Name] = struct{}{}
+	}
 	quotaSnapshots := h.readProviderQuotas(r.Context(), providers)
 	popularByType := map[string]assets.PopularProvider{}
 	if popular, err := getPopularProviders(); err == nil {
@@ -4657,6 +4682,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 	}
 	for _, p := range providers {
 		providerType := providerTypeOrName(p)
+		_, managed := configuredByName[p.Name]
 		status := "online"
 		cards, err := NewProviderClient(p).ListModels(r.Context())
 		if err != nil {
@@ -4664,6 +4690,10 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 			if IsProviderAuthError(err) {
 				status = "auth problem"
 			}
+		}
+		if !managed && strings.EqualFold(strings.TrimSpace(status), "offline") {
+			// Auto-merged providers should be silent when offline.
+			continue
 		}
 		providerStatus[p.Name] = status
 		var providerResponseMS int64
@@ -4752,6 +4782,9 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 		status := providerStatus[pn]
 		if status == "" {
 			status = "cached"
+		}
+		if _, managed := configuredByName[pn]; !managed && strings.EqualFold(strings.TrimSpace(status), "offline") {
+			continue
 		}
 		item := row{
 			Provider:            pn,

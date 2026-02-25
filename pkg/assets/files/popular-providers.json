@@ -282,7 +282,7 @@
   },
   {
     "name": "huggingface",
-    "display_name": "Hugging Face Inference Providers",
+    "display_name": "Hugging Face",
     "base_url": "https://router.huggingface.co/v1",
     "docs_url": "https://huggingface.co/docs/inference-providers/en/index",
     "api_key_env": "HF_TOKEN",
@@ -411,6 +411,18 @@
     "auth_portal_url": "https://ollama.com/settings/keys",
     "source_url": "https://docs.ollama.com/cloud",
     "last_verified_at": "2026-02-24"
+  },
+  {
+    "name": "ollama",
+    "provider_type": "ollama-cloud",
+    "display_name": "Ollama (local)",
+    "base_url": "http://127.0.0.1:11434/v1",
+    "docs_url": "https://ollama.com/blog/openai-compatibility",
+    "api_key_env": "OLLAMA_API_KEY",
+    "compatibility": "openai-compatible",
+    "public_free_no_auth": true,
+    "source_url": "https://ollama.com/blog/openai-compatibility",
+    "last_verified_at": "2026-02-25"
   },
   {
     "name": "openai",

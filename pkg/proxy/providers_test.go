@@ -10,6 +10,18 @@ import (
 )
 
 func TestListProvidersIncludesPublicFreeWhenEnabled(t *testing.T) {
+	prevProbeFn := autoProviderProbeFn
+	autoProviderProbeFn = func(config.ProviderConfig) bool { return true }
+	autoProviderProbeState.mu.Lock()
+	autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+	autoProviderProbeState.mu.Unlock()
+	defer func() {
+		autoProviderProbeFn = prevProbeFn
+		autoProviderProbeState.mu.Lock()
+		autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+		autoProviderProbeState.mu.Unlock()
+	}()
+
 	cfg := config.NewDefaultServerConfig()
 	cfg.Providers = nil
 	cfg.AutoEnablePublicFreeModels = true
@@ -38,6 +50,18 @@ func TestListProvidersIncludesPublicFreeWhenEnabled(t *testing.T) {
 }
 
 func TestResolveWithAutoPublicFreeProvider(t *testing.T) {
+	prevProbeFn := autoProviderProbeFn
+	autoProviderProbeFn = func(config.ProviderConfig) bool { return true }
+	autoProviderProbeState.mu.Lock()
+	autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+	autoProviderProbeState.mu.Unlock()
+	defer func() {
+		autoProviderProbeFn = prevProbeFn
+		autoProviderProbeState.mu.Lock()
+		autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+		autoProviderProbeState.mu.Unlock()
+	}()
+
 	cfg := config.NewDefaultServerConfig()
 	cfg.Providers = nil
 	cfg.AutoEnablePublicFreeModels = true
@@ -223,5 +247,59 @@ func TestResolvePrefersOpenAIProviderForUnqualifiedGPTModel(t *testing.T) {
 	}
 	if model != "gpt-5.3-codex" {
 		t.Fatalf("expected model unchanged, got %q", model)
+	}
+}
+
+func TestProbeLMStudioOnlineRejectsOllamaSignature(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/tags" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"models":[]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	if probeLMStudioOnline(config.ProviderConfig{Name: "lmstudio", BaseURL: srv.URL + "/v1"}) {
+		t.Fatal("expected lmstudio probe to reject ollama signature")
+	}
+}
+
+func TestProbeLMStudioOnlineAcceptsNativeAPI(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			http.NotFound(w, r)
+		case "/api/v0/models":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"id":"qwen2.5-7b-instruct"}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	if !probeLMStudioOnline(config.ProviderConfig{Name: "lmstudio", BaseURL: srv.URL + "/v1"}) {
+		t.Fatal("expected lmstudio probe to accept native api signature")
+	}
+}
+
+func TestProbeOllamaOnlineAcceptsTagsEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/tags" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"models":[]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	if !probeOllamaOnline(config.ProviderConfig{Name: "ollama", BaseURL: srv.URL + "/v1"}) {
+		t.Fatal("expected ollama probe to accept /api/tags signature")
 	}
 }

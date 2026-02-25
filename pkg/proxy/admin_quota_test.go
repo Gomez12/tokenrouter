@@ -131,9 +131,25 @@ func TestReadProviderQuotaCachedUsesTTL(t *testing.T) {
 		QuotaReader:    "openai_codex",
 	}
 	snap1 := h.readProviderQuotaCached(context.Background(), p, preset)
+	if snap1.Status != "loading" && snap1.Status != "ok" {
+		t.Fatalf("expected loading/ok snapshot on first read, got %+v", snap1)
+	}
 	snap2 := h.readProviderQuotaCached(context.Background(), p, preset)
-	if snap1.Status != "ok" || snap2.Status != "ok" {
-		t.Fatalf("expected ok snapshots, got %+v %+v", snap1, snap2)
+	if snap2.Status != "loading" && snap2.Status != "ok" {
+		t.Fatalf("expected loading/ok snapshot on second read, got %+v", snap2)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := h.readProviderQuotaCached(context.Background(), p, preset)
+		if snap.Status == "ok" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	final := h.readProviderQuotaCached(context.Background(), p, preset)
+	if final.Status != "ok" {
+		t.Fatalf("expected eventual ok snapshot, got %+v", final)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("expected one upstream quota request due to cache, got %d", got)

@@ -85,6 +85,9 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelCard, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		if isOllamaProvider(c.Provider) && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed) {
+			return c.listOllamaModels(ctx)
+		}
 		if isOpenAICodexProvider(c.Provider) && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed) {
 			return codexStaticModels(c.Provider.Name), nil
 		}
@@ -102,6 +105,57 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelCard, error) {
 	cards := make([]ModelCard, 0, len(out.Data))
 	for _, m := range out.Data {
 		modelID := NormalizeModelID(m.ID)
+		cards = append(cards, ModelCard{
+			ID:       c.Provider.Name + "/" + modelID,
+			Object:   "model",
+			Provider: c.Provider.Name,
+		})
+	}
+	return cards, nil
+}
+
+func (c *Client) listOllamaModels(ctx context.Context) ([]ModelCard, error) {
+	u, err := url.Parse(strings.TrimRight(c.Provider.BaseURL, "/"))
+	if err != nil {
+		return nil, err
+	}
+	root := &url.URL{Scheme: u.Scheme, Host: u.Host}
+	root.Path = "/api/tags"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, root.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, &HTTPError{
+			Provider:   c.Provider.Name,
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(b)),
+		}
+	}
+	var out struct {
+		Models []struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	cards := make([]ModelCard, 0, len(out.Models))
+	for _, m := range out.Models {
+		modelID := NormalizeModelID(strings.TrimSpace(m.Name))
+		if modelID == "" {
+			modelID = NormalizeModelID(strings.TrimSpace(m.Model))
+		}
+		if modelID == "" {
+			continue
+		}
 		cards = append(cards, ModelCard{
 			ID:       c.Provider.Name + "/" + modelID,
 			Object:   "model",
@@ -262,4 +316,22 @@ func isOpenAICodexProvider(provider config.ProviderConfig) bool {
 	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
 	pathLower := strings.ToLower(strings.Trim(strings.TrimSpace(u.Path), "/"))
 	return host == "chatgpt.com" || strings.Contains(pathLower, "backend-api")
+}
+
+func isOllamaProvider(provider config.ProviderConfig) bool {
+	name := strings.ToLower(strings.TrimSpace(provider.Name))
+	pt := strings.ToLower(strings.TrimSpace(provider.ProviderType))
+	if name == "ollama" || pt == "ollama" {
+		return true
+	}
+	base := strings.TrimSpace(provider.BaseURL)
+	if base == "" {
+		return false
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	return host == "127.0.0.1" || host == "localhost"
 }

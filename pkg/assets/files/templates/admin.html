@@ -102,6 +102,11 @@
       pointer-events: none;
     }
 
+    code {
+      color: #8cff9a !important;
+      text-shadow: 0 0 8px color-mix(in srgb, #8cff9a 45%, transparent);
+    }
+
     .nav-tabs .nav-link.active {
       box-shadow:
         -6px 0 10px -8px color-mix(in srgb, var(--bs-primary) 45%, transparent),
@@ -145,13 +150,40 @@
       <button class="nav-link rounded-top" :class="activeTab==='status' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('status')">Status</button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='quota' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('quota')">Quota</button>
+      <button class="nav-link rounded-top" :class="activeTab==='quota' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('quota')">
+        <span>Quota</span>
+        <span
+          x-show="hasAnyProviderOutOfQuota()"
+          style="display:none;width:1.05rem;height:1.05rem;line-height:1.05rem;font-size:0.74rem;"
+          class="ms-1 d-inline-flex align-items-center justify-content-center rounded-circle bg-danger text-white fw-bold align-middle"
+          title="One or more providers are fully out of quota."
+        >!</span>
+      </button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='providers' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('providers')">Providers</button>
+      <button class="nav-link rounded-top" :class="activeTab==='providers' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('providers')">
+        <span>Providers</span>
+        <span
+          x-show="(providers || []).some((p) => String((p && p.status) || '').trim().toLowerCase() === 'offline')"
+          style="display:none;width:1.05rem;height:1.05rem;line-height:1.05rem;font-size:0.74rem;"
+          class="ms-1 d-inline-flex align-items-center justify-content-center rounded-circle bg-danger text-white fw-bold align-middle"
+          title="One or more providers are failing."
+        >!</span>
+      </button>
     </li>
     <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='access' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('access')">Access</button>
+      <button class="nav-link rounded-top" :class="activeTab==='access' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('access')">
+        <span>Access</span>
+        <span
+          x-show="allowLocalhostNoAuth || allowHostDockerInternalNoAuth"
+          style="display:none;width:1.05rem;height:1.05rem;line-height:1.05rem;font-size:0.74rem;"
+          class="ms-1 d-inline-flex align-items-center justify-content-center rounded-circle bg-warning text-dark fw-bold align-middle"
+          title="Unauthenticated API access is enabled."
+        >!</span>
+      </button>
+    </li>
+    <li class="nav-item">
+      <button class="nav-link rounded-top" :class="activeTab==='network' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('network')">Network</button>
     </li>
     <li class="nav-item">
       <button class="nav-link rounded-top" :class="activeTab==='models' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('models')">Models</button>
@@ -348,7 +380,15 @@
       <div class="card-body">
         <div class="d-flex align-items-center justify-content-between mb-2">
           <h2 class="h5 mb-0">Access Tokens</h2>
-          <div class="d-flex gap-2">
+          <div class="d-flex align-items-center gap-2">
+            <span
+              x-show="allowLocalhostNoAuth || allowHostDockerInternalNoAuth"
+              style="display:none;"
+              class="badge text-bg-warning text-dark"
+              title="Unauthenticated API access is enabled for localhost and/or host.docker.internal."
+            >
+              Warning: unauth access enabled &rarr;
+            </span>
             <button class="icon-btn" title="Access settings" aria-label="Access settings" @click="openAccessSettingsModal()">⚙</button>
             <button class="btn btn-sm btn-primary" @click="openAddAccessTokenModal()">Add Key</button>
           </div>
@@ -356,7 +396,9 @@
         <div class="table-responsive" x-html="accessTokensTableHtml"></div>
       </div>
     </div>
+  </div>
 
+  <div x-show="activeTab==='network'" style="display:none;">
     <div class="card shadow-sm mb-3">
       <div class="card-body">
         <div class="mb-2"><h2 class="h5 mb-0">Let's Encrypt TLS</h2></div>
@@ -394,7 +436,6 @@
         </div>
       </div>
     </div>
-
   </div>
 
   <div x-show="showProvidersSettingsModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeProvidersSettingsModal()">

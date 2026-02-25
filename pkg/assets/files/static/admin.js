@@ -428,6 +428,14 @@ function adminApp() {
       img.onerror = null;
       img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
     },
+    editActionIconSVG() {
+      return '' +
+        '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true">' +
+          '<path d="M15.502 1.94a.5.5 0 0 1 0 .706l-1.043 1.043-2-2L13.502.646a.5.5 0 0 1 .707 0z"/>' +
+          '<path d="M13.752 4.396l-2-2L4.939 9.21a.5.5 0 0 0-.121.196l-.805 2.414a.25.25 0 0 0 .316.316l2.414-.805a.5.5 0 0 0 .196-.12z"/>' +
+          '<path fill-rule="evenodd" d="M1 13.5A1.5 1.5 0 0 0 2.5 15h11A1.5 1.5 0 0 0 15 13.5V6a.5.5 0 0 0-1 0v7.5a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5H10a.5.5 0 0 0 0-1H2.5A1.5 1.5 0 0 0 1 2.5z"/>' +
+        '</svg>';
+    },
     formatPrice(v, currency) {
       if (v === undefined || v === null || Number.isNaN(Number(v))) return '-';
       const n = Number(v);
@@ -1194,6 +1202,42 @@ function adminApp() {
       if (unit === 'requests' || feature.includes('request')) return 'requests';
       return 'other';
     },
+    metricLeftPercent(metric) {
+      if (!metric || typeof metric !== 'object') return null;
+      const limitVal = Number(metric.limit_value || 0);
+      const remainVal = Number(metric.remaining_value);
+      let left = Number(metric.left_percent);
+      if (Number.isFinite(limitVal) && limitVal > 0 && Number.isFinite(remainVal)) {
+        left = (remainVal / limitVal) * 100;
+      }
+      if (!Number.isFinite(left)) return null;
+      return Math.max(0, Math.min(100, left));
+    },
+    hasAnyProviderOutOfQuota() {
+      const map = (this.stats && this.stats.provider_quotas && typeof this.stats.provider_quotas === 'object')
+        ? this.stats.provider_quotas
+        : {};
+      const snaps = Object.values(map);
+      for (let i = 0; i < snaps.length; i++) {
+        const q = snaps[i] || {};
+        if (String(q.status || '').trim().toLowerCase() !== 'ok') continue;
+        const metrics = Array.isArray(q.metrics) ? q.metrics : [];
+        if (metrics.length > 0) {
+          const leftVals = metrics
+            .map((m) => this.metricLeftPercent(m))
+            .filter((v) => Number.isFinite(v));
+          if (leftVals.length > 0 && leftVals.every((v) => v <= 0.000001)) {
+            return true;
+          }
+          continue;
+        }
+        const left = Number(q.left_percent);
+        if (Number.isFinite(left) && left <= 0.000001) {
+          return true;
+        }
+      }
+      return false;
+    },
     chartColor(seed) {
       let h = 0;
       const str = String(seed || '');
@@ -1289,8 +1333,14 @@ function adminApp() {
       const groups = {};
       items.forEach((q) => {
         const status = String(q.status || '');
-        if (status !== 'ok') return;
         const providerName = String(q.display_name || q.provider || 'provider').trim();
+        if (status !== 'ok') {
+          const key = providerName || 'quota';
+          if (!groups[key]) groups[key] = {name: key, provider: providerName, requests: null, tokens: null, other: [], status: status || 'unknown', error: String(q.error || '').trim()};
+          if (!groups[key].status || groups[key].status === 'ok') groups[key].status = status || 'unknown';
+          if (!groups[key].error) groups[key].error = String(q.error || '').trim();
+          return;
+        }
         const metrics = (Array.isArray(q.metrics) && q.metrics.length)
           ? q.metrics
           : [{metered_feature: 'quota', window: '', left_percent: q.left_percent, reset_at: q.reset_at}];
@@ -1304,7 +1354,7 @@ function adminApp() {
             groupName = feature;
           }
           const key = groupName || providerName || 'quota';
-          if (!groups[key]) groups[key] = {name: key, provider: providerName, requests: null, tokens: null, other: []};
+          if (!groups[key]) groups[key] = {name: key, provider: providerName, requests: null, tokens: null, other: [], status: 'ok', error: ''};
           const kind = this.quotaMetricKind(m);
           if (kind === 'requests') groups[key].requests = m;
           else if (kind === 'tokens') groups[key].tokens = m;
@@ -1312,18 +1362,18 @@ function adminApp() {
         });
       });
       const cards = Object.values(groups).sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''))).map((g) => {
-        const metricLeftPercent = (metric) => {
-          if (!metric) return 0;
-          const limitVal = Number(metric.limit_value || 0);
-          const remainVal = Number(metric.remaining_value);
-          let left = Number(metric.left_percent || 0);
-          if (Number.isFinite(limitVal) && limitVal > 0 && Number.isFinite(remainVal)) left = (remainVal / limitVal) * 100;
-          return Math.max(0, Math.min(100, left));
-        };
+        if (String(g.status || '').toLowerCase() !== 'ok') {
+          const msg = this.escapeHtml(String(g.error || g.status || 'quota unavailable'));
+          return '<div class="border rounded p-2 bg-body">' +
+            '<div class="fw-semibold small mb-2" title="' + this.escapeHtml(g.name || 'quota') + '" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + this.escapeHtml(g.name || 'quota') + '</div>' +
+            '<div class="small text-body-secondary">Quota unavailable</div>' +
+            '<div class="small text-danger mt-1">' + msg + '</div>' +
+          '</div>';
+        }
         const ringColorFromUsed = (used) => (used >= 90 ? '#dc3545' : (used >= 70 ? '#fd7e14' : '#198754'));
         const renderCircle = (metric, label) => {
           if (!metric) return '';
-          const left = metricLeftPercent(metric);
+          const left = Number(this.metricLeftPercent(metric) || 0);
           const used = Math.max(0, Math.min(100, 100 - left));
           const ringColor = ringColorFromUsed(used);
           const tip = this.escapeHtml(this.quotaTooltipText(metric));
@@ -1337,8 +1387,8 @@ function adminApp() {
         };
         const renderDualCircle = (reqMetric, tokMetric) => {
           if (!reqMetric || !tokMetric) return '';
-          const reqLeft = metricLeftPercent(reqMetric);
-          const tokLeft = metricLeftPercent(tokMetric);
+          const reqLeft = Number(this.metricLeftPercent(reqMetric) || 0);
+          const tokLeft = Number(this.metricLeftPercent(tokMetric) || 0);
           const reqUsed = Math.max(0, Math.min(100, 100 - reqLeft));
           const tokUsed = Math.max(0, Math.min(100, 100 - tokLeft));
           const reqColor = ringColorFromUsed(reqUsed);
@@ -1510,7 +1560,12 @@ function adminApp() {
         let totalModels = modelCount;
         if (totalModels <= 0 && pricedCount > 0) totalModels = pricedCount;
         const unknownCount = Math.max(0, totalModels - pricedCount);
-        const totalModelsText = totalModels + ' (' + freeCount + ' free, ' + unknownCount + ' unknown)';
+        const paidCount = Math.max(0, pricedCount - freeCount);
+        const totalModelsParts = [];
+        if (freeCount > 0) totalModelsParts.push(freeCount + ' free');
+        if (paidCount > 0) totalModelsParts.push(paidCount + ' paid');
+        if (unknownCount > 0) totalModelsParts.push(unknownCount + ' unknown');
+        const totalModelsText = totalModelsParts.length > 0 ? totalModelsParts.join(', ') : '0';
         const responseMSValue = Number(p.response_ms || 0);
         const responseMS = responseMSValue > 0 ? responseMSValue + 'ms' : '';
         let status = this.escapeHtml(statusRaw);
@@ -1518,18 +1573,23 @@ function adminApp() {
           const detail = [responseMS, ageText].filter(Boolean).join(' ');
           status = this.escapeHtml(detail || 'online');
         }
+        const statusNorm = String(statusRaw || '').trim().toLowerCase();
+        const statusProblem = (statusNorm === 'offline' || statusNorm === 'auth problem' || statusNorm === 'blocked');
+        const statusAlert = statusProblem
+          ? '<span class="ms-1 d-inline-flex align-items-center justify-content-center rounded-circle bg-danger text-white fw-bold align-middle" style="width:1.05rem;height:1.05rem;line-height:1.05rem;font-size:0.74rem;" title="Provider has a problem">!</span>'
+          : '';
         const pricingAge = this.formatAge(p.pricing_last_update);
         const pricingUpdated = this.escapeHtml(pricingAge || '');
         const actionNameAttr = this.escapeHtml(rawName);
         const actions = p.managed
           ? '<div class="d-flex justify-content-end gap-1">' +
-              '<button class="icon-btn" type="button" title="Edit provider" aria-label="Edit provider" data-provider-name="' + actionNameAttr + '" onclick="window.__adminEditProvider(this.getAttribute(\'data-provider-name\'))"><svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M12.146.854a.5.5 0 0 1 .708 0l2.292 2.292a.5.5 0 0 1 0 .708l-8.5 8.5a.5.5 0 0 1-.168.11l-3 1.2a.5.5 0 0 1-.65-.65l1.2-3a.5.5 0 0 1 .11-.168zM11.5 2.207 4.545 9.162l-.733 1.833 1.833-.733L12.6 3.307z"/></svg></button>' +
+              '<button class="icon-btn" type="button" title="Edit provider" aria-label="Edit provider" data-provider-name="' + actionNameAttr + '" onclick="window.__adminEditProvider(this.getAttribute(\'data-provider-name\'))">' + this.editActionIconSVG() + '</button>' +
               '<button class="icon-btn icon-btn-danger" type="button" title="Delete provider" aria-label="Delete provider" data-provider-name="' + actionNameAttr + '" onclick="window.__adminRemoveProvider(this.getAttribute(\'data-provider-name\'))"><svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z"/></svg></button>' +
             '</div>'
           : '<span class="badge text-bg-light border">Auto</span>';
         return '<tr>' +
           '<td>' + providerLabel + '</td>' +
-          '<td>' + status + '</td>' +
+          '<td>' + status + statusAlert + '</td>' +
           '<td>' + this.escapeHtml(totalModelsText) + '</td>' +
           '<td><small>' + pricingUpdated + '</small></td>' +
           '<td>' + actions + '</td>' +
@@ -1541,7 +1601,7 @@ function adminApp() {
       const tableRows = page.rows.join('');
       this.providersTableHtml =
         '<table class="table table-sm align-middle mb-0">' +
-          '<thead><tr><th>Name</th><th>Status</th><th>Total Models</th><th>Pricing Updated</th><th></th></tr></thead>' +
+          '<thead><tr><th>Name</th><th>Status</th><th>Models</th><th>Pricing Updated</th><th></th></tr></thead>' +
           '<tbody>' + (tableRows || '<tr><td colspan="5" class="text-body-secondary">No providers configured.</td></tr>') + '</tbody>' +
         '</table>' +
         this.renderProvidersPager(page.totalRows, page.page, page.totalPages, page.pageSize);
@@ -1635,7 +1695,7 @@ function adminApp() {
           '<td title="' + expiryTitle + '">' + expiry + '</td>' +
           '<td class="text-end">' +
             '<button class="icon-btn me-1" type="button" title="Edit token" aria-label="Edit token" data-token-id="' + id + '" onclick="window.__adminEditAccessToken(this.getAttribute(\'data-token-id\'))">' +
-              '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M12.146.854a.5.5 0 0 1 .708 0l2.292 2.292a.5.5 0 0 1 0 .708l-8.5 8.5a.5.5 0 0 1-.168.11l-3 1.2a.5.5 0 0 1-.65-.65l1.2-3a.5.5 0 0 1 .11-.168zM11.5 2.207 4.545 9.162l-.733 1.833 1.833-.733L12.6 3.307z"/></svg>' +
+              this.editActionIconSVG() +
             '</button>' +
             '<button class="icon-btn icon-btn-danger" type="button" title="Delete token" aria-label="Delete token" data-token-id="' + id + '" onclick="window.__adminDeleteAccessToken(this.getAttribute(\'data-token-id\'))">' +
               '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z"/></svg>' +
