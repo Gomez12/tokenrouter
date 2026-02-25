@@ -1633,7 +1633,7 @@ function adminApp() {
       const renderRoleBadge = (role) => {
         const r = String(role || '').trim().toLowerCase();
         if (r === 'admin') return '<span class="badge text-bg-danger">admin</span>';
-        if (r === 'keymaster') return '<span class="badge text-bg-warning text-dark">keymaster</span>';
+        if (r === 'keymaster') return '<span class="badge text-bg-info">keymaster</span>';
         return '<span class="badge text-bg-secondary">inferrer</span>';
       };
       const formatCountShort = (n) => {
