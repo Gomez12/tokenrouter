@@ -8,7 +8,7 @@ import (
 
 func TestStatsStoreAggregatesInto5MinuteBuckets(t *testing.T) {
 	s := NewStatsStore(100)
-	base := time.Date(2026, 2, 23, 20, 0, 10, 0, time.UTC)
+	base := time.Now().UTC().Add(-3 * time.Minute)
 	s.Add(UsageEvent{
 		Timestamp:      base,
 		Provider:       "openai",
@@ -21,7 +21,7 @@ func TestStatsStoreAggregatesInto5MinuteBuckets(t *testing.T) {
 		GenTPS:         80,
 	})
 	s.Add(UsageEvent{
-		Timestamp:      base.Add(2 * time.Minute),
+		Timestamp:      base.Add(90 * time.Second),
 		Provider:       "openai",
 		Model:          "openai/gpt-5",
 		PromptTokens:   50,
@@ -62,9 +62,7 @@ func TestPersistentStatsStoreLoadsFromDisk(t *testing.T) {
 		PromptTPS:      100,
 		GenTPS:         50,
 	})
-	s.mu.Lock()
-	s.saveLocked()
-	s.mu.Unlock()
+	s.Flush()
 
 	loaded := NewPersistentStatsStore(100, path)
 	summary := loaded.Summary(time.Hour)
@@ -95,7 +93,7 @@ func TestStatsStoreAggregatesClientMetadata(t *testing.T) {
 		GenTPS:         50,
 	})
 	s.Add(UsageEvent{
-		Timestamp:      now.Add(10 * time.Second),
+		Timestamp:      now.Add(-10 * time.Second),
 		Provider:       "openai",
 		Model:          "openai/gpt-5",
 		ClientType:     "curl",

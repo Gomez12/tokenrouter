@@ -337,6 +337,32 @@ func (s *Store) Conversation(key string) []Record {
 	return out
 }
 
+func (s *Store) DeleteConversation(key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key = strings.TrimSpace(key)
+	if key == "" || len(s.records) == 0 {
+		return 0
+	}
+	kept := s.records[:0]
+	removed := 0
+	for _, r := range s.records {
+		if strings.TrimSpace(r.ConversationKey) == key {
+			removed++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if removed == 0 {
+		return 0
+	}
+	s.records = kept
+	s.rebuildIndexesLocked()
+	s.dirty = true
+	s.saveLocked(true)
+	return removed
+}
+
 func (s *Store) resolveConversationKeyLocked(in CaptureInput, now time.Time) string {
 	if id := strings.TrimSpace(in.ProtocolIDs.RequestConversationID); id != "" {
 		return "cid:" + id

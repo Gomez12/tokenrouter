@@ -27,6 +27,9 @@
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+  <script defer src="/admin/static/admin.api.js"></script>
+  <script defer src="/admin/static/admin.realtime.js"></script>
+  <script defer src="/admin/static/admin.toast.js"></script>
   <script defer src="/admin/static/admin.js"></script>
   <style>
     [data-bs-theme="light"] body {
@@ -197,16 +200,22 @@
             <button class="btn btn-sm btn-outline-primary" @click="loadConversations()">Refresh</button>
           </div>
         </div>
-        <div class="small text-body-secondary mb-2" x-show="conversationsStatusHtml" style="display:none;" x-html="conversationsStatusHtml"></div>
-        <div class="row g-3">
-          <div class="col-lg-4">
-            <div class="border rounded p-2" style="max-height:68vh; overflow:auto;" x-html="conversationsListHtml"></div>
-            <div x-html="conversationsPagerHtml"></div>
-          </div>
-          <div class="col-lg-8">
-            <div class="border rounded p-2" style="max-height:68vh; overflow:auto;" x-html="conversationDetailHtml"></div>
-          </div>
+        <div class="border rounded p-2" style="max-height:68vh; overflow:auto;" x-html="conversationsListHtml"></div>
+        <div x-html="conversationsPagerHtml"></div>
+        <div class="small text-body-secondary mt-2">Click a conversation to open chat view.</div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="showConversationDetailModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeConversationDetailModal()">
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.55;" @click="closeConversationDetailModal()"></div>
+    <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
+      <div class="card shadow" style="width:100%;max-width:1100px;max-height:88vh;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="h5 mb-0">Conversation</h3>
+          <button class="icon-btn" @click="closeConversationDetailModal()" title="Close" aria-label="Close">✕</button>
         </div>
+        <div class="card-body" style="overflow:auto;max-height:calc(88vh - 58px);" x-html="conversationDetailHtml"></div>
       </div>
     </div>
   </div>
@@ -242,7 +251,6 @@
               <span x-show="conversationsSaveInProgress">Saving...</span>
             </button>
           </div>
-          <div class="small text-body-secondary mt-3" x-show="conversationsStatusHtml" style="display:none;" x-html="conversationsStatusHtml"></div>
         </div>
       </div>
     </div>
@@ -272,7 +280,6 @@
             <button class="btn btn-sm btn-outline-primary" @click="loadLogs()">Refresh</button>
           </div>
         </div>
-        <div class="small text-body-secondary mb-2" x-show="logStatusHtml" style="display:none;" x-html="logStatusHtml"></div>
         <div class="small text-body-secondary mb-2">Entries shown: <span x-text="logEntriesShownCount"></span> of <span x-text="logEntriesTotalCount"></span></div>
         <div class="border rounded p-2" style="max-height:70vh; overflow:auto;" x-html="logEntriesHtml"></div>
       </div>
@@ -300,6 +307,7 @@
         <div class="d-flex align-items-center justify-content-between mb-2">
           <h2 class="h5 mb-0">Providers</h2>
           <div class="d-flex gap-2">
+            <button class="icon-btn" title="Provider settings" aria-label="Provider settings" @click="openProvidersSettingsModal()">⚙</button>
             <button class="btn btn-sm btn-primary" @click="openAddProviderModal()">Add Provider</button>
           </div>
         </div>
@@ -313,31 +321,12 @@
       <div class="card-body">
         <div class="d-flex align-items-center justify-content-between mb-2">
           <h2 class="h5 mb-0">Access Tokens</h2>
-          <button class="btn btn-sm btn-primary" @click="openAddAccessTokenModal()">Add Key</button>
+          <div class="d-flex gap-2">
+            <button class="icon-btn" title="Access settings" aria-label="Access settings" @click="openAccessSettingsModal()">⚙</button>
+            <button class="btn btn-sm btn-primary" @click="openAddAccessTokenModal()">Add Key</button>
+          </div>
         </div>
-        <div class="small mb-2" x-show="accessTokenStatusHtml" style="display:none;" x-html="accessTokenStatusHtml"></div>
         <div class="table-responsive" x-html="accessTokensTableHtml"></div>
-      </div>
-    </div>
-
-    <div class="card shadow-sm mb-3">
-      <div class="card-body">
-        <div class="mb-2"><h2 class="h5 mb-0">API Access</h2></div>
-        <div class="form-check form-switch">
-          <input class="form-check-input" type="checkbox" id="allowLocalhostNoAuth" x-model="allowLocalhostNoAuth" @change="saveSecuritySettings()">
-          <label class="form-check-label" for="allowLocalhostNoAuth">Allow unauthenticated API access from localhost</label>
-        </div>
-        <div class="small text-body-secondary mt-2">Only loopback requests (127.0.0.1 / ::1) bypass API key checks when enabled.</div>
-        <div class="form-check form-switch mt-3">
-          <input class="form-check-input" type="checkbox" id="allowHostDockerInternalNoAuth" x-model="allowHostDockerInternalNoAuth" @change="saveSecuritySettings()">
-          <label class="form-check-label" for="allowHostDockerInternalNoAuth">Allow unauthenticated API access from host.docker.internal</label>
-        </div>
-        <div class="small text-body-secondary mt-2">When enabled, requests from the IP resolved by <code>host.docker.internal</code> bypass API key checks.</div>
-        <div class="form-check form-switch mt-3">
-          <input class="form-check-input" type="checkbox" id="autoEnablePublicFreeModels" x-model="autoEnablePublicFreeModels" @change="saveSecuritySettings()">
-          <label class="form-check-label" for="autoEnablePublicFreeModels">Automatically enable public free-model providers (no setup required)</label>
-        </div>
-        <div class="small text-body-secondary mt-2">When enabled, free models from built-in providers are available for use even if no providers are configured manually.</div>
       </div>
     </div>
 
@@ -379,9 +368,61 @@
       </div>
     </div>
 
-    <div class="card shadow-sm mb-3" x-show="statusHtml" style="display:none;">
-      <div class="card-body">
-        <div class="small text-body-secondary" x-html="statusHtml"></div>
+  </div>
+
+  <div x-show="showProvidersSettingsModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeProvidersSettingsModal()">
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeProvidersSettingsModal()"></div>
+    <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
+      <div class="card shadow" style="width:100%;max-width:620px;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="h5 mb-0">Provider Settings</h3>
+          <button class="icon-btn" :disabled="securitySaveInProgress" @click="closeProvidersSettingsModal()" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="card-body">
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="autoEnablePublicFreeModelsProviders" x-model="autoEnablePublicFreeModels">
+            <label class="form-check-label" for="autoEnablePublicFreeModelsProviders">Automatically enable public free-model providers (no setup required)</label>
+          </div>
+          <div class="small text-body-secondary mt-2">When enabled, free models from built-in providers are available for use even if no providers are configured manually.</div>
+          <div class="d-flex justify-content-end gap-2 mt-3">
+            <button class="btn btn-outline-secondary" :disabled="securitySaveInProgress" @click="closeProvidersSettingsModal()">Cancel</button>
+            <button class="btn btn-primary" :disabled="securitySaveInProgress" @click="saveProvidersSettings()">
+              <span x-show="!securitySaveInProgress">Save</span>
+              <span x-show="securitySaveInProgress">Saving...</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="showAccessSettingsModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeAccessSettingsModal()">
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeAccessSettingsModal()"></div>
+    <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
+      <div class="card shadow" style="width:100%;max-width:640px;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="h5 mb-0">API Access Settings</h3>
+          <button class="icon-btn" :disabled="securitySaveInProgress" @click="closeAccessSettingsModal()" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="card-body">
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="allowLocalhostNoAuthModal" x-model="allowLocalhostNoAuth">
+            <label class="form-check-label" for="allowLocalhostNoAuthModal">Allow unauthenticated API access from localhost</label>
+          </div>
+          <div class="small text-body-secondary mt-2">Only loopback requests (127.0.0.1 / ::1) bypass API key checks when enabled.</div>
+          <div class="form-check form-switch mt-3">
+            <input class="form-check-input" type="checkbox" id="allowHostDockerInternalNoAuthModal" x-model="allowHostDockerInternalNoAuth">
+            <label class="form-check-label" for="allowHostDockerInternalNoAuthModal">Allow unauthenticated API access from host.docker.internal</label>
+          </div>
+          <div class="small text-body-secondary mt-2">When enabled, requests from the IP resolved by <code>host.docker.internal</code> bypass API key checks.</div>
+          <div class="d-flex justify-content-end gap-2 mt-3">
+            <button class="btn btn-outline-secondary" :disabled="securitySaveInProgress" @click="closeAccessSettingsModal()">Cancel</button>
+            <button class="btn btn-primary" :disabled="securitySaveInProgress" @click="saveAccessSettings()">
+              <span x-show="!securitySaveInProgress">Save</span>
+              <span x-show="securitySaveInProgress">Saving...</span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -742,10 +783,31 @@
           </div>
           <div class="small text-body-secondary mt-2" x-show="!accessTokenDraft.id" style="display:none;">A random long key is generated by default. You can regenerate or edit before saving.</div>
           <div class="small text-body-secondary mt-2" x-show="accessTokenDraft.id" style="display:none;">API key value is hidden after creation and cannot be changed.</div>
-          <div class="small mt-2" x-show="accessTokenStatusHtml" style="display:none;" x-html="accessTokenStatusHtml"></div>
           <div class="d-flex justify-content-end gap-2 mt-3">
             <button class="btn btn-outline-secondary" x-show="!requiresInitialTokenSetup" style="display:none;" @click="closeAddAccessTokenModal()">Cancel</button>
             <button class="btn btn-primary" @click="saveAccessToken()">Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="showConfirmModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeConfirmModal()">
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeConfirmModal()"></div>
+    <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
+      <div class="card shadow" style="width:100%;max-width:520px;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="h5 mb-0" x-text="confirmModalTitle"></h3>
+          <button class="icon-btn" :disabled="confirmModalBusy" @click="closeConfirmModal()" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="card-body">
+          <p class="mb-3" x-text="confirmModalMessage"></p>
+          <div class="d-flex justify-content-end gap-2">
+            <button class="btn btn-outline-secondary" :disabled="confirmModalBusy" @click="closeConfirmModal()">Cancel</button>
+            <button class="btn btn-danger" :disabled="confirmModalBusy" @click="confirmModalProceed()">
+              <span x-show="!confirmModalBusy" x-text="confirmModalConfirmLabel"></span>
+              <span x-show="confirmModalBusy">Working...</span>
+            </button>
           </div>
         </div>
       </div>

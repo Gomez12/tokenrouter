@@ -135,6 +135,9 @@ func (s *Server) Run(ctx context.Context) error {
 		if s.logs != nil {
 			s.logs.Flush()
 		}
+		if s.stats != nil {
+			s.stats.Flush()
+		}
 	}()
 	cfg := s.store.Snapshot()
 	errCh := make(chan error, 2)
@@ -370,7 +373,7 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	captureEnabled := isConversationCaptureEndpoint(r.URL.Path)
 	reqConversationID, reqPrevResponseID := parseConversationRequestIDs(body)
 	requestPayload := capJSONBytes(body, 128<<10)
-	requestText := extractPromptTextFromBody(body)
+	requestText := dedupeConversationText(extractPromptTextFromBody(body))
 	requestHeaders := sanitizeConversationRequestHeaders(r.Header)
 
 	start := time.Now()
@@ -437,7 +440,7 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 				RequestPayload:       requestPayload,
 				ResponsePayload:      capJSONBytes(streamPayload, 128<<10),
 				RequestTextMarkdown:  requestText,
-				ResponseTextMarkdown: strings.TrimSpace(usage.CapturedOutput),
+				ResponseTextMarkdown: dedupeConversationText(strings.TrimSpace(usage.CapturedOutput)),
 				StatusCode:           statusCode,
 				LatencyMS:            latency.Milliseconds(),
 				Stream:               true,
@@ -509,7 +512,7 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordUsageMeasured(provider.Name, model, upstreamModel, statusCode, usageLatency, promptTokens, metrics.PromptCachedTokens, completionTokens, totalTokens, promptTPS, genTPS, clientMeta)
 	if captureEnabled && s.adminHandler != nil {
-		responseText := extractCompletionTextFromBody(respBody)
+		responseText := dedupeConversationText(extractCompletionTextFromBody(respBody))
 		s.adminHandler.RecordConversation(conversations.CaptureInput{
 			Timestamp:            time.Now().UTC(),
 			Endpoint:             normalizeConversationEndpoint(r.URL.Path),
@@ -533,6 +536,10 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
+}
+
+func dedupeConversationText(text string) string {
+	return strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
 }
 
 func (s *Server) prepareUpstreamRequest(body []byte) (incomingModel string, outBody []byte, provider config.ProviderConfig, upstreamModel string, stream bool, err error) {
@@ -876,6 +883,7 @@ func (s *Server) recordUsageMeasured(providerName, incomingModel, upstreamModel 
 		UserAgent:      strings.TrimSpace(meta.UserAgent),
 		ClientIP:       strings.TrimSpace(meta.ClientIP),
 		APIKeyName:     strings.TrimSpace(meta.APIKeyName),
+		StatusCode:     status,
 		PromptTokens:   promptTokens,
 		PromptCached:   promptCachedTokens,
 		CompletionToks: completionTokens,
@@ -884,6 +892,9 @@ func (s *Server) recordUsageMeasured(providerName, incomingModel, upstreamModel 
 		PromptTPS:      promptTPS,
 		GenTPS:         genTPS,
 	})
+	if s.adminHandler != nil {
+		s.adminHandler.NotifyStatsChanged()
+	}
 	_ = upstreamModel
 }
 
@@ -1043,8 +1054,8 @@ func (p *sseUsageParser) captureStreamFields(data []byte) {
 			}
 		}
 	}
-	chunkText := strings.TrimSpace(extractCompletionText(payload))
-	if chunkText == "" {
+	chunkText := extractCompletionText(payload)
+	if strings.TrimSpace(chunkText) == "" {
 		return
 	}
 	if p.usage.CapturedOutput == "" {
@@ -1421,7 +1432,7 @@ func firstErr(ch <-chan error) error {
 
 func isConversationCaptureEndpoint(path string) bool {
 	switch strings.TrimSpace(path) {
-	case "/v1/chat/completions", "/v1/responses":
+	case "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses":
 		return true
 	default:
 		return false
@@ -1432,6 +1443,10 @@ func normalizeConversationEndpoint(path string) string {
 	switch strings.TrimSpace(path) {
 	case "/v1/chat/completions":
 		return "chat.completions"
+	case "/v1/completions":
+		return "completions"
+	case "/v1/embeddings":
+		return "embeddings"
 	case "/v1/responses":
 		return "responses"
 	default:
@@ -1585,6 +1600,9 @@ func firstMapValueAny(m map[string]any, keys ...string) any {
 }
 
 func asStringAny(v any) string {
+	if v == nil {
+		return ""
+	}
 	switch t := v.(type) {
 	case string:
 		return t

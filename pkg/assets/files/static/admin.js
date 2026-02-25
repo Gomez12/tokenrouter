@@ -9,8 +9,8 @@ function adminApp() {
     selectedConversationKey: '',
     conversationsSettings: {enabled:true, max_items:5000, max_age_days:30},
     conversationsSaveInProgress: false,
-    conversationsStatusHtml: '',
     showConversationsSettingsModal: false,
+    showConversationDetailModal: false,
     conversationsSearch: '',
     conversationsListHtml: '',
     conversationsPagerHtml: '',
@@ -25,7 +25,6 @@ function adminApp() {
     logDebounceTimer: null,
     logMaxLines: 5000,
     logSaveInProgress: false,
-    logStatusHtml: '',
     popularProviders: [],
     modelsCatalog: [],
     allowLocalhostNoAuth: false,
@@ -45,14 +44,14 @@ function adminApp() {
     accessTokensTableHtml: '',
     modelsTableHtml: '',
     modelsFreshnessHtml: '',
-    statusHtml: '',
-    accessTokenStatusHtml: '',
     modalStatusHtml: '',
     deviceCodeFetchInProgress: false,
     deviceTokenPollInProgress: false,
     oauthLoginInProgress: false,
     oauthPollState: '',
     showAddProviderModal: false,
+    showProvidersSettingsModal: false,
+    showAccessSettingsModal: false,
     addProviderStep: 'pick_provider',
     selectedPreset: '',
     presetInfoHtml: '',
@@ -75,9 +74,12 @@ function adminApp() {
     modelsInitialized: false,
     modelsInitialLoadInProgress: false,
     quotaRefreshInProgress: false,
+    statsLoading: false,
+    statsRenderToken: 0,
     editingProviderName: '',
     runtimeInstanceID: '',
     reloadingForRuntimeUpdate: false,
+    wsFailureCount: 0,
     themeMode: 'auto',
     activeTabCacheKey: 'opp_admin_active_tab_v1',
     modelsCacheKey: 'opp_models_catalog_cache_v1',
@@ -89,6 +91,12 @@ function adminApp() {
     accessTokens: [],
     requiresInitialTokenSetup: false,
     showAddAccessTokenModal: false,
+    showConfirmModal: false,
+    confirmModalTitle: 'Confirm Action',
+    confirmModalMessage: '',
+    confirmModalConfirmLabel: 'Confirm',
+    confirmModalBusy: false,
+    confirmModalAction: null,
     accessTokenDraft: {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0'},
     ws: null,
     wsReconnectTimer: null,
@@ -148,175 +156,59 @@ function adminApp() {
         }
       }
     },
-    startRealtimeUpdates() {
-      this.configureStatusUpdates();
-      window.addEventListener('beforeunload', () => this.stopRealtimeUpdates());
-    },
-    stopRealtimeUpdates() {
-      if (this.wsReconnectTimer) {
-        clearTimeout(this.wsReconnectTimer);
-        this.wsReconnectTimer = null;
-      }
-      if (this.fallbackPoller) {
-        clearInterval(this.fallbackPoller);
-        this.fallbackPoller = null;
-      }
-      if (this.intervalPoller) {
-        clearInterval(this.intervalPoller);
-        this.intervalPoller = null;
-      }
-      if (this.ws) {
-        try { this.ws.close(); } catch (_) {}
-        this.ws = null;
-      }
-    },
-    isStatusRealtimeMode() {
-      return this.statusUpdateSpeed === 'realtime';
-    },
-    statusUpdateIntervalMs() {
-      const v = String(this.statusUpdateSpeed || '').trim();
-      if (v === '2s') return 2000;
-      if (v === '10s') return 10000;
-      if (v === '30s') return 30000;
-      if (v === '1m') return 60 * 1000;
-      if (v === '5m') return 5 * 60 * 1000;
-      if (v === '15m') return 15 * 60 * 1000;
-      if (v === 'disabled') return -1;
-      return 0;
-    },
-    configureStatusUpdates() {
-      if (this.intervalPoller) {
-        clearInterval(this.intervalPoller);
-        this.intervalPoller = null;
-      }
-      this.clearFallbackPolling();
-      const intervalMs = this.statusUpdateIntervalMs();
-      if (intervalMs < 0) {
-        if (this.wsReconnectTimer) {
-          clearTimeout(this.wsReconnectTimer);
-          this.wsReconnectTimer = null;
-        }
-        if (this.ws) {
-          try { this.ws.close(); } catch (_) {}
-          this.ws = null;
-        }
-        return;
-      }
-      if (this.isStatusRealtimeMode()) {
-        this.connectRealtimeWebSocket();
-        this.handleRealtimeRefresh(true);
-        return;
-      }
-      if (this.ws) {
-        try { this.ws.close(); } catch (_) {}
-        this.ws = null;
-      }
-      if (this.wsReconnectTimer) {
-        clearTimeout(this.wsReconnectTimer);
-        this.wsReconnectTimer = null;
-      }
-      this.intervalPoller = setInterval(() => this.handleRealtimeRefresh(false), intervalMs);
-      this.handleRealtimeRefresh(true);
-    },
-    ensureFallbackPolling() {
-      if (!this.isStatusRealtimeMode()) return;
-      if (this.fallbackPoller) return;
-      this.fallbackPoller = setInterval(() => this.handleRealtimeRefresh(), 5000);
-    },
-    clearFallbackPolling() {
-      if (!this.fallbackPoller) return;
-      clearInterval(this.fallbackPoller);
-      this.fallbackPoller = null;
-    },
-    scheduleRealtimeReconnect() {
-      if (!this.isStatusRealtimeMode()) return;
-      if (this.wsReconnectTimer) return;
-      const delay = Math.min(this.wsBackoffMs, 30000);
-      this.wsReconnectTimer = setTimeout(() => {
-        this.wsReconnectTimer = null;
-        this.connectRealtimeWebSocket();
-      }, delay);
-      this.wsBackoffMs = Math.min(this.wsBackoffMs * 2, 30000);
-    },
-    connectRealtimeWebSocket() {
-      if (!this.isStatusRealtimeMode()) return;
-      if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
-      const wsProto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-      const wsURL = wsProto + window.location.host + '/admin/ws';
-      try {
-        const ws = new WebSocket(wsURL);
-        this.ws = ws;
-        ws.onopen = () => {
-          this.wsBackoffMs = 1000;
-          this.clearFallbackPolling();
-          this.handleRealtimeRefresh(true);
-        };
-        ws.onmessage = (ev) => {
-          let msg = null;
-          try { msg = JSON.parse(String(ev.data || '{}')); } catch (_) {}
-          if (!msg || !msg.type) return;
-          if (msg.type === 'refresh') {
-            this.handleRealtimeRefresh(true);
-            return;
-          }
-          if (msg.type === 'conversation_append' && this.activeTab === 'conversations') {
-            this.loadConversations(false);
-          }
-        };
-        ws.onerror = () => {
-          this.ensureFallbackPolling();
-        };
-        ws.onclose = () => {
-          this.ensureFallbackPolling();
-          this.scheduleRealtimeReconnect();
-        };
-      } catch (_) {
-        this.ensureFallbackPolling();
-        this.scheduleRealtimeReconnect();
-      }
-    },
-    handleRealtimeRefresh(forceStats) {
-      if (this.activeTab === 'status' || this.activeTab === 'quota' || this.activeTab === 'access') {
-        this.loadStats(!!forceStats);
-      }
-      if (this.activeTab === 'providers') {
-        this.loadProviders();
-      } else if (this.activeTab === 'access') {
-        this.loadAccessTokens();
-        this.loadSecuritySettings();
-        this.loadTLSSettings();
-      } else if (this.activeTab === 'models') {
-        this.loadModelsCatalog(false);
-      } else if (this.activeTab === 'conversations') {
-        this.loadConversations(false);
-      } else if (this.activeTab === 'log') {
-        this.loadLogs();
-      }
-    },
+    startRealtimeUpdates() { return window.AdminRealtime.startRealtimeUpdates.call(this); },
+    stopRealtimeUpdates() { return window.AdminRealtime.stopRealtimeUpdates.call(this); },
+    isStatusRealtimeMode() { return window.AdminRealtime.isStatusRealtimeMode.call(this); },
+    statusUpdateIntervalMs() { return window.AdminRealtime.statusUpdateIntervalMs.call(this); },
+    configureStatusUpdates() { return window.AdminRealtime.configureStatusUpdates.call(this); },
+    ensureFallbackPolling() { return window.AdminRealtime.ensureFallbackPolling.call(this); },
+    clearFallbackPolling() { return window.AdminRealtime.clearFallbackPolling.call(this); },
+    scheduleRealtimeReconnect() { return window.AdminRealtime.scheduleRealtimeReconnect.call(this); },
+    connectRealtimeWebSocket() { return window.AdminRealtime.connectRealtimeWebSocket.call(this); },
+    sendWSSubscription() { return window.AdminRealtime.sendWSSubscription.call(this); },
+    noteWSFailure() { return window.AdminRealtime.noteWSFailure.call(this); },
+    handleRealtimeRefresh(forceStats) { return window.AdminRealtime.handleRealtimeRefresh.call(this, forceStats); },
     headers() { return {'Content-Type':'application/json'}; },
-    async apiFetch(url, opts) {
-      const r = await fetch(url, opts);
-      this.observeRuntimeInstance(r);
-      return r;
-    },
-    observeRuntimeInstance(response) {
-      if (!response || !response.headers) return;
-      const nextID = String(response.headers.get('X-OPP-Instance-ID') || '').trim();
-      if (!nextID) return;
-      if (!this.runtimeInstanceID) {
-        this.runtimeInstanceID = nextID;
-        return;
-      }
-      if (this.runtimeInstanceID !== nextID && !this.reloadingForRuntimeUpdate) {
-        this.runtimeInstanceID = nextID;
-        this.reloadForRuntimeUpdate();
+    toast(type, message, duration) {
+      const msg = String(message || '').trim();
+      if (!msg) return;
+      if (window.AdminToast && typeof window.AdminToast.show === 'function') {
+        window.AdminToast.show({type, message: msg, duration});
       }
     },
-    reloadForRuntimeUpdate() {
-      if (this.reloadingForRuntimeUpdate) return;
-      this.reloadingForRuntimeUpdate = true;
-      window.location.reload();
+    toastSuccess(message, duration) { this.toast('success', message, duration); },
+    toastError(message, duration) { this.toast('error', message, duration); },
+    toastInfo(message, duration) { this.toast('info', message, duration); },
+    toastWarning(message, duration) { this.toast('warning', message, duration); },
+    openConfirmModal(opts, onConfirm) {
+      const o = opts || {};
+      this.confirmModalTitle = String(o.title || 'Confirm Action').trim();
+      this.confirmModalMessage = String(o.message || '').trim();
+      this.confirmModalConfirmLabel = String(o.confirmLabel || 'Confirm').trim();
+      this.confirmModalAction = (typeof onConfirm === 'function') ? onConfirm : null;
+      this.confirmModalBusy = false;
+      this.showConfirmModal = true;
     },
+    closeConfirmModal() {
+      if (this.confirmModalBusy) return;
+      this.showConfirmModal = false;
+      this.confirmModalAction = null;
+    },
+    async confirmModalProceed() {
+      if (this.confirmModalBusy) return;
+      const fn = this.confirmModalAction;
+      this.confirmModalBusy = true;
+      try {
+        if (typeof fn === 'function') await fn();
+      } finally {
+        this.confirmModalBusy = false;
+        this.showConfirmModal = false;
+        this.confirmModalAction = null;
+      }
+    },
+    async apiFetch(url, opts) { return window.AdminApi.apiFetch.call(this, url, opts); },
+    observeRuntimeInstance(response) { return window.AdminApi.observeRuntimeInstance.call(this, response); },
+    reloadForRuntimeUpdate() { return window.AdminApi.reloadForRuntimeUpdate.call(this); },
     selectTab(tab) {
       this.activeTab = tab;
       this.persistActiveTab();
@@ -552,6 +444,42 @@ function adminApp() {
       const remMin = min % 60;
       return hr + 'h ' + remMin + 'm ago';
     },
+    formatRelativeAge(ts) {
+      const raw = String(ts || '').trim();
+      if (!raw) return '-';
+      const d = new Date(raw);
+      if (Number.isNaN(d.getTime())) return raw;
+      return this.formatAge(d.toISOString());
+    },
+    conversationProviderDisplayName(providerName) {
+      const provider = String(providerName || '').trim();
+      if (!provider) return '-';
+      const configured = (this.providers || []).find((p) => String((p && p.name) || '').trim() === provider);
+      if (configured) {
+        const display = String((configured && configured.display_name) || '').trim();
+        if (display) return display;
+      }
+      const preset = (this.popularProviders || []).find((p) => String((p && p.name) || '').trim() === provider);
+      if (preset) {
+        const display = String((preset && preset.display_name) || '').trim();
+        if (display) return display;
+      }
+      return provider;
+    },
+    conversationModelDisplayName(providerName, modelName) {
+      const model = String(modelName || '').trim();
+      if (!model) return '-';
+      const provider = String(providerName || '').trim();
+      const match = (this.modelsCatalog || []).find((m) =>
+        String((m && m.provider) || '').trim() === provider &&
+        String((m && m.model) || '').trim() === model
+      );
+      if (match) {
+        const display = String((match && (match.model_display_name || match.display_name)) || '').trim();
+        if (display) return display;
+      }
+      return model;
+    },
     formatUntil(targetAt) {
       if (!targetAt) return '';
       const t = new Date(targetAt);
@@ -660,6 +588,28 @@ function adminApp() {
       this.usageChartGroupBy = key;
       this.persistUsageChartGroup();
       this.renderStats();
+    },
+    renderStatsLoading() {
+      if (this.usageChart) {
+        try { this.usageChart.destroy(); } catch (_) {}
+        this.usageChart = null;
+      }
+      this.statsSummaryHtml =
+        '<div class="row g-2">' +
+          '<div class="col-3"><div class="border rounded p-2 bg-body placeholder-glow" style="min-height:78px;"><span class="placeholder col-8"></span><span class="placeholder col-5"></span></div></div>' +
+          '<div class="col-3"><div class="border rounded p-2 bg-body placeholder-glow" style="min-height:78px;"><span class="placeholder col-8"></span><span class="placeholder col-6"></span></div></div>' +
+          '<div class="col-3"><div class="border rounded p-2 bg-body placeholder-glow" style="min-height:78px;"><span class="placeholder col-8"></span><span class="placeholder col-4"></span></div></div>' +
+          '<div class="col-3"><div class="border rounded p-2 bg-body placeholder-glow" style="min-height:78px;"><span class="placeholder col-8"></span><span class="placeholder col-4"></span></div></div>' +
+        '</div>' +
+        '<div class="border rounded p-3 bg-body mt-2 placeholder-glow">' +
+          '<span class="placeholder col-3 mb-2"></span>' +
+          '<div style="height:280px;" class="bg-body-tertiary rounded"></div>' +
+        '</div>' +
+        '<div class="row g-3 mt-1">' +
+          '<div class="col-lg-6"><div class="border rounded p-3 bg-body placeholder-glow"><span class="placeholder col-4"></span><span class="placeholder col-12"></span><span class="placeholder col-10"></span><span class="placeholder col-11"></span></div></div>' +
+          '<div class="col-lg-6"><div class="border rounded p-3 bg-body placeholder-glow"><span class="placeholder col-4"></span><span class="placeholder col-12"></span><span class="placeholder col-10"></span><span class="placeholder col-11"></span></div></div>' +
+        '</div>';
+      this.quotaSummaryHtml = '<div class="small text-body-secondary placeholder-glow"><span class="placeholder col-3"></span></div>';
     },
     renderPager(totalRows, page, totalPages, pageSize, key) {
       const disabledFirst = page <= 1 ? ' disabled' : '';
@@ -930,9 +880,9 @@ function adminApp() {
       if (!code) return;
       try {
         await navigator.clipboard.writeText(code);
-        this.modalStatusHtml = '<span class="text-success">Device code copied.</span>';
+        this.toastSuccess('Device code copied.');
       } catch (_) {
-        this.modalStatusHtml = '<span class="text-danger">Could not copy device code.</span>';
+        this.toastError('Could not copy device code.');
       }
     },
     openDeviceAuth(withCode) {
@@ -963,14 +913,14 @@ function adminApp() {
         if (startResp.status === 401) { window.location = '/admin/login?next=/admin'; return; }
         const startBody = await startResp.json().catch(() => ({}));
         if (!(startResp.ok && startBody.ok)) {
-          this.modalStatusHtml = '<span class="text-danger">' + this.escapeHtml(startBody.error || 'Failed to start OAuth flow.') + '</span>';
+          this.toastError(startBody.error || 'Failed to start OAuth flow.');
           this.oauthLoginInProgress = false;
           return;
         }
         const state = String(startBody.state || '').trim();
         const authURL = String(startBody.auth_url || '').trim();
         if (!state || !authURL) {
-          this.modalStatusHtml = '<span class="text-danger">OAuth start response was incomplete.</span>';
+          this.toastError('OAuth start response was incomplete.');
           this.oauthLoginInProgress = false;
           return;
         }
@@ -984,12 +934,12 @@ function adminApp() {
           if (rr.status === 401) { window.location = '/admin/login?next=/admin'; return; }
           const rb = await rr.json().catch(() => ({}));
           if (rr.status === 404) {
-            this.modalStatusHtml = '<span class="text-danger">OAuth session expired or not found. Retry.</span>';
+            this.toastError('OAuth session expired or not found. Retry.');
             this.oauthLoginInProgress = false;
             return;
           }
           if (!(rr.ok && rb.ok)) {
-            this.modalStatusHtml = '<span class="text-danger">' + this.escapeHtml(rb.error || 'OAuth flow failed.') + '</span>';
+            this.toastError(rb.error || 'OAuth flow failed.');
             this.oauthLoginInProgress = false;
             return;
           }
@@ -999,11 +949,12 @@ function adminApp() {
           this.draft.token_expires_at = String(rb.token_expires_at || '').trim();
           this.draft.account_id = String(rb.account_id || '').trim();
           if (String(rb.base_url || '').trim()) this.draft.base_url = String(rb.base_url || '').trim();
-          this.modalStatusHtml = '<span class="text-success">OAuth login completed. Token captured.</span>';
+          this.toastSuccess('OAuth login completed. Token captured.');
+          this.modalStatusHtml = '';
           this.oauthLoginInProgress = false;
           return;
         }
-        this.modalStatusHtml = '<span class="text-danger">Timed out waiting for OAuth callback.</span>';
+        this.toastError('Timed out waiting for OAuth callback.');
       } finally {
         this.oauthLoginInProgress = false;
       }
@@ -1023,8 +974,7 @@ function adminApp() {
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
         const body = await r.json().catch(() => ({}));
         if (!(r.ok && body.ok)) {
-          const err = this.escapeHtml(body.error || 'Failed to fetch device code.');
-          this.modalStatusHtml = '<span class="text-danger">' + err + '</span>';
+          this.toastError(body.error || 'Failed to fetch device code.');
           return;
         }
         const userCode = String(body.user_code || '').trim();
@@ -1038,7 +988,8 @@ function adminApp() {
         else if (verificationURL) this.draft.device_auth_url = verificationURL;
         let msg = 'Device code fetched.';
         if (expiresIn > 0) msg += ' Expires in ' + expiresIn + 's.';
-        this.modalStatusHtml = '<span class="text-success">' + this.escapeHtml(msg) + '</span>';
+        this.toastSuccess(msg);
+        this.modalStatusHtml = '';
       } finally {
         this.deviceCodeFetchInProgress = false;
       }
@@ -1054,11 +1005,11 @@ function adminApp() {
         grant_type: String(this.draft.device_grant_type || '').trim() || 'urn:ietf:params:oauth:grant-type:device_code'
       };
       if (!payload.device_token_url || !payload.client_id || !payload.device_code) {
-        this.modalStatusHtml = '<span class="text-danger">Device token URL, client_id, and device_code are required.</span>';
+        this.toastError('Device token URL, client_id, and device_code are required.');
         return;
       }
       if (payload.provider === 'openai' && !payload.device_auth_id) {
-        this.modalStatusHtml = '<span class="text-danger">OpenAI headless flow requires device_auth_id. Fetch device code first.</span>';
+        this.toastError('OpenAI headless flow requires device_auth_id. Fetch device code first.');
         return;
       }
       this.deviceTokenPollInProgress = true;
@@ -1069,7 +1020,7 @@ function adminApp() {
           if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
           const body = await r.json().catch(() => ({}));
           if (!(r.ok && body.ok)) {
-            this.modalStatusHtml = '<span class="text-danger">' + this.escapeHtml(body.error || 'Device token exchange failed.') + '</span>';
+            this.toastError(body.error || 'Device token exchange failed.');
             return;
           }
           if (!body.pending && String(body.auth_token || '').trim()) {
@@ -1080,13 +1031,14 @@ function adminApp() {
               const when = new Date(Date.now() + Number(body.expires_in) * 1000).toISOString();
               this.draft.token_expires_at = when;
             }
-            this.modalStatusHtml = '<span class="text-success">Device auth token received.</span>';
+            this.toastSuccess('Device auth token received.');
+            this.modalStatusHtml = '';
             return;
           }
           const waitSec = Math.max(1, Number(body.interval || 5));
           await new Promise((resolve) => setTimeout(resolve, waitSec * 1000));
         }
-        this.modalStatusHtml = '<span class="text-danger">Timed out waiting for device auth token.</span>';
+        this.toastError('Timed out waiting for device auth token.');
       } finally {
         this.deviceTokenPollInProgress = false;
       }
@@ -1122,12 +1074,9 @@ function adminApp() {
       const buckets = Array.isArray(s.buckets) ? s.buckets : [];
       const groupField = this.usageChartGroupBy || 'model';
       const groupLabel = this.usageChartGroupLabel(groupField);
-      const providersTable = this.renderUsageMetricTable('Providers', this.aggregateUsageRowsBy(buckets, 'provider'), 'Provider');
-      const modelsTable = this.renderUsageMetricTable('Models', this.aggregateUsageRowsBy(buckets, 'model'), 'Model');
-      const tokenNamesTable = this.renderUsageMetricTable('Token Names', this.aggregateUsageRowsBy(buckets, 'api_key_name'), 'Token Name');
-      const remoteIPsTable = this.renderUsageMetricTable('Remote IPs', this.aggregateUsageRowsBy(buckets, 'client_ip'), 'Remote IP');
-      const userAgentsTable = this.renderUsageMetricTable('User Agents', this.aggregateUsageRowsBy(buckets, 'user_agent'), 'User-Agent');
-      this.quotaSummaryHtml = this.renderQuotaPanel(s.provider_quotas || {});
+      const bucketMs = this.usageBucketMs(buckets);
+      const bucketLabel = this.usageBucketLabel(bucketMs);
+      const renderToken = ++this.statsRenderToken;
       this.statsSummaryHtml =
         '<div class="row g-2">' +
           '<div class="col-3"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Requests</div><div class="fw-semibold">' + req + '</div></div></div>' +
@@ -1137,7 +1086,7 @@ function adminApp() {
         '</div>' +
         '<div class="border rounded p-3 bg-body mt-2">' +
           '<div class="d-flex justify-content-between align-items-center mb-2">' +
-            '<div class="fw-semibold">Usage by ' + this.escapeHtml(groupLabel.toLowerCase()) + ' (tokens / 5m)</div>' +
+            '<div class="fw-semibold">Usage by ' + this.escapeHtml(groupLabel.toLowerCase()) + ' (tokens / ' + this.escapeHtml(bucketLabel) + ')</div>' +
             '<div class="d-flex align-items-center">' +
               '<select class="form-select form-select-sm" style="width:auto;" onchange="window.__adminSetUsageChartGroup(this.value)">' +
                 '<option value="model"' + (groupField === 'model' ? ' selected' : '') + '>Model</option>' +
@@ -1151,14 +1100,35 @@ function adminApp() {
           '<div style="height:280px;"><canvas id="modelUsageChart"></canvas></div>' +
         '</div>' +
         '<div class="small text-body-secondary mt-2">Providers available: <strong>' + providersAvailable + '</strong> · Online: <strong>' + providersOnline + '</strong></div>' +
-        '<div class="row g-3 mt-1">' +
+        '<div id="usageStatsTables" class="row g-3 mt-1">' +
+          '<div class="col-lg-6"><div class="border rounded p-3 bg-body placeholder-glow"><span class="placeholder col-4"></span><span class="placeholder col-12"></span><span class="placeholder col-10"></span><span class="placeholder col-11"></span></div></div>' +
+          '<div class="col-lg-6"><div class="border rounded p-3 bg-body placeholder-glow"><span class="placeholder col-4"></span><span class="placeholder col-12"></span><span class="placeholder col-10"></span><span class="placeholder col-11"></span></div></div>' +
+          '<div class="col-lg-6"><div class="border rounded p-3 bg-body placeholder-glow"><span class="placeholder col-4"></span><span class="placeholder col-12"></span><span class="placeholder col-10"></span><span class="placeholder col-11"></span></div></div>' +
+          '<div class="col-lg-6"><div class="border rounded p-3 bg-body placeholder-glow"><span class="placeholder col-4"></span><span class="placeholder col-12"></span><span class="placeholder col-10"></span><span class="placeholder col-11"></span></div></div>' +
+          '<div class="col-lg-6"><div class="border rounded p-3 bg-body placeholder-glow"><span class="placeholder col-4"></span><span class="placeholder col-12"></span><span class="placeholder col-10"></span><span class="placeholder col-11"></span></div></div>' +
+        '</div>';
+      this.quotaSummaryHtml = '<div class="small text-body-secondary">Loading quota...</div>';
+      setTimeout(() => {
+        if (renderToken !== this.statsRenderToken) return;
+        this.quotaSummaryHtml = this.renderQuotaPanel(s.provider_quotas || {});
+        this.renderUsageTimelineChart(buckets, groupField);
+      }, 0);
+      setTimeout(() => {
+        if (renderToken !== this.statsRenderToken) return;
+        const providersTable = this.renderUsageMetricTable('Providers', this.aggregateUsageRowsBy(buckets, 'provider'), 'Provider');
+        const modelsTable = this.renderUsageMetricTable('Models', this.aggregateUsageRowsBy(buckets, 'model'), 'Model');
+        const tokenNamesTable = this.renderUsageMetricTable('Token Names', this.aggregateUsageRowsBy(buckets, 'api_key_name'), 'Token Name');
+        const remoteIPsTable = this.renderUsageMetricTable('Remote IPs', this.aggregateUsageRowsBy(buckets, 'client_ip'), 'Remote IP');
+        const userAgentsTable = this.renderUsageMetricTable('User Agents', this.aggregateUsageRowsBy(buckets, 'user_agent'), 'User-Agent');
+        const tablesNode = document.getElementById('usageStatsTables');
+        if (!tablesNode) return;
+        tablesNode.innerHTML =
           '<div class="col-lg-6">' + providersTable + '</div>' +
           '<div class="col-lg-6">' + modelsTable + '</div>' +
           '<div class="col-lg-6">' + tokenNamesTable + '</div>' +
           '<div class="col-lg-6">' + remoteIPsTable + '</div>' +
-          '<div class="col-lg-6">' + userAgentsTable + '</div>' +
-        '</div>';
-      setTimeout(() => this.renderUsageTimelineChart(buckets, groupField), 0);
+          '<div class="col-lg-6">' + userAgentsTable + '</div>';
+      }, 25);
     },
     usageChartGroupLabel(field) {
       if (field === 'provider') return 'Provider';
@@ -1167,10 +1137,56 @@ function adminApp() {
       if (field === 'user_agent') return 'User Agent';
       return 'Model';
     },
+    usageBucketMs(buckets) {
+      let minSec = 0;
+      (Array.isArray(buckets) ? buckets : []).forEach((b) => {
+        const sec = Number(b.slot_seconds || 0);
+        if (!Number.isFinite(sec) || sec <= 0) return;
+        if (minSec <= 0 || sec < minSec) minSec = sec;
+      });
+      if (minSec > 0) return minSec * 1000;
+      if (Math.max(1, Number(this.statsRangeHours || 8)) <= 1) return 60 * 1000;
+      return 5 * 60 * 1000;
+    },
+    usageBucketLabel(bucketMs) {
+      const sec = Math.max(1, Math.round(Number(bucketMs || 0) / 1000));
+      if (sec % 3600 === 0) return String(sec / 3600) + 'h';
+      if (sec % 60 === 0) return String(sec / 60) + 'm';
+      return String(sec) + 's';
+    },
     renderQuotaPanel(quotaMap) {
       const chart = this.renderQuotaChart(quotaMap || {});
       if (!chart) return '<div class="small text-body-secondary">No quota data.</div>';
       return chart;
+    },
+    quotaValueText(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '';
+      const rounded = Math.round(n);
+      if (Math.abs(n - rounded) < 0.000001) return String(rounded);
+      return n.toFixed(2);
+    },
+    quotaTooltipText(metric) {
+      const m = metric || {};
+      const unit = String(m.unit || '').trim();
+      const limit = Number(m.limit_value);
+      const remaining = Number(m.remaining_value);
+      const used = Number(m.used_value);
+      if (!Number.isFinite(limit) || limit <= 0) return '';
+      const usedVal = Number.isFinite(used) ? used : Math.max(0, limit - (Number.isFinite(remaining) ? remaining : 0));
+      const remVal = Number.isFinite(remaining) ? remaining : Math.max(0, limit - usedVal);
+      const suffix = unit ? (' ' + unit) : '';
+      return 'Used: ' + this.quotaValueText(usedVal) + suffix +
+        ' / Limit: ' + this.quotaValueText(limit) + suffix +
+        ' (Remaining: ' + this.quotaValueText(remVal) + suffix + ')';
+    },
+    quotaMetricKind(metric) {
+      const m = metric || {};
+      const unit = String(m.unit || '').trim().toLowerCase();
+      const feature = String(m.metered_feature || '').trim().toLowerCase();
+      if (unit === 'tokens' || feature.includes('token')) return 'tokens';
+      if (unit === 'requests' || feature.includes('request')) return 'requests';
+      return 'other';
     },
     chartColor(seed) {
       let h = 0;
@@ -1184,7 +1200,7 @@ function adminApp() {
       if (!canvas || typeof Chart === 'undefined') return;
       const now = Date.now();
       const rangeMs = Math.max(1, Number(this.statsRangeHours || 8)) * 3600 * 1000;
-      const bucketMs = 5 * 60 * 1000;
+      const bucketMs = this.usageBucketMs(buckets);
       const endBucket = Math.floor(now / bucketMs) * bucketMs;
       const startBucket = Math.floor((endBucket - rangeMs) / bucketMs) * bucketMs;
       const byGroup = {};
@@ -1263,61 +1279,97 @@ function adminApp() {
     renderQuotaChart(quotaMap) {
       const items = Object.values(quotaMap || {});
       if (!items.length) return '';
-      const cards = items.map((q) => {
-        const name = this.escapeHtml(q.display_name || q.provider || 'provider');
-        const checkedAtRaw = String(q.checked_at || '').trim();
-        let staleLabel = '';
-        if (checkedAtRaw) {
-          const ts = new Date(checkedAtRaw);
-          if (!Number.isNaN(ts.getTime())) {
-            const ageMs = Date.now() - ts.getTime();
-            if (ageMs > 60 * 60 * 1000) {
-              staleLabel = 'stale ' + this.formatAge(checkedAtRaw);
-            }
-          }
-        }
-        const staleHtml = staleLabel ? (' <span class="small text-warning">(' + this.escapeHtml(staleLabel) + ')</span>') : '';
+      const groupField = String(this.usageChartGroupBy || 'model').trim().toLowerCase();
+      const groups = {};
+      items.forEach((q) => {
         const status = String(q.status || '');
-        if (status !== 'ok') {
-          const err = this.escapeHtml(String(q.error || 'quota unavailable'));
-          return '<div class="border rounded p-2 bg-body" style="width:100%;flex:1 1 100%;max-width:100%;">' +
-            '<div class="fw-semibold small mb-1">' + name + staleHtml + '</div>' +
-            '<div class="small text-danger">' + err + '</div>' +
-          '</div>';
-        }
+        if (status !== 'ok') return;
+        const providerName = String(q.display_name || q.provider || 'provider').trim();
         const metrics = (Array.isArray(q.metrics) && q.metrics.length)
           ? q.metrics
-          : [{metered_feature: 'codex', window: '', left_percent: q.left_percent, reset_at: q.reset_at}];
-        const plan = this.escapeHtml(String(q.plan_type || '').toUpperCase());
-        const metricRows = metrics.map((m) => {
-          const left = Math.max(0, Math.min(100, Number(m.left_percent || 0)));
-          const used = Math.max(0, Math.min(100, 100 - left));
-          const ringColor = used >= 90 ? '#dc3545' : (used >= 70 ? '#fd7e14' : '#198754');
-          const resetAge = this.formatUntil(m.reset_at);
+          : [{metered_feature: 'quota', window: '', left_percent: q.left_percent, reset_at: q.reset_at}];
+        metrics.forEach((m) => {
           const feature = String(m.metered_feature || '').trim();
           const windowLabel = String(m.window || '').trim();
-          const labelParts = [];
-          if (feature) labelParts.push(feature);
-          if (windowLabel) labelParts.push(windowLabel);
-          const label = this.escapeHtml(labelParts.join(' · ') || 'quota');
-          const tileFlex = (window.innerWidth && window.innerWidth < 768) ? '1 1 100%' : '1 1 240px';
-          return '<div class="border rounded p-2 bg-body d-flex align-items-center gap-2" style="min-width:180px;flex:' + tileFlex + ';max-width:100%;">' +
-            '<div style="width:62px;height:62px;border-radius:999px;background:conic-gradient(' + ringColor + ' ' + used + '%, rgba(128,128,128,0.25) 0);display:flex;align-items:center;justify-content:center;">' +
+          let groupName = providerName;
+          if (groupField === 'provider') {
+            groupName = providerName;
+          } else if (feature && !feature.toLowerCase().includes('request') && !feature.toLowerCase().includes('token')) {
+            groupName = feature;
+          }
+          const key = groupName || providerName || 'quota';
+          if (!groups[key]) groups[key] = {name: key, provider: providerName, requests: null, tokens: null, other: []};
+          const kind = this.quotaMetricKind(m);
+          if (kind === 'requests') groups[key].requests = m;
+          else if (kind === 'tokens') groups[key].tokens = m;
+          else groups[key].other.push(m);
+        });
+      });
+      const cards = Object.values(groups).sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''))).map((g) => {
+        const metricLeftPercent = (metric) => {
+          if (!metric) return 0;
+          const limitVal = Number(metric.limit_value || 0);
+          const remainVal = Number(metric.remaining_value);
+          let left = Number(metric.left_percent || 0);
+          if (Number.isFinite(limitVal) && limitVal > 0 && Number.isFinite(remainVal)) left = (remainVal / limitVal) * 100;
+          return Math.max(0, Math.min(100, left));
+        };
+        const ringColorFromUsed = (used) => (used >= 90 ? '#dc3545' : (used >= 70 ? '#fd7e14' : '#198754'));
+        const renderCircle = (metric, label) => {
+          if (!metric) return '';
+          const left = metricLeftPercent(metric);
+          const used = Math.max(0, Math.min(100, 100 - left));
+          const ringColor = ringColorFromUsed(used);
+          const tip = this.escapeHtml(this.quotaTooltipText(metric));
+          const resetAge = this.formatUntil(metric && metric.reset_at);
+          return '<div class="d-flex align-items-center gap-2">' +
+            '<div' + (tip ? (' title="' + tip + '"') : '') + ' style="width:62px;height:62px;border-radius:999px;background:conic-gradient(' + ringColor + ' ' + used + '%, rgba(128,128,128,0.25) 0);display:flex;align-items:center;justify-content:center;cursor:help;">' +
               '<div class="bg-body rounded-circle d-flex align-items-center justify-content-center fw-semibold" style="width:48px;height:48px;font-size:12px;">' + Math.round(left) + '%</div>' +
             '</div>' +
-            '<div class="small" style="min-width:0;">' +
-              '<div class="fw-semibold text-break">' + label + '</div>' +
-              '<div class="text-body-secondary">Quota left · ' + Math.round(left) + '%</div>' +
-              '<div class="text-body-secondary">' + (resetAge ? ('resets ' + this.escapeHtml(resetAge)) : 'reset unknown') + '</div>' +
+            '<div class="small"><div class="fw-semibold">' + this.escapeHtml(label) + '</div><div class="text-body-secondary">' + (resetAge ? ('resets ' + this.escapeHtml(resetAge)) : 'reset unknown') + '</div></div>' +
+          '</div>';
+        };
+        const renderDualCircle = (reqMetric, tokMetric) => {
+          if (!reqMetric || !tokMetric) return '';
+          const reqLeft = metricLeftPercent(reqMetric);
+          const tokLeft = metricLeftPercent(tokMetric);
+          const reqUsed = Math.max(0, Math.min(100, 100 - reqLeft));
+          const tokUsed = Math.max(0, Math.min(100, 100 - tokLeft));
+          const reqColor = ringColorFromUsed(reqUsed);
+          const tokColor = ringColorFromUsed(tokUsed);
+          const reqReset = this.formatUntil(reqMetric && reqMetric.reset_at);
+          const tokReset = this.formatUntil(tokMetric && tokMetric.reset_at);
+          const tip = this.escapeHtml('Tokens: ' + this.quotaTooltipText(tokMetric) + ' | Requests: ' + this.quotaTooltipText(reqMetric));
+          return '<div class="d-flex align-items-center gap-2">' +
+            '<div' + (tip ? (' title="' + tip + '"') : '') + ' style="width:72px;height:72px;border-radius:999px;background:conic-gradient(' + tokColor + ' ' + tokUsed + '%, rgba(128,128,128,0.25) 0);display:flex;align-items:center;justify-content:center;cursor:help;">' +
+              '<div class="bg-body rounded-circle d-flex align-items-center justify-content-center" style="width:54px;height:54px;">' +
+                '<div style="width:42px;height:42px;border-radius:999px;background:conic-gradient(' + reqColor + ' ' + reqUsed + '%, rgba(96,96,96,0.38) 0);display:flex;align-items:center;justify-content:center;">' +
+                  '<div class="bg-body rounded-circle d-flex align-items-center justify-content-center fw-semibold" style="width:28px;height:28px;font-size:9px;">' + Math.round(reqLeft) + '%</div>' +
+                '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="small">' +
+              '<div class="fw-semibold">Tokens ' + Math.round(tokLeft) + '%</div>' +
+              '<div class="text-body-secondary">' + (tokReset ? ('resets ' + this.escapeHtml(tokReset)) : 'reset unknown') + '</div>' +
+              '<div class="fw-semibold mt-1">Requests ' + Math.round(reqLeft) + '%</div>' +
+              '<div class="text-body-secondary">' + (reqReset ? ('resets ' + this.escapeHtml(reqReset)) : 'reset unknown') + '</div>' +
             '</div>' +
           '</div>';
-        }).join('');
-        return '<div class="border rounded p-2 bg-body" style="width:100%;flex:1 1 100%;max-width:100%;">' +
-          '<div class="small fw-semibold mb-2">' + name + (plan ? (' · ' + plan) : '') + staleHtml + '</div>' +
-          '<div class="d-flex flex-wrap gap-2 align-items-stretch" style="width:100%;">' + metricRows + '</div>' +
+        };
+        const dualCircle = renderDualCircle(g.requests, g.tokens);
+        const reqCircle = dualCircle ? '' : renderCircle(g.requests, 'Requests');
+        const tokCircle = dualCircle ? '' : renderCircle(g.tokens, 'Tokens');
+        const fallbackCircle = (!reqCircle && !tokCircle) ? renderCircle(g.other[0] || null, 'Quota') : '';
+        const subtitle = (String(g.provider || '').trim() && String(g.provider || '').trim() !== String(g.name || '').trim())
+          ? ('<div class="small text-body-secondary text-break">' + this.escapeHtml(g.provider) + '</div>')
+          : '';
+        return '<div class="border rounded p-2 bg-body">' +
+          subtitle +
+          '<div class="fw-semibold small text-break mb-2">' + this.escapeHtml(g.name || 'quota') + '</div>' +
+          '<div class="d-flex flex-wrap gap-3 align-items-center mt-2">' + (dualCircle + reqCircle + tokCircle + fallbackCircle) + '</div>' +
         '</div>';
       }).join('');
-      return '<div class="mt-2 d-flex flex-wrap gap-2 align-items-start" style="width:100%;">' + cards + '</div>';
+      return '<div class="mt-2" style="width:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.5rem;align-items:stretch;">' + (cards || '<div class="small text-body-secondary">No quota data.</div>') + '</div>';
     },
     renderUsageChart(sourceMap, title) {
       const colors = ['#0d6efd', '#198754', '#dc3545', '#fd7e14', '#20c997', '#6f42c1', '#0dcaf0', '#ffc107', '#6c757d', '#6610f2'];
@@ -1570,7 +1622,6 @@ function adminApp() {
     openAddAccessTokenModal() {
       this.showAddAccessTokenModal = true;
       this.accessTokenDraft = {id:'', name:'', key:this.randomTokenKey(), role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0'};
-      this.accessTokenStatusHtml = '';
     },
     openEditAccessTokenModal(id) {
       const sid = String(id || '').trim();
@@ -1595,13 +1646,11 @@ function adminApp() {
         quota_tokens_limit: Number(qt.limit || 0) > 0 ? String(qt.limit) : '',
         quota_tokens_interval_seconds: String(Number(qt.interval_seconds || 0))
       };
-      this.accessTokenStatusHtml = '';
     },
     closeAddAccessTokenModal() {
       if (this.requiresInitialTokenSetup) return;
       this.showAddAccessTokenModal = false;
       this.accessTokenDraft = {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0'};
-      this.accessTokenStatusHtml = '';
     },
     buildAccessTokenQuotaPayload() {
       if (!this.accessTokenDraft.quota_enabled) return null;
@@ -1633,9 +1682,9 @@ function adminApp() {
       if (!key) return;
       try {
         await navigator.clipboard.writeText(key);
-        this.accessTokenStatusHtml = '<span class="text-success">Key copied.</span>';
+        this.toastSuccess('Key copied.');
       } catch (_) {
-        this.accessTokenStatusHtml = '<span class="text-danger">Could not copy key.</span>';
+        this.toastError('Could not copy key.');
       }
     },
     expiryPresetToRFC3339(preset) {
@@ -1760,10 +1809,24 @@ function adminApp() {
     async loadStats(force) {
       const sec = Math.max(1, Number(this.statsRangeHours || 8)) * 3600;
       const u = force ? ('/admin/api/stats?period_seconds=' + sec + '&force=1') : ('/admin/api/stats?period_seconds=' + sec);
+      this.statsLoading = true;
+      const hasExistingStats = !!(this.stats && typeof this.stats === 'object' && Object.keys(this.stats).length > 0);
+      if (!hasExistingStats) {
+        this.renderStatsLoading();
+      }
       const r = await this.apiFetch(u, {headers:this.headers()});
-      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
-      if (!r.ok) return;
+      if (r.status === 401) {
+        this.statsLoading = false;
+        window.location = '/admin/login?next=/admin';
+        return;
+      }
+      if (!r.ok) {
+        this.statsLoading = false;
+        this.statsSummaryHtml = '<div class="small text-danger">Failed to load usage stats.</div>';
+        return;
+      }
       this.stats = await r.json();
+      this.statsLoading = false;
       this.renderStats();
     },
     async refreshQuota() {
@@ -1801,10 +1864,39 @@ function adminApp() {
         };
         const r = await this.apiFetch('/admin/api/settings/security', {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
-        this.statusHtml = r.ok ? '<span class="text-success">Security settings saved.</span>' : '<span class="text-danger">Failed to save security settings.</span>';
+        if (r.ok) {
+          this.toastSuccess('Security settings saved.');
+          return true;
+        }
+        this.toastError('Failed to save security settings.');
+        return false;
       } finally {
         this.securitySaveInProgress = false;
       }
+    },
+    async openAccessSettingsModal() {
+      await this.loadSecuritySettings();
+      this.showAccessSettingsModal = true;
+    },
+    closeAccessSettingsModal() {
+      if (this.securitySaveInProgress) return;
+      this.showAccessSettingsModal = false;
+    },
+    async saveAccessSettings() {
+      const ok = await this.saveSecuritySettings();
+      if (ok) this.showAccessSettingsModal = false;
+    },
+    async openProvidersSettingsModal() {
+      await this.loadSecuritySettings();
+      this.showProvidersSettingsModal = true;
+    },
+    closeProvidersSettingsModal() {
+      if (this.securitySaveInProgress) return;
+      this.showProvidersSettingsModal = false;
+    },
+    async saveProvidersSettings() {
+      const ok = await this.saveSecuritySettings();
+      if (ok) this.showProvidersSettingsModal = false;
     },
     async loadTLSSettings() {
       const r = await this.apiFetch('/admin/api/settings/tls', {headers:this.headers()});
@@ -1837,9 +1929,8 @@ function adminApp() {
         const r = await this.apiFetch('/admin/api/settings/tls', {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
         const txt = await r.text();
-        this.statusHtml = r.ok
-          ? '<span class="text-success">TLS settings saved. Restart torod for listener changes to apply.</span>'
-          : '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to save TLS settings.') + '</span>';
+        if (r.ok) this.toastSuccess('TLS settings saved. Restart torod for listener changes to apply.');
+        else this.toastError(txt || 'Failed to save TLS settings.');
         if (r.ok) {
           await this.loadTLSSettings();
         }
@@ -1862,11 +1953,11 @@ function adminApp() {
         const body = await r.json().catch(() => ({}));
         if (!r.ok || String(body.status || '').trim() !== 'ok') {
           const msg = String(body.error || '').trim() || 'TLS action failed.';
-          this.statusHtml = '<span class="text-danger">' + this.escapeHtml(msg) + '</span>';
+          this.toastError(msg);
           return;
         }
         const msg = String(body.message || '').trim() || fallbackMessage;
-        this.statusHtml = '<span class="text-success">' + this.escapeHtml(msg) + '</span>';
+        this.toastSuccess(msg);
       } finally {
         this.tlsActionInProgress = false;
       }
@@ -1893,7 +1984,7 @@ function adminApp() {
         this.persistActiveTab();
         if (!this.showAddAccessTokenModal) {
           this.openAddAccessTokenModal();
-          this.accessTokenStatusHtml = '<span class="text-warning">Create your first access token to enable API access.</span>';
+          this.toastWarning('Create your first access token to enable API access.');
         }
       }
     },
@@ -1916,7 +2007,7 @@ function adminApp() {
       if (this.logSaveInProgress) return;
       const maxLines = Number(this.logMaxLines || 0);
       if (!Number.isFinite(maxLines) || maxLines < 100 || maxLines > 200000) {
-        this.logStatusHtml = '<span class="text-danger">Max lines must be between 100 and 200000.</span>';
+        this.toastError('Max lines must be between 100 and 200000.');
         return;
       }
       this.logSaveInProgress = true;
@@ -1929,10 +2020,10 @@ function adminApp() {
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
         if (!r.ok) {
           const txt = await r.text();
-          this.logStatusHtml = '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to save log settings.') + '</span>';
+          this.toastError(txt || 'Failed to save log settings.');
           return;
         }
-        this.logStatusHtml = '<span class="text-success">Log settings saved.</span>';
+        this.toastSuccess('Log settings saved.');
         await this.loadLogSettings();
         await this.loadLogs();
       } finally {
@@ -1956,17 +2047,23 @@ function adminApp() {
       this.renderLogs();
     },
     async clearLogs() {
-      if (!window.confirm('Delete all persisted log entries?')) return;
+      this.openConfirmModal({
+        title: 'Clear Log',
+        message: 'Delete all persisted log entries?',
+        confirmLabel: 'Clear log'
+      }, async () => this.clearLogsConfirmed());
+    },
+    async clearLogsConfirmed() {
       const r = await this.apiFetch('/admin/api/logs', {method:'DELETE', headers:this.headers()});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) {
         const txt = await r.text();
-        this.logStatusHtml = '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to clear log.') + '</span>';
+        this.toastError(txt || 'Failed to clear log.');
         return;
       }
       this.logEntries = [];
       this.renderLogs();
-      this.logStatusHtml = '<span class="text-success">Log cleared.</span>';
+      this.toastSuccess('Log cleared.');
     },
     renderLogs() {
       const allRows = (this.logEntries || []).map((e) => {
@@ -2006,12 +2103,14 @@ function adminApp() {
       return t.toLocaleString();
     },
     async openConversationsSettingsModal() {
-      this.conversationsStatusHtml = '';
       await this.loadConversationsSettings();
       this.showConversationsSettingsModal = true;
     },
     closeConversationsSettingsModal() {
       this.showConversationsSettingsModal = false;
+    },
+    closeConversationDetailModal() {
+      this.showConversationDetailModal = false;
     },
     async loadConversationsSettings() {
       const r = await this.apiFetch('/admin/api/settings/conversations', {headers:this.headers()});
@@ -2029,11 +2128,11 @@ function adminApp() {
       const maxItems = Number(this.conversationsSettings.max_items || 0);
       const maxAgeDays = Number(this.conversationsSettings.max_age_days || 0);
       if (!Number.isFinite(maxItems) || maxItems < 100 || maxItems > 200000) {
-        this.conversationsStatusHtml = '<span class="text-danger">Max items must be between 100 and 200000.</span>';
+        this.toastError('Max items must be between 100 and 200000.');
         return;
       }
       if (!Number.isFinite(maxAgeDays) || maxAgeDays < 1) {
-        this.conversationsStatusHtml = '<span class="text-danger">Max age days must be at least 1.</span>';
+        this.toastError('Max age days must be at least 1.');
         return;
       }
       this.conversationsSaveInProgress = true;
@@ -2047,10 +2146,10 @@ function adminApp() {
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
         if (!r.ok) {
           const txt = await r.text();
-          this.conversationsStatusHtml = '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to save conversation settings.') + '</span>';
+          this.toastError(txt || 'Failed to save conversation settings.');
           return;
         }
-        this.conversationsStatusHtml = '<span class="text-success">Conversation settings saved.</span>';
+        this.toastSuccess('Conversation settings saved.');
         await this.loadConversationsSettings();
         await this.loadConversations(true);
         this.closeConversationsSettingsModal();
@@ -2064,27 +2163,46 @@ function adminApp() {
       if (q) params.set('q', q);
       params.set('limit', '5000');
       const url = '/admin/api/conversations' + (params.toString() ? ('?' + params.toString()) : '');
-      const r = await this.apiFetch(url, {headers:this.headers()});
+      let r = null;
+      try {
+        r = await this.apiFetch(url, {headers:this.headers()});
+      } catch (_) {
+        this.conversationsListHtml = '<div class=\"small text-danger\">Failed to load conversations (network error).</div>';
+        this.conversationDetailHtml = '<div class=\"small text-body-secondary\">Select a conversation to inspect chat flow.</div>';
+        this.conversationsPagerHtml = '';
+        return;
+      }
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
-      if (!r.ok) return;
+      if (!r.ok) {
+        const msg = await r.text().catch(() => '');
+        this.conversationsListHtml = '<div class=\"small text-danger\">Failed to load conversations: ' + this.escapeHtml(msg || ('HTTP ' + r.status)) + '</div>';
+        this.conversationDetailHtml = '<div class=\"small text-body-secondary\">Select a conversation to inspect chat flow.</div>';
+        this.conversationsPagerHtml = '';
+        return;
+      }
       const body = await r.json().catch(() => ({}));
       this.conversationThreads = Array.isArray(body.threads) ? body.threads : [];
-      this.conversationsPage = 1;
-      if (resetSelection && this.conversationThreads.length > 0) {
-        this.selectedConversationKey = String(this.conversationThreads[0].conversation_key || '').trim();
+      if (!body.enabled) {
+        this.conversationsListHtml = '<div class=\"small text-warning\">Conversation capture is disabled in settings.</div>';
+        this.conversationsPagerHtml = '';
+        this.conversationDetailHtml = '<div class=\"small text-body-secondary\">Enable conversation capture in settings to start recording.</div>';
+        return;
       }
-      if (!this.selectedConversationKey && this.conversationThreads.length > 0) {
-        this.selectedConversationKey = String(this.conversationThreads[0].conversation_key || '').trim();
+      this.conversationsPage = 1;
+      if (resetSelection) {
+        this.selectedConversationKey = '';
       }
       if (this.selectedConversationKey && !this.conversationThreads.some((x) => String(x.conversation_key || '').trim() === this.selectedConversationKey)) {
-        this.selectedConversationKey = this.conversationThreads.length ? String(this.conversationThreads[0].conversation_key || '').trim() : '';
+        this.selectedConversationKey = '';
       }
       this.renderConversationsList();
       if (this.selectedConversationKey) {
         await this.loadConversationDetail(this.selectedConversationKey);
       } else {
         this.conversationRecords = [];
-        this.conversationDetailHtml = '<div class="small text-body-secondary">No conversations found for current filters.</div>';
+        this.conversationDetailHtml = this.conversationThreads.length
+          ? '<div class="small text-body-secondary">Select a conversation above to inspect details.</div>'
+          : '<div class="small text-body-secondary">No conversations found for current filters.</div>';
       }
     },
     async loadConversationDetail(conversationKey) {
@@ -2098,24 +2216,58 @@ function adminApp() {
       this.conversationRecords = Array.isArray(body.records) ? body.records : [];
       this.renderConversationsList();
       this.renderConversationDetail();
+      this.showConversationDetailModal = true;
+    },
+    async removeConversation(conversationKey) {
+      const key = String(conversationKey || '').trim();
+      if (!key) return;
+      this.openConfirmModal({
+        title: 'Delete Conversation',
+        message: 'Delete this conversation and all its records?',
+        confirmLabel: 'Delete'
+      }, async () => this.removeConversationConfirmed(key));
+    },
+    async removeConversationConfirmed(key) {
+      const r = await this.apiFetch('/admin/api/conversations/' + encodeURIComponent(key), {method:'DELETE', headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) {
+        const txt = await r.text().catch(() => '');
+        this.toastError('Failed to delete conversation: ' + (txt || ('HTTP ' + r.status)));
+        return;
+      }
+      this.toastSuccess('Conversation deleted.');
+      if (this.selectedConversationKey === key) {
+        this.selectedConversationKey = '';
+        this.conversationRecords = [];
+        this.showConversationDetailModal = false;
+        this.conversationDetailHtml = '<div class=\"small text-body-secondary\">Select a conversation to inspect chat flow.</div>';
+      }
+      await this.loadConversations(false);
     },
     renderConversationsList() {
       const allRows = (this.conversationThreads || []).map((t) => {
         const key = String(t.conversation_key || '').trim();
         const selected = key && key === this.selectedConversationKey;
-        const cls = selected ? 'border-primary bg-primary-subtle' : 'border';
-        const provider = this.escapeHtml(t.provider || '-');
-        const model = this.escapeHtml(t.model || '-');
+        const cls = selected ? 'border-primary bg-primary-subtle' : 'border-secondary-subtle';
+        const provider = this.escapeHtml(this.conversationProviderDisplayName(t.provider || ''));
+        const model = this.escapeHtml(this.conversationModelDisplayName(t.provider || '', t.model || ''));
         const keyName = this.escapeHtml(t.api_key_name || '-');
         const remote = this.escapeHtml(t.remote_ip || '-');
         const updated = this.escapeHtml(this.formatRelativeAge(t.last_at || ''));
         const preview = this.escapeHtml(t.last_preview || '');
+        const count = Math.max(0, Number(t.count || 0));
         return '' +
-          '<button type=\"button\" class=\"btn w-100 text-start p-2 mb-2 ' + cls + '\" data-conversation-key=\"' + this.escapeHtml(key) + '\" onclick=\"window.__adminOpenConversation(this.getAttribute(\\\"data-conversation-key\\\"))\">' +
-            '<div class=\"fw-semibold small\">' + provider + ' · ' + model + '</div>' +
-            '<div class=\"small text-body-secondary\">' + keyName + ' · ' + remote + ' · ' + updated + '</div>' +
-            '<div class=\"small text-body-secondary\">' + preview + '</div>' +
-          '</button>';
+          '<div class=\"border rounded p-2 mb-2 ' + cls + '\">' +
+            '<div class=\"d-flex align-items-start justify-content-between gap-2\">' +
+              '<button type=\"button\" class=\"btn btn-sm text-start p-0 border-0 bg-transparent flex-grow-1\" data-conversation-key=\"' + this.escapeHtml(key) + '\" onclick=\"window.__adminOpenConversation(this.getAttribute(\'data-conversation-key\'))\">' +
+                '<div class=\"fw-semibold small\">' + provider + ' - ' + model + ' - ' + keyName + ' - ' + remote + ' - ' + updated + ' - ' + count + ' msgs</div>' +
+                '<div class=\"small text-body-secondary text-break\">' + preview + '</div>' +
+              '</button>' +
+              '<button class=\"icon-btn icon-btn-danger\" type=\"button\" title=\"Delete conversation\" aria-label=\"Delete conversation\" data-conversation-key=\"' + this.escapeHtml(key) + '\" onclick=\"window.__adminDeleteConversation(this.getAttribute(\'data-conversation-key\'))\">' +
+                '<svg xmlns=\"http://www.w3.org/2000/svg\" fill=\"currentColor\" viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z\"/><path d=\"M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z\"/></svg>' +
+              '</button>' +
+            '</div>' +
+          '</div>';
       });
       const page = this.paginateRows(allRows, this.conversationsPage, this.conversationsPageSize);
       this.conversationsPage = page.page;
@@ -2123,6 +2275,7 @@ function adminApp() {
       this.conversationsListHtml = page.rows.join('') || '<div class=\"small text-body-secondary\">No conversations yet.</div>';
       this.conversationsPagerHtml = this.renderPager(page.totalRows, page.page, page.totalPages, page.pageSize, 'Conversations');
       window.__adminOpenConversation = (key) => this.loadConversationDetail(key);
+      window.__adminDeleteConversation = (key) => this.removeConversation(key);
     },
     renderConversationDetail() {
       const records = this.conversationRecords || [];
@@ -2130,28 +2283,68 @@ function adminApp() {
         this.conversationDetailHtml = '<div class=\"small text-body-secondary\">No messages captured for this conversation.</div>';
         return;
       }
-      const rows = records.map((rec) => {
+      const rows = [];
+      let prevSentRaw = '';
+      let prevRecvRaw = '';
+      records.forEach((rec) => {
         const ts = this.escapeHtml(this.formatRelativeAge(rec.created_at || ''));
+        const tsTitle = this.escapeHtml(this.formatTimestamp(rec.created_at || ''));
         const status = this.escapeHtml(String(rec.status_code || ''));
         const latency = this.escapeHtml(String(rec.latency_ms || 0) + 'ms');
-        const sent = this.renderMarkdown(rec.request_text_markdown || '');
-        const recv = this.renderMarkdown(rec.response_text_markdown || '');
-        const reqPayload = this.escapeHtml(JSON.stringify(rec.request_payload || {}, null, 2));
-        const respPayload = this.escapeHtml(JSON.stringify(rec.response_payload || {}, null, 2));
+        const rawSent = String(rec.request_text_markdown || '');
+        const rawRecv = String(rec.response_text_markdown || '');
+        const apiSentDelta = String(rec.request_delta_markdown || '');
+        const apiRecvDelta = String(rec.response_delta_markdown || '');
+        const sentCollapsed = this.collapseRepeatedConversationText(rawSent, prevSentRaw);
+        const recvCollapsed = this.collapseRepeatedConversationText(rawRecv, prevRecvRaw);
+        prevSentRaw = rawSent;
+        prevRecvRaw = rawRecv;
+        const sentText = apiSentDelta || sentCollapsed;
+        const recvText = apiRecvDelta || recvCollapsed;
+        if (!sentText && !recvText) return;
+        const sent = this.renderMarkdown(sentText);
+        const recv = this.renderMarkdown(recvText);
         const reqHeaders = this.escapeHtml(JSON.stringify(rec.request_headers || {}, null, 2));
         const respHeaders = this.escapeHtml(JSON.stringify(rec.response_headers || {}, null, 2));
-        return '' +
-          '<div class=\"border rounded p-2 mb-2\">' +
-            '<div class=\"small text-body-secondary mb-2\">' + ts + ' · status ' + status + ' · ' + latency + '</div>' +
-            '<div class=\"row g-2\">' +
-              '<div class=\"col-md-6\"><div class=\"fw-semibold small mb-1\">Sent</div><div class=\"small\">' + sent + '</div></div>' +
-              '<div class=\"col-md-6\"><div class=\"fw-semibold small mb-1\">Received</div><div class=\"small\">' + recv + '</div></div>' +
+        rows.push('' +
+          '<div class=\"text-center small text-body-secondary mb-2\" title=\"' + tsTitle + '\">· ' + ts + ' ·</div>' +
+          '<div class=\"d-flex justify-content-end mb-2\">' +
+            '<div class=\"rounded-3 p-2 border bg-primary-subtle\" style=\"max-width:78%;\">' +
+              '<div class=\"small\">' + sent + '</div>' +
+              '<div class=\"mt-2\"><details><summary class=\"btn btn-sm btn-outline-secondary py-0 px-2\">Headers</summary><pre class=\"small mt-1 mb-0\"><code>' + reqHeaders + '</code></pre></details></div>' +
             '</div>' +
-            '<details class=\"mt-2\"><summary class=\"small\">Request payload / headers</summary><pre class=\"small mt-1 mb-1\"><code>' + reqPayload + '</code></pre><pre class=\"small mb-0\"><code>' + reqHeaders + '</code></pre></details>' +
-            '<details class=\"mt-2\"><summary class=\"small\">Response payload / headers</summary><pre class=\"small mt-1 mb-1\"><code>' + respPayload + '</code></pre><pre class=\"small mb-0\"><code>' + respHeaders + '</code></pre></details>' +
-          '</div>';
-      });
-      this.conversationDetailHtml = rows.join('');
+          '</div>' +
+          '<div class=\"d-flex justify-content-start mb-3\">' +
+            '<div class=\"rounded-3 p-2 border bg-body\" style=\"max-width:78%;\">' +
+              '<div class=\"small\">' + recv + '</div>' +
+              '<div class=\"mt-2 d-flex flex-wrap gap-2 align-items-center\"><span class=\"badge text-bg-secondary\">status ' + status + '</span><span class=\"badge text-bg-light border\">' + latency + '</span><details><summary class=\"btn btn-sm btn-outline-secondary py-0 px-2\">Headers</summary><pre class=\"small mt-1 mb-0\"><code>' + respHeaders + '</code></pre></details></div>' +
+            '</div>' +
+	          '</div>');
+	      });
+      if (!rows.length) {
+        this.conversationDetailHtml = '<div class=\"small text-body-secondary\">No new messages to display after deduplication.</div>';
+        return;
+      }
+      const head = '<div class=\"d-flex align-items-center justify-content-between mb-3\"><div class=\"small text-body-secondary\">Messages: <strong>' + rows.length + '</strong></div></div>';
+      this.conversationDetailHtml = head + rows.join('');
+    },
+    collapseRepeatedConversationText(currentText, previousText) {
+      const cur = String(currentText || '').replaceAll('\r\n', '\n');
+      const prev = String(previousText || '').replaceAll('\r\n', '\n');
+      if (!cur) return '';
+      if (!prev) return cur.trim();
+      if (cur === prev) return '';
+      if (cur.startsWith(prev)) return cur.slice(prev.length).trimStart();
+      const prevTailLimit = 12000;
+      const prevTail = prev.length > prevTailLimit ? prev.slice(prev.length - prevTailLimit) : prev;
+      const max = Math.min(prevTail.length, cur.length);
+      const minOverlap = 40;
+      for (let n = max; n >= minOverlap; n--) {
+        if (prevTail.slice(prevTail.length - n) === cur.slice(0, n)) {
+          return cur.slice(n).trimStart();
+        }
+      }
+      return cur.trim();
     },
     renderMarkdown(input) {
       const md = String(input || '').trim();
@@ -2159,12 +2352,26 @@ function adminApp() {
       try {
         let html = '';
         if (window.marked && typeof window.marked.parse === 'function') {
-          html = window.marked.parse(md, {gfm:true, breaks:true});
+          html = window.marked.parse(md, {gfm:true, breaks:false});
         } else {
           html = this.escapeHtml(md).replaceAll('\\n', '<br>');
         }
         if (window.DOMPurify && typeof window.DOMPurify.sanitize === 'function') {
           html = window.DOMPurify.sanitize(html);
+        }
+        if (html.includes('<table')) {
+          const wrap = document.createElement('div');
+          wrap.innerHTML = html;
+          wrap.querySelectorAll('table').forEach((table) => {
+            table.classList.add('table', 'table-sm', 'table-bordered', 'align-middle', 'mb-2');
+            if (!(table.parentElement && table.parentElement.classList && table.parentElement.classList.contains('table-responsive'))) {
+              const holder = document.createElement('div');
+              holder.className = 'table-responsive';
+              table.parentNode.insertBefore(holder, table);
+              holder.appendChild(table);
+            }
+          });
+          html = wrap.innerHTML;
         }
         return html;
       } catch (_) {
@@ -2178,17 +2385,17 @@ function adminApp() {
       }
       const name = String(this.accessTokenDraft.name || '').trim();
       if (!name) {
-        this.accessTokenStatusHtml = '<span class="text-danger">Name is required.</span>';
+        this.toastError('Name is required.');
         return;
       }
       const key = String(this.accessTokenDraft.key || '').trim();
       if (!key) {
-        this.accessTokenStatusHtml = '<span class="text-danger">Key is required.</span>';
+        this.toastError('Key is required.');
         return;
       }
       const role = String(this.accessTokenDraft.role || '').trim().toLowerCase();
       if (role !== 'admin' && role !== 'keymaster' && role !== 'inferrer') {
-        this.accessTokenStatusHtml = '<span class="text-danger">Type is required.</span>';
+        this.toastError('Type is required.');
         return;
       }
       const expiresAt = this.expiryPresetToRFC3339(this.accessTokenDraft.expiry_preset);
@@ -2200,18 +2407,18 @@ function adminApp() {
         quota: this.buildAccessTokenQuotaPayload()
       };
       if (this.accessTokenDraft.quota_enabled && !payload.quota) {
-        this.accessTokenStatusHtml = '<span class="text-danger">Set at least one quota limit.</span>';
+        this.toastError('Set at least one quota limit.');
         return;
       }
       const r = await this.apiFetch('/admin/api/access-tokens', {method:'POST', headers:this.headers(), body:JSON.stringify(payload)});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) {
         const txt = await r.text();
-        this.accessTokenStatusHtml = '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to add key') + '</span>';
+        this.toastError(txt || 'Failed to add key');
         return;
       }
       this.closeAddAccessTokenModal();
-      this.accessTokenStatusHtml = '<span class="text-success">Key added.</span>';
+      this.toastSuccess('Key added.');
       await this.loadAccessTokens();
     },
     async saveAccessTokenEdit() {
@@ -2219,12 +2426,12 @@ function adminApp() {
       if (!id) return;
       const name = String(this.accessTokenDraft.name || '').trim();
       if (!name) {
-        this.accessTokenStatusHtml = '<span class="text-danger">Name is required.</span>';
+        this.toastError('Name is required.');
         return;
       }
       const role = String(this.accessTokenDraft.role || '').trim().toLowerCase();
       if (role !== 'admin' && role !== 'keymaster' && role !== 'inferrer') {
-        this.accessTokenStatusHtml = '<span class="text-danger">Type is required.</span>';
+        this.toastError('Type is required.');
         return;
       }
       const preset = String(this.accessTokenDraft.expiry_preset || 'never').trim();
@@ -2238,32 +2445,38 @@ function adminApp() {
         quota: this.buildAccessTokenQuotaPayload()
       };
       if (this.accessTokenDraft.quota_enabled && !payload.quota) {
-        this.accessTokenStatusHtml = '<span class="text-danger">Set at least one quota limit.</span>';
+        this.toastError('Set at least one quota limit.');
         return;
       }
       const r = await this.apiFetch('/admin/api/access-tokens/' + encodeURIComponent(id), {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) {
         const txt = await r.text();
-        this.accessTokenStatusHtml = '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to update key') + '</span>';
+        this.toastError(txt || 'Failed to update key');
         return;
       }
       this.closeAddAccessTokenModal();
-      this.accessTokenStatusHtml = '<span class="text-success">Key updated.</span>';
+      this.toastSuccess('Key updated.');
       await this.loadAccessTokens();
     },
     async removeAccessToken(id) {
       const tokenId = String(id || '').trim();
       if (!tokenId) return;
-      if (!window.confirm('Delete this access token?')) return;
+      this.openConfirmModal({
+        title: 'Delete Access Token',
+        message: 'Delete this access token?',
+        confirmLabel: 'Delete'
+      }, async () => this.removeAccessTokenConfirmed(tokenId));
+    },
+    async removeAccessTokenConfirmed(tokenId) {
       const r = await this.apiFetch('/admin/api/access-tokens/' + encodeURIComponent(tokenId), {method:'DELETE', headers:this.headers()});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) {
         const txt = await r.text();
-        this.accessTokenStatusHtml = '<span class="text-danger">' + this.escapeHtml(txt || 'Failed to delete token') + '</span>';
+        this.toastError(txt || 'Failed to delete token');
         return;
       }
-      this.accessTokenStatusHtml = '<span class="text-success">Token deleted.</span>';
+      this.toastSuccess('Token deleted.');
       await this.loadAccessTokens();
     },
     openEditProviderModal(name) {
@@ -2360,11 +2573,11 @@ function adminApp() {
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       const body = await r.json().catch(() => ({}));
       if (r.ok && body.ok) {
-        this.modalStatusHtml = '<span class="text-success">Connection successful. Models found: ' + Number(body.model_count || 0) + '</span>';
+        this.toastSuccess('Connection successful. Models found: ' + Number(body.model_count || 0));
         return;
       }
-      const err = this.escapeHtml(body.error || 'Connection failed.');
-      this.modalStatusHtml = '<span class="text-danger">' + err + '</span>';
+      const err = body.error || 'Connection failed.';
+      this.toastError(err);
     },
     async saveProvider() {
       const payload = this.buildProviderPayload();
@@ -2373,14 +2586,13 @@ function adminApp() {
       const method = isEdit ? 'PUT' : 'POST';
       if (this.authMode === 'oauth') {
         if (!String(payload.auth_token || '').trim()) {
-          this.modalStatusHtml = '<span class="text-danger">Run browser OAuth login first.</span>';
+          this.toastError('Run browser OAuth login first.');
           return;
         }
         const r = await this.apiFetch(endpoint, {method, headers:this.headers(), body:JSON.stringify(payload)});
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
-        this.statusHtml = r.ok
-          ? ('<span class="text-success">Provider ' + (isEdit ? 'updated' : 'added') + '.</span>')
-          : ('<span class="text-danger">Failed to ' + (isEdit ? 'update' : 'add') + ' provider.</span>');
+        if (r.ok) this.toastSuccess('Provider ' + (isEdit ? 'updated' : 'added') + '.');
+        else this.toastError('Failed to ' + (isEdit ? 'update' : 'add') + ' provider.');
         if (!r.ok) return;
         this.closeAddProviderModal();
         this.loadProviders();
@@ -2391,15 +2603,14 @@ function adminApp() {
       if (tr.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       const tb = await tr.json().catch(() => ({}));
       if (!(tr.ok && tb.ok)) {
-        const err = this.escapeHtml(tb.error || 'Provider authentication failed.');
-        this.modalStatusHtml = '<span class="text-danger">' + err + '</span>';
+        const err = tb.error || 'Provider authentication failed.';
+        this.toastError(err);
         return;
       }
       const r = await this.apiFetch(endpoint, {method, headers:this.headers(), body:JSON.stringify(payload)});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
-      this.statusHtml = r.ok
-        ? ('<span class="text-success">Provider ' + (isEdit ? 'updated' : 'added') + '.</span>')
-        : ('<span class="text-danger">Failed to ' + (isEdit ? 'update' : 'add') + ' provider.</span>');
+      if (r.ok) this.toastSuccess('Provider ' + (isEdit ? 'updated' : 'added') + '.');
+      else this.toastError('Failed to ' + (isEdit ? 'update' : 'add') + ' provider.');
       if (!r.ok) return;
       this.closeAddProviderModal();
       this.loadProviders();
@@ -2407,17 +2618,25 @@ function adminApp() {
     async removeProvider(name) {
       const providerName = String(name || '').trim();
       if (!providerName) return;
-      if (!window.confirm('Delete provider "' + providerName + '"? This cannot be undone.')) return;
+      this.openConfirmModal({
+        title: 'Delete Provider',
+        message: 'Delete provider "' + providerName + '"? This cannot be undone.',
+        confirmLabel: 'Delete provider'
+      }, async () => this.removeProviderConfirmed(providerName));
+    },
+    async removeProviderConfirmed(providerName) {
       const r = await this.apiFetch('/admin/api/providers/'+encodeURIComponent(providerName), {method:'DELETE', headers:this.headers()});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
-      this.statusHtml = r.ok ? '<span class="text-success">Provider removed.</span>' : '<span class="text-danger">Failed to remove provider.</span>';
+      if (r.ok) this.toastSuccess('Provider removed.');
+      else this.toastError('Failed to remove provider.');
       if (!r.ok) return;
       this.loadProviders();
     },
     async refreshModels() {
       const r = await this.apiFetch('/admin/api/models/refresh', {method:'POST', headers:this.headers()});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
-      this.statusHtml = r.ok ? '<span class="text-success">Model refresh completed.</span>' : '<span class="text-danger">Model refresh failed.</span>';
+      if (r.ok) this.toastSuccess('Model refresh completed.');
+      else this.toastError('Model refresh failed.');
       if (r.ok && this.activeTab === 'models') {
         this.loadModelsCatalog(false);
       }

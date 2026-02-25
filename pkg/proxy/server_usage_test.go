@@ -13,6 +13,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/conversations"
 )
 
 func TestRecordUsageCountsRequestWithoutUsagePayload(t *testing.T) {
@@ -51,6 +52,82 @@ func TestRecordUsageParsesResponsesUsageSchema(t *testing.T) {
 	}
 	if summary.TotalTokens != 18 {
 		t.Fatalf("expected 18 total tokens, got %d", summary.TotalTokens)
+	}
+}
+
+func TestRecordUsageMeasuredSkipsFailedStatuses(t *testing.T) {
+	s := &Server{stats: NewStatsStore(100)}
+	s.recordUsageMeasured("openai", "openai/gpt-4.1", "gpt-4.1", 500, 100*time.Millisecond, 0, 0, 0, 0, 0, 0, clientUsageMeta{})
+
+	summary := s.stats.Summary(time.Hour)
+	if summary.Requests != 0 {
+		t.Fatalf("expected failed status to be skipped, got %d requests", summary.Requests)
+	}
+}
+
+func TestDedupeConversationTextPreservesSpacingAndMarkdown(t *testing.T) {
+	in := "time for a conversation\n" +
+		"time for a conversation\n" +
+		"\n" +
+		"hi hi\n" +
+		"hi    hi\n" +
+		"\n" +
+		"again\n" +
+		"again\n" +
+		"again\n"
+
+	out := dedupeConversationText(in)
+	if out != strings.TrimSpace(in) {
+		t.Fatalf("expected text fidelity, got: %q", out)
+	}
+}
+
+func TestProxyHandlerCapturesConversation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"id":"resp_conv_1",
+			"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8},
+			"choices":[{"message":{"role":"assistant","content":"hello"}}]
+		}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{
+		{
+			Name:           "test-provider",
+			BaseURL:        upstream.URL + "/v1",
+			APIKey:         "test-key",
+			Enabled:        true,
+			TimeoutSeconds: 10,
+		},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	resolver := NewProviderResolver(store)
+	s := &Server{
+		store:                 store,
+		resolver:              resolver,
+		stats:                 NewStatsStore(100),
+		providerHealthChecker: NewProviderHealthChecker(resolver, providerHealthCheckInterval),
+		adminHandler: &AdminHandler{
+			conversations: conversations.NewStore("", conversations.Settings{Enabled: true, MaxItems: 1000, MaxAgeDays: 30}),
+			wsClients:     map[*adminWSClient]struct{}{},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-provider/test-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.proxyHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	threads, _, total := s.adminHandler.conversations.ListThreads(conversations.ListFilter{Limit: 100})
+	if total < 1 || len(threads) < 1 {
+		t.Fatalf("expected at least one conversation thread, got total=%d len=%d", total, len(threads))
 	}
 }
 

@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/charmbracelet/log"
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	"github.com/lkarlslund/tokenrouter/pkg/assets"
@@ -61,7 +62,15 @@ type AdminHandler struct {
 	quotaCache    *cache.TTLMap[string, quotaCacheValue]
 	statsCache    *cache.TTLMap[int64, StatsSummary]
 	wsMu          sync.Mutex
-	wsClients     map[chan []byte]struct{}
+	wsClients     map[*adminWSClient]struct{}
+	statsNotifyAt time.Time
+}
+
+type adminWSClient struct {
+	ch          chan []byte
+	updateEvery time.Duration
+	lastRefresh time.Time
+	realtime    bool
 }
 
 type adminAuthContextKey struct{}
@@ -92,12 +101,21 @@ type quotaCacheValue struct {
 const quotaRefreshOK = 15 * time.Minute
 const quotaRefreshError = 30 * time.Second
 const statsRefreshInterval = 15 * time.Minute
-const adminRealtimeInterval = 2 * time.Second
+const adminWSCheckInterval = 1 * time.Second
+const adminWSRealtimeIdleRefresh = 5 * time.Minute
 
 type modelListResponse struct {
 	Data []struct {
 		ID string `json:"id"`
 	} `json:"data"`
+}
+
+type conversationRecordView struct {
+	conversations.Record
+	RequestDeltaMarkdown     string `json:"request_delta_markdown,omitempty"`
+	ResponseDeltaMarkdown    string `json:"response_delta_markdown,omitempty"`
+	RequestPreviousMarkdown  string `json:"request_previous_markdown,omitempty"`
+	ResponsePreviousMarkdown string `json:"response_previous_markdown,omitempty"`
 }
 
 func NewAdminHandler(store *config.ServerConfigStore, stats *StatsStore, resolver *ProviderResolver, pricingMgr *pricing.Manager, healthChecker *ProviderHealthChecker, instanceID string) *AdminHandler {
@@ -112,9 +130,9 @@ func NewAdminHandler(store *config.ServerConfigStore, stats *StatsStore, resolve
 		oauthSrvAddr:  "127.0.0.1:1455",
 		quotaCache:    cache.NewTTLMap[string, quotaCacheValue](),
 		statsCache:    cache.NewTTLMap[int64, StatsSummary](),
-		wsClients:     map[chan []byte]struct{}{},
+		wsClients:     map[*adminWSClient]struct{}{},
 	}
-	go h.runRealtimeTicker()
+	go h.runWSScheduler()
 	return h
 }
 
@@ -164,15 +182,14 @@ func (h *AdminHandler) RegisterRoutes(r chi.Router) {
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Delete("/admin/api/logs", h.logsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/conversations", h.conversationsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/conversations/{id}", h.conversationByIDAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Delete("/admin/api/conversations/{id}", h.conversationByIDAPI)
 }
 
-func (h *AdminHandler) runRealtimeTicker() {
-	t := time.NewTicker(adminRealtimeInterval)
+func (h *AdminHandler) runWSScheduler() {
+	t := time.NewTicker(adminWSCheckInterval)
 	defer t.Stop()
 	for range t.C {
-		h.broadcastAdminEvent(map[string]any{
-			"type": "refresh",
-		})
+		h.pushScheduledRefresh()
 	}
 }
 
@@ -186,42 +203,59 @@ func (h *AdminHandler) broadcastAdminEvent(event map[string]any) {
 	}
 	h.wsMu.Lock()
 	defer h.wsMu.Unlock()
-	for ch := range h.wsClients {
+	isRefresh := strings.TrimSpace(fmt.Sprintf("%v", event["type"])) == "refresh"
+	now := time.Now().UTC()
+	for client := range h.wsClients {
+		if isRefresh && !client.realtime {
+			continue
+		}
 		select {
-		case ch <- b:
+		case client.ch <- b:
+			if isRefresh {
+				client.lastRefresh = now
+			}
 		default:
 		}
 	}
 }
 
-func (h *AdminHandler) RecordConversation(in conversations.CaptureInput) {
+func (h *AdminHandler) RecordConversation(in conversations.CaptureInput) bool {
 	if h == nil || h.conversations == nil {
-		return
+		log.Warn("conversation capture skipped", "reason", "store_unavailable", "endpoint", strings.TrimSpace(in.Endpoint), "provider", strings.TrimSpace(in.Provider), "model", strings.TrimSpace(in.Model), "status", in.StatusCode)
+		return false
 	}
 	rec, ok := h.conversations.Add(in)
 	if !ok {
-		return
+		settings := h.conversations.Settings()
+		reason := "rejected"
+		if !settings.Enabled {
+			reason = "disabled"
+		}
+		log.Warn("conversation capture skipped", "reason", reason, "enabled", settings.Enabled, "endpoint", strings.TrimSpace(in.Endpoint), "provider", strings.TrimSpace(in.Provider), "model", strings.TrimSpace(in.Model), "status", in.StatusCode)
+		return false
 	}
+	log.Info("conversation captured", "conversation_key", rec.ConversationKey, "endpoint", strings.TrimSpace(rec.Endpoint), "provider", strings.TrimSpace(rec.Provider), "model", strings.TrimSpace(rec.Model), "status", rec.StatusCode, "latency_ms", rec.LatencyMS)
 	h.broadcastAdminEvent(map[string]any{
 		"type":             "conversation_append",
 		"conversation_key": rec.ConversationKey,
 		"id":               rec.ID,
 		"updated_at":       rec.UpdatedAt.Format(time.RFC3339Nano),
 	})
+	return true
 }
 
-func (h *AdminHandler) registerWSClient(ch chan []byte) {
+func (h *AdminHandler) registerWSClient(c *adminWSClient) {
 	h.wsMu.Lock()
 	defer h.wsMu.Unlock()
-	h.wsClients[ch] = struct{}{}
+	h.wsClients[c] = struct{}{}
 }
 
-func (h *AdminHandler) unregisterWSClient(ch chan []byte) {
+func (h *AdminHandler) unregisterWSClient(c *adminWSClient) {
 	h.wsMu.Lock()
 	defer h.wsMu.Unlock()
-	if _, ok := h.wsClients[ch]; ok {
-		delete(h.wsClients, ch)
-		close(ch)
+	if _, ok := h.wsClients[c]; ok {
+		delete(h.wsClients, c)
+		close(c.ch)
 	}
 }
 
@@ -248,20 +282,25 @@ func (h *AdminHandler) adminWebsocket(w http.ResponseWriter, r *http.Request) {
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	})
-	clientCh := make(chan []byte, 16)
-	h.registerWSClient(clientCh)
-	defer h.unregisterWSClient(clientCh)
-
-	h.broadcastAdminEvent(map[string]any{"type": "refresh"})
+	client := &adminWSClient{
+		ch:          make(chan []byte, 16),
+		updateEvery: adminWSRealtimeIdleRefresh,
+		realtime:    true,
+	}
+	h.registerWSClient(client)
+	defer h.unregisterWSClient(client)
+	h.sendWSRefreshToClient(client)
 	pingTicker := time.NewTicker(25 * time.Second)
 	defer pingTicker.Stop()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
 				return
 			}
+			h.handleWSClientMessage(client, payload)
 		}
 	}()
 	for {
@@ -272,7 +311,7 @@ func (h *AdminHandler) adminWebsocket(w http.ResponseWriter, r *http.Request) {
 			if err := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second)); err != nil {
 				return
 			}
-		case msg, ok := <-clientCh:
+		case msg, ok := <-client.ch:
 			if !ok {
 				return
 			}
@@ -281,6 +320,94 @@ func (h *AdminHandler) adminWebsocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+func (h *AdminHandler) handleWSClientMessage(client *adminWSClient, payload []byte) {
+	if client == nil || len(payload) == 0 {
+		return
+	}
+	var msg struct {
+		Type        string `json:"type"`
+		UpdateSpeed string `json:"update_speed"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		return
+	}
+	if strings.TrimSpace(msg.Type) != "subscribe" {
+		return
+	}
+	h.wsMu.Lock()
+	defer h.wsMu.Unlock()
+	client.updateEvery, client.realtime = parseWSUpdateEvery(msg.UpdateSpeed)
+}
+
+func parseWSUpdateEvery(updateSpeed string) (time.Duration, bool) {
+	switch strings.TrimSpace(strings.ToLower(updateSpeed)) {
+	case "2s":
+		return 2 * time.Second, false
+	case "10s":
+		return 10 * time.Second, false
+	case "30s":
+		return 30 * time.Second, false
+	case "1m":
+		return 1 * time.Minute, false
+	case "5m":
+		return 5 * time.Minute, false
+	case "15m":
+		return 15 * time.Minute, false
+	case "disabled":
+		return 0, false
+	case "realtime":
+		return adminWSRealtimeIdleRefresh, true
+	default:
+		return adminWSRealtimeIdleRefresh, true
+	}
+}
+
+func (h *AdminHandler) pushScheduledRefresh() {
+	now := time.Now().UTC()
+	h.wsMu.Lock()
+	defer h.wsMu.Unlock()
+	for client := range h.wsClients {
+		every := client.updateEvery
+		if every <= 0 {
+			continue
+		}
+		if !client.lastRefresh.IsZero() && now.Sub(client.lastRefresh) < every {
+			continue
+		}
+		select {
+		case client.ch <- []byte(`{"type":"refresh"}`):
+			client.lastRefresh = now
+		default:
+		}
+	}
+}
+
+func (h *AdminHandler) sendWSRefreshToClient(client *adminWSClient) {
+	if client == nil {
+		return
+	}
+	select {
+	case client.ch <- []byte(`{"type":"refresh"}`):
+		client.lastRefresh = time.Now().UTC()
+	default:
+	}
+}
+
+func (h *AdminHandler) NotifyStatsChanged() {
+	if h == nil {
+		return
+	}
+	now := time.Now().UTC()
+	h.wsMu.Lock()
+	if !h.statsNotifyAt.IsZero() && now.Sub(h.statsNotifyAt) < 1500*time.Millisecond {
+		h.wsMu.Unlock()
+		return
+	}
+	h.statsNotifyAt = now
+	h.wsMu.Unlock()
+	h.broadcastAdminEvent(map[string]any{"type": "refresh"})
 }
 
 func (h *AdminHandler) withRuntimeInstanceHeader(next http.Handler) http.Handler {
@@ -1264,6 +1391,10 @@ func parseGoogleRetrieveUserQuota(body []byte) (string, []ProviderQuotaMetric, e
 			MeteredFeature: modelID,
 			Window:         window,
 			LeftPercent:    leftPercent,
+			UsedValue:      100 - leftPercent,
+			RemainingValue: leftPercent,
+			LimitValue:     100,
+			Unit:           "percent",
 			ResetAt:        resetAt,
 		})
 	}
@@ -1726,6 +1857,14 @@ func huggingFaceMetricsFromHeaders(h http.Header) []ProviderQuotaMetric {
 	return rateLimitStructuredMetricsFromHeaders(h, "huggingface")
 }
 
+func quotaMetricUnit(feature string) string {
+	f := strings.ToLower(strings.TrimSpace(feature))
+	if strings.Contains(f, "token") {
+		return "tokens"
+	}
+	return "requests"
+}
+
 func rateLimitMetricsFromHeaders(h http.Header, keyPrefix string, classifySuffix func(string) (string, string)) []ProviderQuotaMetric {
 	if classifySuffix == nil {
 		return nil
@@ -1857,6 +1996,10 @@ func rateLimitMetricsFromHeaders(h http.Header, keyPrefix string, classifySuffix
 		if remaining > mp.limit {
 			remaining = mp.limit
 		}
+		used := mp.limit - remaining
+		if used < 0 {
+			used = 0
+		}
 		leftPercent := (remaining / mp.limit) * 100
 		feature, window := classifySuffix(suffix)
 		if strings.TrimSpace(feature) == "" || strings.TrimSpace(window) == "" {
@@ -1882,6 +2025,10 @@ func rateLimitMetricsFromHeaders(h http.Header, keyPrefix string, classifySuffix
 			MeteredFeature: feature,
 			Window:         window,
 			LeftPercent:    leftPercent,
+			UsedValue:      used,
+			RemainingValue: remaining,
+			LimitValue:     mp.limit,
+			Unit:           quotaMetricUnit(feature),
 			ResetAt:        resetAt,
 		})
 	}
@@ -1970,6 +2117,10 @@ func rateLimitStructuredMetricsFromHeaders(h http.Header, keyPrefix string) []Pr
 		if r > q {
 			r = q
 		}
+		used := q - r
+		if used < 0 {
+			used = 0
+		}
 		leftPercent := (r / q) * 100
 
 		resetAt := ""
@@ -1993,6 +2144,10 @@ func rateLimitStructuredMetricsFromHeaders(h http.Header, keyPrefix string) []Pr
 			Window:         window,
 			WindowSeconds:  windowSeconds,
 			LeftPercent:    leftPercent,
+			UsedValue:      used,
+			RemainingValue: r,
+			LimitValue:     q,
+			Unit:           quotaMetricUnit(feature),
 			ResetAt:        resetAt,
 		})
 	}
@@ -2362,6 +2517,10 @@ func antigravityMetricFromMap(m map[string]any, now time.Time) (ProviderQuotaMet
 		Window:         window,
 		WindowSeconds:  windowSeconds,
 		LeftPercent:    left,
+		UsedValue:      used,
+		RemainingValue: left,
+		LimitValue:     100,
+		Unit:           "percent",
 		ResetAt:        resetAt,
 	}, true
 }
@@ -2478,6 +2637,10 @@ func appendRateLimitMetrics(dst *[]ProviderQuotaMetric, seen map[string]struct{}
 			Window:         windowName,
 			WindowSeconds:  windowSeconds,
 			LeftPercent:    100 - usedPercent,
+			UsedValue:      usedPercent,
+			RemainingValue: 100 - usedPercent,
+			LimitValue:     100,
+			Unit:           "percent",
 		}
 		if resetAt > 0 {
 			m.ResetAt = time.Unix(resetAt, 0).UTC().Format(time.RFC3339)
@@ -2857,11 +3020,85 @@ func (h *AdminHandler) conversationByIDAPI(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "id is required", http.StatusBadRequest)
 		return
 	}
+	if decoded, err := url.PathUnescape(id); err == nil && strings.TrimSpace(decoded) != "" {
+		id = strings.TrimSpace(decoded)
+	}
+	if r.Method == http.MethodDelete {
+		removed := h.conversations.DeleteConversation(id)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "ok",
+			"id":      id,
+			"removed": removed,
+		})
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	records := h.conversations.Conversation(id)
+	views := buildConversationRecordViews(records)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":      id,
-		"records": records,
+		"records": views,
 	})
+}
+
+func buildConversationRecordViews(records []conversations.Record) []conversationRecordView {
+	if len(records) == 0 {
+		return []conversationRecordView{}
+	}
+	out := make([]conversationRecordView, 0, len(records))
+	prevReq := ""
+	prevResp := ""
+	for _, rec := range records {
+		req := strings.TrimSpace(rec.RequestTextMarkdown)
+		resp := strings.TrimSpace(rec.ResponseTextMarkdown)
+		view := conversationRecordView{
+			Record:                   rec,
+			RequestPreviousMarkdown:  prevReq,
+			ResponsePreviousMarkdown: prevResp,
+			RequestDeltaMarkdown:     extractConversationDelta(req, prevReq),
+			ResponseDeltaMarkdown:    extractConversationDelta(resp, prevResp),
+		}
+		out = append(out, view)
+		prevReq = req
+		prevResp = resp
+	}
+	return out
+}
+
+func extractConversationDelta(current, previous string) string {
+	cur := strings.ReplaceAll(strings.TrimSpace(current), "\r\n", "\n")
+	prev := strings.ReplaceAll(strings.TrimSpace(previous), "\r\n", "\n")
+	if cur == "" {
+		return ""
+	}
+	if prev == "" {
+		return cur
+	}
+	if cur == prev {
+		return ""
+	}
+	if strings.HasPrefix(cur, prev) {
+		return strings.TrimSpace(cur[len(prev):])
+	}
+	prevTail := prev
+	const tailLimit = 12000
+	if len(prevTail) > tailLimit {
+		prevTail = prevTail[len(prevTail)-tailLimit:]
+	}
+	maxOverlap := len(prevTail)
+	if len(cur) < maxOverlap {
+		maxOverlap = len(cur)
+	}
+	const minOverlap = 40
+	for n := maxOverlap; n >= minOverlap; n-- {
+		if prevTail[len(prevTail)-n:] == cur[:n] {
+			return strings.TrimSpace(cur[n:])
+		}
+	}
+	return cur
 }
 
 func (h *AdminHandler) tlsTestCertificateAPI(w http.ResponseWriter, r *http.Request) {

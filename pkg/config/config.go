@@ -155,10 +155,11 @@ func DefaultLogsPath() string {
 
 func NewDefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		ListenAddr:      ":8080",
-		IncomingTokens:  []IncomingAPIToken{},
-		DefaultProvider: "",
-		Providers:       []ProviderConfig{},
+		ListenAddr:                  ":8080",
+		IncomingTokens:              []IncomingAPIToken{},
+		DefaultProvider:             "",
+		Providers:                   []ProviderConfig{},
+		AutoEnablePublicFreeModels:  true,
 		Conversations: ConversationsConfig{
 			Enabled:    true,
 			MaxItems:   5000,
