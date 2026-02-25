@@ -31,17 +31,26 @@ function adminApp() {
     modelsCatalog: [],
     allowLocalhostNoAuth: false,
     allowHostDockerInternalNoAuth: false,
+    allowLocalhostNoAuthEffective: false,
+    allowHostDockerInternalNoAuthEffective: false,
     autoEnablePublicFreeModels: false,
     autoRemoveExpiredTokens: true,
     autoRemoveEmptyQuotaTokens: false,
     securitySaveInProgress: false,
     networkBindMode: 'localhost',
+    networkBindSelection: 'localhost',
     networkCustomBind: '',
     networkPort: 8080,
+    networkHTTPMode: 'enabled',
     networkActiveAddrs: [],
+    networkDetectedAddrs: [],
     networkPending: null,
     networkApplyInProgress: false,
-    tlsSettings: {enabled:false, domain:'', email:'', cache_dir:''},
+    tlsBindMode: 'localhost',
+    tlsBindSelection: 'localhost',
+    tlsCustomBind: '',
+    tlsPort: 443,
+    tlsSettings: {enabled:false, mode:'letsencrypt', domain:'', email:'', cache_dir:'', cert_pem:'', key_pem:'', cert_configured:false, key_configured:false},
     tlsSaveInProgress: false,
     tlsActionInProgress: false,
     statsSummaryHtml: '',
@@ -250,7 +259,7 @@ function adminApp() {
     restoreActiveTab() {
       try {
         const tab = window.localStorage.getItem(this.activeTabCacheKey);
-        if (tab === 'status' || tab === 'conversations' || tab === 'log' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'models') {
+        if (tab === 'status' || tab === 'conversations' || tab === 'log' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'network' || tab === 'models') {
           this.activeTab = tab;
         }
       } catch (_) {}
@@ -1986,8 +1995,10 @@ function adminApp() {
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) return;
       const body = await r.json();
-      this.allowLocalhostNoAuth = !!body.allow_localhost_no_auth;
-      this.allowHostDockerInternalNoAuth = !!body.allow_host_docker_internal_no_auth;
+      this.allowLocalhostNoAuthEffective = !!body.allow_localhost_no_auth;
+      this.allowHostDockerInternalNoAuthEffective = !!body.allow_host_docker_internal_no_auth;
+      this.allowLocalhostNoAuth = this.allowLocalhostNoAuthEffective;
+      this.allowHostDockerInternalNoAuth = this.allowHostDockerInternalNoAuthEffective;
       this.autoEnablePublicFreeModels = !!body.auto_enable_public_free_models;
       this.autoRemoveExpiredTokens = !!body.auto_remove_expired_tokens;
       this.autoRemoveEmptyQuotaTokens = !!body.auto_remove_empty_quota_tokens;
@@ -2006,6 +2017,8 @@ function adminApp() {
         const r = await this.apiFetch('/admin/api/settings/security', {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
         if (r.ok) {
+          this.allowLocalhostNoAuthEffective = !!payload.allow_localhost_no_auth;
+          this.allowHostDockerInternalNoAuthEffective = !!payload.allow_host_docker_internal_no_auth;
           this.toastSuccess('Security settings saved.');
           return true;
         }
@@ -2044,11 +2057,28 @@ function adminApp() {
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) return;
       const body = await r.json();
+      const mode = String(body.mode || '').trim().toLowerCase();
+      this.tlsSettings.mode = (mode === 'letsencrypt' || mode === 'self_signed' || mode === 'pem') ? mode : 'letsencrypt';
+      const bindMode = String(body.bind_mode || '').trim().toLowerCase();
+      this.tlsBindMode = (bindMode === 'localhost' || bindMode === 'all' || bindMode === 'custom') ? bindMode : 'localhost';
+      this.tlsCustomBind = String(body.custom_bind || '').trim();
+      const port = Number(body.port || 443);
+      this.tlsPort = (Number.isFinite(port) && port > 0) ? Math.trunc(port) : 443;
+      if (this.tlsBindMode === 'custom' && this.tlsCustomBind && this.networkDetectedAddrs.includes(this.tlsCustomBind)) {
+        this.tlsBindSelection = 'ip:' + this.tlsCustomBind;
+      } else {
+        this.tlsBindSelection = this.tlsBindMode;
+      }
       this.tlsSettings = {
         enabled: !!body.enabled,
+        mode: this.tlsSettings.mode,
         domain: String(body.domain || '').trim(),
         email: String(body.email || '').trim(),
-        cache_dir: String(body.cache_dir || '').trim()
+        cache_dir: String(body.cache_dir || '').trim(),
+        cert_pem: '',
+        key_pem: '',
+        cert_configured: !!body.cert_configured,
+        key_configured: !!body.key_configured
       };
     },
     async loadNetworkSettings() {
@@ -2059,51 +2089,114 @@ function adminApp() {
       const mode = String(body.bind_mode || '').trim().toLowerCase();
       this.networkBindMode = (mode === 'localhost' || mode === 'all' || mode === 'custom') ? mode : 'localhost';
       this.networkCustomBind = String(body.custom_bind || '').trim();
+      this.networkDetectedAddrs = Array.isArray(body.local_addrs) ? body.local_addrs.map((x) => String(x || '').trim()).filter(Boolean) : [];
+      if (this.networkBindMode === 'custom' && this.networkCustomBind && this.networkDetectedAddrs.includes(this.networkCustomBind)) {
+        this.networkBindSelection = 'ip:' + this.networkCustomBind;
+      } else {
+        this.networkBindSelection = this.networkBindMode;
+      }
       const p = Number(body.port || 8080);
       this.networkPort = (Number.isFinite(p) && p > 0) ? Math.trunc(p) : 8080;
+      const httpMode = String(body.http_mode || '').trim().toLowerCase();
+      this.networkHTTPMode = (httpMode === 'enabled' || httpMode === 'when_required' || httpMode === 'disabled') ? httpMode : 'enabled';
       this.networkActiveAddrs = Array.isArray(body.active) ? body.active.map((x) => String(x || '').trim()).filter(Boolean) : [];
       this.networkPending = (body.pending && typeof body.pending === 'object') ? body.pending : null;
+    },
+    onNetworkBindSelectionChange() {
+      const sel = String(this.networkBindSelection || '').trim();
+      if (sel === 'localhost' || sel === 'all' || sel === 'custom') {
+        this.networkBindMode = sel;
+        return;
+      }
+      if (sel.startsWith('ip:')) {
+        this.networkBindMode = 'custom';
+        this.networkCustomBind = sel.slice(3);
+      }
+    },
+    onTLSBindSelectionChange() {
+      const sel = String(this.tlsBindSelection || '').trim();
+      if (sel === 'localhost' || sel === 'all' || sel === 'custom') {
+        this.tlsBindMode = sel;
+        return;
+      }
+      if (sel.startsWith('ip:')) {
+        this.tlsBindMode = 'custom';
+        this.tlsCustomBind = sel.slice(3);
+      }
+    },
+    async onTLSCertFileChange(event) {
+      const file = event && event.target && event.target.files && event.target.files[0];
+      if (!file) return;
+      const text = await file.text().catch(() => '');
+      if (!text.trim()) {
+        this.toastError('Certificate PEM file is empty.');
+        return;
+      }
+      this.tlsSettings.cert_pem = text;
+      this.toastSuccess('Certificate PEM loaded.');
+    },
+    async onTLSKeyFileChange(event) {
+      const file = event && event.target && event.target.files && event.target.files[0];
+      if (!file) return;
+      const text = await file.text().catch(() => '');
+      if (!text.trim()) {
+        this.toastError('Private key PEM file is empty.');
+        return;
+      }
+      this.tlsSettings.key_pem = text;
+      this.toastSuccess('Private key PEM loaded.');
     },
     async applyNetworkSettings() {
       if (this.networkApplyInProgress) return;
       const mode = String(this.networkBindMode || '').trim().toLowerCase();
+      const httpMode = String(this.networkHTTPMode || '').trim().toLowerCase();
       const port = Math.trunc(Number(this.networkPort || 0));
       if (mode !== 'localhost' && mode !== 'all' && mode !== 'custom') {
         this.toastError('Bind mode must be localhost, all, or custom.');
-        return;
+        return false;
+      }
+      if (httpMode !== 'enabled' && httpMode !== 'when_required' && httpMode !== 'disabled') {
+        this.toastError('HTTP mode must be enabled, when_required, or disabled.');
+        return false;
       }
       if (!Number.isFinite(port) || port < 1 || port > 65535) {
         this.toastError('Port must be between 1 and 65535.');
-        return;
+        return false;
       }
       if (mode === 'custom' && !String(this.networkCustomBind || '').trim()) {
         this.toastError('Custom bind host is required.');
-        return;
+        return false;
       }
       this.networkApplyInProgress = true;
       try {
         const payload = {
           bind_mode: mode,
           custom_bind: String(this.networkCustomBind || '').trim(),
-          port
+          port,
+          http_mode: httpMode
         };
         const applyResp = await this.apiFetch('/admin/api/settings/network/apply', {
           method: 'POST',
           headers: this.headers(),
           body: JSON.stringify(payload)
         });
-        if (applyResp.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+        if (applyResp.status === 401) { window.location = '/admin/login?next=/admin'; return 'redirect'; }
         if (!applyResp.ok) {
           const txt = await applyResp.text();
           this.toastError(txt || 'Failed to apply network settings.');
-          return;
+          return 'failed';
         }
         const applyBody = await applyResp.json().catch(() => ({}));
         const switchID = String(applyBody.switch_id || '').trim();
         const expectedInstance = String(applyBody.instance_id || '').trim();
+        if (String(applyBody.status || '').trim() === 'ok' && !switchID) {
+          this.toastSuccess('Network settings saved.');
+          await this.loadNetworkSettings();
+          return 'ok';
+        }
         if (!switchID) {
           this.toastError('Network apply did not return switch id.');
-          return;
+          return 'failed';
         }
 
         const probeOK = await this.probeNewBinding(mode, String(applyBody.custom_bind || '').trim(), Number(applyBody.port || port), expectedInstance);
@@ -2112,28 +2205,35 @@ function adminApp() {
           headers: this.headers(),
           body: JSON.stringify({switch_id: switchID, probe_ok: !!probeOK})
         });
-        if (confirmResp.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+        if (confirmResp.status === 401) { window.location = '/admin/login?next=/admin'; return 'redirect'; }
         if (!confirmResp.ok) {
           const txt = await confirmResp.text();
           this.toastError(txt || 'Failed to confirm network switch.');
-          return;
+          return 'failed';
         }
         const confirmBody = await confirmResp.json().catch(() => ({}));
         if (!probeOK) {
           this.toastError('Could not verify new bind address; keeping existing listener.');
           await this.loadNetworkSettings();
-          return;
+          return 'failed';
         }
         const redirectURL = String(confirmBody.redirect_url || '').trim();
         if (redirectURL) {
           const payload = this.buildLocalStorageHandoffPayload();
           window.location = this.appendLocalStorageHandoffToURL(redirectURL, payload);
-          return;
+          return 'redirect';
         }
         window.location.reload();
+        return 'redirect';
       } finally {
         this.networkApplyInProgress = false;
       }
+    },
+    async applyNetworkPageSettings() {
+      if (this.networkApplyInProgress || this.tlsSaveInProgress || this.tlsActionInProgress) return;
+      const networkResult = await this.applyNetworkSettings();
+      if (networkResult !== 'ok') return;
+      await this.saveTLSSettings();
     },
     async probeNewBinding(mode, customHost, port, expectedInstance) {
       const proto = window.location.protocol === 'https:' ? 'https:' : 'http:';
@@ -2236,18 +2336,59 @@ function adminApp() {
       if (this.tlsSaveInProgress) return;
       this.tlsSaveInProgress = true;
       try {
+        const mode = String(this.tlsSettings.mode || '').trim().toLowerCase();
+        const bindMode = String(this.tlsBindMode || '').trim().toLowerCase();
+        const port = Math.trunc(Number(this.tlsPort || 0));
+        if (mode !== 'letsencrypt' && mode !== 'self_signed' && mode !== 'pem') {
+          this.toastError('TLS mode must be letsencrypt, self_signed, or pem.');
+          return false;
+        }
+        if (bindMode !== 'localhost' && bindMode !== 'all' && bindMode !== 'custom') {
+          this.toastError('TLS bind mode must be localhost, all, or custom.');
+          return false;
+        }
+        if (!Number.isFinite(port) || port < 1 || port > 65535) {
+          this.toastError('TLS port must be between 1 and 65535.');
+          return false;
+        }
+        if (bindMode === 'custom' && !String(this.tlsCustomBind || '').trim()) {
+          this.toastError('Custom TLS bind host is required.');
+          return false;
+        }
         const payload = {
           enabled: !!this.tlsSettings.enabled,
+          mode,
+          bind_mode: bindMode,
+          custom_bind: String(this.tlsCustomBind || '').trim(),
+          port,
           domain: String(this.tlsSettings.domain || '').trim(),
-          email: String(this.tlsSettings.email || '').trim()
+          email: String(this.tlsSettings.email || '').trim(),
+          cert_pem: String(this.tlsSettings.cert_pem || ''),
+          key_pem: String(this.tlsSettings.key_pem || '')
         };
         const r = await this.apiFetch('/admin/api/settings/tls', {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
-        const txt = await r.text();
-        if (r.ok) this.toastSuccess('TLS settings saved. Restart torod for listener changes to apply.');
-        else this.toastError(txt || 'Failed to save TLS settings.');
+        const body = await r.json().catch(() => ({}));
+        if (r.ok) this.toastSuccess('TLS settings saved.');
+        else if (r.status === 409 && String(body.status || '').trim() === 'transition_required' && String(body.http_url || '').trim()) {
+          const target = String(body.http_url || '').trim();
+          this.openConfirmModal({
+            title: 'Switch To HTTP',
+            message: 'Apply HTTPS listener changes from HTTP admin. Switch now?',
+            confirmLabel: 'Switch'
+          }, async () => {
+            const payload = this.buildLocalStorageHandoffPayload();
+            window.location = this.appendLocalStorageHandoffToURL(target, payload);
+          });
+          return false;
+        } else {
+          const msg = String(body.error || '').trim();
+          this.toastError(msg || 'Failed to save TLS settings.');
+          return false;
+        }
         if (r.ok) {
           await this.loadTLSSettings();
+          return true;
         }
       } finally {
         this.tlsSaveInProgress = false;

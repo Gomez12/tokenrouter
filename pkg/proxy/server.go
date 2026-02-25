@@ -6,11 +6,16 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -154,33 +159,68 @@ func (s *Server) Run(ctx context.Context) error {
 	s.runAccessTokenCleanupOnce()
 
 	if cfg.TLS.Enabled {
-		mgr := &autocert.Manager{
-			Cache:      autocert.DirCache(cfg.TLS.CacheDir),
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(cfg.TLS.Domain),
-			Email:      cfg.TLS.Email,
-		}
-
 		httpsSrv := *s.httpServer
-		httpsSrv.Addr = ":443"
-		httpsSrv.TLSConfig = &tls.Config{GetCertificate: mgr.GetCertificate, MinVersion: tls.VersionTLS12}
+		tlsListenAddr := strings.TrimSpace(cfg.TLS.ListenAddr)
+		if tlsListenAddr == "" {
+			tlsListenAddr = ":443"
+		}
+		httpsSrv.Addr = tlsListenAddr
+		httpMode := strings.ToLower(strings.TrimSpace(cfg.HTTPMode))
+		if httpMode == "" {
+			httpMode = "enabled"
+		}
+		var certFile string
+		var keyFile string
+		var httpChallenge *http.Server
+		switch strings.TrimSpace(cfg.TLS.Mode) {
+		case "pem":
+			httpsSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+			cert, err := tls.X509KeyPair([]byte(cfg.TLS.CertPEM), []byte(cfg.TLS.KeyPEM))
+			if err != nil {
+				return fmt.Errorf("load pem certificate: %w", err)
+			}
+			httpsSrv.TLSConfig.Certificates = []tls.Certificate{cert}
+		case "self_signed":
+			httpsSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+			cert, err := generateSelfSignedCert(strings.TrimSpace(cfg.TLS.Domain))
+			if err != nil {
+				return fmt.Errorf("generate self-signed certificate: %w", err)
+			}
+			httpsSrv.TLSConfig.Certificates = []tls.Certificate{cert}
+		default:
+			mgr := &autocert.Manager{
+				Cache:      autocert.DirCache(cfg.TLS.CacheDir),
+				Prompt:     autocert.AcceptTOS,
+				HostPolicy: autocert.HostWhitelist(cfg.TLS.Domain),
+				Email:      cfg.TLS.Email,
+			}
+			httpsSrv.TLSConfig = &tls.Config{GetCertificate: mgr.GetCertificate, MinVersion: tls.VersionTLS12}
+			if httpMode != "disabled" {
+				httpChallenge = &http.Server{
+					Addr:              ":80",
+					Handler:           mgr.HTTPHandler(http.HandlerFunc(redirectHTTPS)),
+					ReadHeaderTimeout: 10 * time.Second,
+				}
+			}
+		}
+		if httpMode == "enabled" {
+			if err := s.addHTTPListener(cfg.ListenAddr); err != nil {
+				return fmt.Errorf("http listener (tls mode): %w", err)
+			}
+		}
 
-		httpChallenge := &http.Server{
-			Addr:              ":80",
-			Handler:           mgr.HTTPHandler(http.HandlerFunc(redirectHTTPS)),
-			ReadHeaderTimeout: 10 * time.Second,
+		if httpChallenge != nil {
+			go func() {
+				log.Infof("http challenge/redirect listening on :80")
+				if err := httpChallenge.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					errCh <- fmt.Errorf("http challenge server: %w", err)
+				}
+			}()
 		}
 
 		go func() {
-			log.Infof("http challenge/redirect listening on :80")
-			if err := httpChallenge.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errCh <- fmt.Errorf("http challenge server: %w", err)
-			}
-		}()
-
-		go func() {
-			log.Infof("https listening on :443 for %s", cfg.TLS.Domain)
-			if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Infof("https listening on %s (mode=%s)", tlsListenAddr, strings.TrimSpace(cfg.TLS.Mode))
+			if err := httpsSrv.ListenAndServeTLS(certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("https server: %w", err)
 			}
 		}()
@@ -190,7 +230,10 @@ func (s *Server) Run(ctx context.Context) error {
 		s.waitForProxyIdle(ctx)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = httpChallenge.Shutdown(shutdownCtx)
+		_ = s.httpServer.Shutdown(shutdownCtx)
+		if httpChallenge != nil {
+			_ = httpChallenge.Shutdown(shutdownCtx)
+		}
 		_ = httpsSrv.Shutdown(shutdownCtx)
 		return firstErr(errCh)
 	}
@@ -400,6 +443,53 @@ func quotaBudgetExhaustedWithoutReset(b *config.TokenQuotaBudget) bool {
 
 func redirectHTTPS(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "https://"+r.Host+r.RequestURI, http.StatusMovedPermanently)
+}
+
+func generateSelfSignedCert(domain string) (tls.Certificate, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	notBefore := time.Now().Add(-5 * time.Minute)
+	notAfter := notBefore.Add(365 * 24 * time.Hour)
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	host := strings.TrimSpace(domain)
+	if host == "" {
+		host = "localhost"
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: host,
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+	if host != "" && host != "localhost" {
+		if ip := net.ParseIP(host); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		} else {
+			tmpl.DNSNames = append(tmpl.DNSNames, host)
+		}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  priv,
+		Leaf:        tmpl,
+	}, nil
 }
 
 func requestDebugLogMiddleware(next http.Handler) http.Handler {

@@ -58,7 +58,7 @@
   }
 
   function scheduleRealtimeReconnect() {
-    if (!this.isStatusRealtimeMode()) return;
+    if (this.statusUpdateIntervalMs() < 0) return;
     if (this.wsReconnectTimer) return;
     const delay = Math.min(this.wsBackoffMs, 30000);
     this.wsReconnectTimer = setTimeout(() => {
@@ -145,6 +145,9 @@
       this.loadConversations(false);
     } else if (this.activeTab === 'log') {
       this.loadLogs();
+    } else if (this.activeTab === 'network') {
+      this.loadNetworkSettings();
+      this.loadTLSSettings();
     }
   }
 
@@ -181,7 +184,10 @@
       return;
     }
     if (s === 'network') {
-      if (this.activeTab === 'network') this.loadTLSSettings();
+      if (this.activeTab === 'network') {
+        this.loadNetworkSettings();
+        this.loadTLSSettings();
+      }
       return;
     }
     this.handleRealtimeRefresh(true);

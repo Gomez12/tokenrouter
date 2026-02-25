@@ -175,7 +175,7 @@
       <button class="nav-link rounded-top" :class="activeTab==='access' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('access')">
         <span>Access</span>
         <span
-          x-show="allowLocalhostNoAuth || allowHostDockerInternalNoAuth"
+          x-show="allowLocalhostNoAuthEffective || allowHostDockerInternalNoAuthEffective"
           style="display:none;width:1.05rem;height:1.05rem;line-height:1.05rem;font-size:0.74rem;"
           class="ms-1 d-inline-flex align-items-center justify-content-center rounded-circle bg-warning text-dark fw-bold align-middle"
           title="Unauthenticated API access is enabled."
@@ -391,7 +391,7 @@
           <h2 class="h5 mb-0">Access Tokens</h2>
           <div class="d-flex align-items-center gap-2">
             <span
-              x-show="allowLocalhostNoAuth || allowHostDockerInternalNoAuth"
+              x-show="allowLocalhostNoAuthEffective || allowHostDockerInternalNoAuthEffective"
               style="display:none;"
               class="badge text-bg-warning text-dark"
               title="Unauthenticated API access is enabled for localhost and/or host.docker.internal."
@@ -411,14 +411,30 @@
     <div class="card shadow-sm mb-3">
       <div class="card-body">
         <div class="mb-3">
-          <h2 class="h5 mb-2">Network Binding</h2>
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <div class="d-flex align-items-center gap-2">
+              <h2 class="h5 mb-0">Unencrypted (HTTP)</h2>
+              <div class="btn-group" role="group" aria-label="HTTP mode">
+                <button type="button" class="btn btn-sm" :class="networkHTTPMode==='enabled' ? 'btn-primary' : 'btn-outline-secondary'" @click="networkHTTPMode='enabled'">Enabled</button>
+                <button type="button" class="btn btn-sm" :class="networkHTTPMode==='when_required' ? 'btn-primary' : 'btn-outline-secondary'" @click="networkHTTPMode='when_required'">When required</button>
+                <button type="button" class="btn btn-sm" :class="networkHTTPMode==='disabled' ? 'btn-primary' : 'btn-outline-secondary'" @click="networkHTTPMode='disabled'">Disabled</button>
+              </div>
+            </div>
+            <button class="btn btn-primary" :disabled="networkApplyInProgress || tlsSaveInProgress || tlsActionInProgress" @click="applyNetworkPageSettings()">
+              <span x-show="!networkApplyInProgress && !tlsSaveInProgress">Apply</span>
+              <span x-show="networkApplyInProgress || tlsSaveInProgress">Applying...</span>
+            </button>
+          </div>
           <div class="row g-2 align-items-end">
             <div class="col-md-4">
               <label class="form-label">Bind</label>
-              <select class="form-select" x-model="networkBindMode">
-                <option value="localhost">localhost</option>
+              <select class="form-select" x-model="networkBindSelection" @change="onNetworkBindSelectionChange()">
+                <option value="localhost">localhost (127.0.0.1)</option>
                 <option value="all">all (0.0.0.0)</option>
                 <option value="custom">custom</option>
+                <template x-for="ip in networkDetectedAddrs" :key="ip">
+                  <option :value="'ip:' + ip" x-text="ip"></option>
+                </template>
               </select>
             </div>
             <div class="col-md-4" x-show="networkBindMode==='custom'" style="display:none;">
@@ -429,50 +445,106 @@
               <label class="form-label">Port</label>
               <input class="form-control" type="number" min="1" max="65535" step="1" x-model.number="networkPort" />
             </div>
-            <div class="col-md-2 d-grid">
-              <button class="btn btn-primary" :disabled="networkApplyInProgress" @click="applyNetworkSettings()">
-                <span x-show="!networkApplyInProgress">Apply</span>
-                <span x-show="networkApplyInProgress">Applying...</span>
-              </button>
-            </div>
           </div>
           <div class="small text-body-secondary mt-2">
             Active listeners:
             <span x-text="(networkActiveAddrs && networkActiveAddrs.length) ? networkActiveAddrs.join(', ') : 'none'"></span>
           </div>
         </div>
-        <div class="mb-2"><h2 class="h5 mb-0">Let's Encrypt TLS</h2></div>
-        <div class="form-check form-switch mb-2">
-          <input class="form-check-input" type="checkbox" id="tlsEnabled" x-model="tlsSettings.enabled">
-          <label class="form-check-label" for="tlsEnabled">Enable automatic Let's Encrypt certificates</label>
+      </div>
+    </div>
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="mb-2"><h2 class="h5 mb-0">Encrypted (HTTPS)</h2></div>
+        <div class="mb-3">
+          <div class="btn-group" role="group" aria-label="HTTPS mode">
+            <button type="button" class="btn btn-sm" :class="tlsSettings.enabled ? 'btn-primary' : 'btn-outline-secondary'" @click="tlsSettings.enabled=true">Enabled</button>
+            <button type="button" class="btn btn-sm" :class="!tlsSettings.enabled ? 'btn-primary' : 'btn-outline-secondary'" @click="tlsSettings.enabled=false">Disabled</button>
+          </div>
         </div>
         <div x-show="tlsSettings.enabled" style="display:none;">
-        <div class="row g-2 mb-2">
-          <div class="col-md-6">
-            <label class="form-label">External hostname</label>
-            <input class="form-control" placeholder="example.yourdomain.com" x-model="tlsSettings.domain" />
+          <div class="row g-2 mb-2">
+            <div class="col-md-4">
+              <label class="form-label">TLS mode</label>
+              <select class="form-select" x-model="tlsSettings.mode">
+                <option value="self_signed">Self signed key</option>
+                <option value="letsencrypt">LetsEncrypt</option>
+                <option value="pem">Upload PEM</option>
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Bind</label>
+              <select class="form-select" x-model="tlsBindSelection" @change="onTLSBindSelectionChange()">
+                <option value="localhost">localhost (127.0.0.1)</option>
+                <option value="all">all (0.0.0.0)</option>
+                <option value="custom">custom</option>
+                <template x-for="ip in networkDetectedAddrs" :key="'tls-' + ip">
+                  <option :value="'ip:' + ip" x-text="ip"></option>
+                </template>
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Port</label>
+              <input class="form-control" type="number" min="1" max="65535" step="1" x-model.number="tlsPort" />
+            </div>
           </div>
-          <div class="col-md-6">
-            <label class="form-label">ACME email (optional)</label>
-            <input class="form-control" placeholder="ops@example.com" x-model="tlsSettings.email" />
+          <div class="row g-2 mb-2" x-show="tlsBindMode==='custom'" style="display:none;">
+            <div class="col-md-6">
+              <label class="form-label">Custom host</label>
+              <input class="form-control" placeholder="e.g. 192.168.1.10" x-model="tlsCustomBind" />
+            </div>
           </div>
-        </div>
-        <div class="small text-body-secondary mb-3">ACME cache dir: <code x-text="tlsSettings.cache_dir || '(default)'"></code></div>
-        <div class="d-flex flex-wrap gap-2">
-          <button class="btn btn-outline-primary" :disabled="tlsSaveInProgress || tlsActionInProgress" @click="saveTLSSettings()">
-            <span x-show="!tlsSaveInProgress">Save TLS Settings</span>
-            <span x-show="tlsSaveInProgress">Saving...</span>
-          </button>
-          <button class="btn btn-outline-secondary" :disabled="tlsActionInProgress || tlsSaveInProgress" @click="testTLSCertificate()">
-            <span x-show="!tlsActionInProgress">Get Test Certificate</span>
-            <span x-show="tlsActionInProgress">Working...</span>
-          </button>
-          <button class="btn btn-outline-secondary" :disabled="tlsActionInProgress || tlsSaveInProgress" @click="renewTLSCertificate()">
-            <span x-show="!tlsActionInProgress">Force Renew Certificate</span>
-            <span x-show="tlsActionInProgress">Working...</span>
-          </button>
-        </div>
-        <div class="small text-body-secondary mt-2">Certificates require public DNS + reachability on ports 80/443 for ACME challenges.</div>
+
+          <div x-show="tlsSettings.mode==='letsencrypt'" style="display:none;">
+            <div class="row g-2 mb-2">
+              <div class="col-md-6">
+                <label class="form-label">External hostname</label>
+                <input class="form-control" placeholder="example.yourdomain.com" x-model="tlsSettings.domain" />
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">ACME email (optional)</label>
+                <input class="form-control" placeholder="ops@example.com" x-model="tlsSettings.email" />
+              </div>
+            </div>
+            <div class="d-flex flex-wrap gap-2">
+              <button class="btn btn-outline-secondary" :disabled="tlsActionInProgress || tlsSaveInProgress" @click="testTLSCertificate()">
+                <span x-show="!tlsActionInProgress">Get Test Certificate</span>
+                <span x-show="tlsActionInProgress">Working...</span>
+              </button>
+              <button class="btn btn-outline-secondary" :disabled="tlsActionInProgress || tlsSaveInProgress" @click="renewTLSCertificate()">
+                <span x-show="!tlsActionInProgress">Force Renew Certificate</span>
+                <span x-show="tlsActionInProgress">Working...</span>
+              </button>
+            </div>
+            <div class="small text-body-secondary mt-2">Certificates require public DNS + reachability on ports 80/443 for ACME challenges.</div>
+          </div>
+
+          <div x-show="tlsSettings.mode==='self_signed'" style="display:none;">
+            <div class="row g-2 mb-2">
+              <div class="col-md-6">
+                <label class="form-label">Hostname / IP (optional)</label>
+                <input class="form-control" placeholder="localhost" x-model="tlsSettings.domain" />
+              </div>
+            </div>
+            <div class="small text-body-secondary mb-2">Generates a self-signed certificate at runtime. Browsers/clients will warn unless trusted manually.</div>
+          </div>
+
+          <div x-show="tlsSettings.mode==='pem'" style="display:none;">
+            <div class="row g-2 mb-2">
+              <div class="col-md-6">
+                <label class="form-label">Certificate (PEM)</label>
+                <input class="form-control" type="file" accept=".pem,.crt,.cer,.txt" @change="onTLSCertFileChange($event)" />
+                <div class="small text-body-secondary mt-1" x-text="tlsSettings.cert_configured ? 'Certificate already configured' : 'No certificate configured yet'"></div>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Private key (PEM)</label>
+                <input class="form-control" type="file" accept=".pem,.key,.txt" @change="onTLSKeyFileChange($event)" />
+                <div class="small text-body-secondary mt-1" x-text="tlsSettings.key_configured ? 'Key already configured' : 'No key configured yet'"></div>
+              </div>
+            </div>
+            <div class="small text-body-secondary mb-2">Uploaded PEM content is stored in config.</div>
+          </div>
+
         </div>
       </div>
     </div>

@@ -39,10 +39,14 @@ type ProviderConfig struct {
 }
 
 type TLSConfig struct {
-	Enabled  bool   `toml:"enabled"`
-	Domain   string `toml:"domain"`
-	Email    string `toml:"email"`
-	CacheDir string `toml:"cache_dir"`
+	Enabled    bool   `toml:"enabled"`
+	Mode       string `toml:"mode"`
+	ListenAddr string `toml:"listen_addr"`
+	Domain     string `toml:"domain"`
+	Email      string `toml:"email"`
+	CacheDir   string `toml:"cache_dir"`
+	CertPEM    string `toml:"cert_pem,omitempty"`
+	KeyPEM     string `toml:"key_pem,omitempty"`
 }
 
 type ConversationsConfig struct {
@@ -81,6 +85,7 @@ type IncomingAPIToken struct {
 
 type ServerConfig struct {
 	ListenAddr                    string              `toml:"listen_addr"`
+	HTTPMode                      string              `toml:"http_mode"`
 	IncomingTokens                []IncomingAPIToken  `toml:"incoming_tokens"`
 	AllowLocalhostNoAuth          bool                `toml:"allow_localhost_no_auth"`
 	AllowHostDockerInternalNoAuth bool                `toml:"allow_host_docker_internal_no_auth"`
@@ -155,9 +160,18 @@ func DefaultLogsPath() string {
 	return filepath.Join(home, ".cache", "tokenrouter", "logs.json")
 }
 
+func DefaultTLSCacheDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "tls-autocert"
+	}
+	return filepath.Join(home, ".cache", "tokenrouter", "tls-autocert")
+}
+
 func NewDefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
 		ListenAddr:                 "127.0.0.1:8080",
+		HTTPMode:                   "enabled",
 		IncomingTokens:             []IncomingAPIToken{},
 		DefaultProvider:            "",
 		Providers:                  []ProviderConfig{},
@@ -173,10 +187,12 @@ func NewDefaultServerConfig() *ServerConfig {
 			MaxLines: 5000,
 		},
 		TLS: TLSConfig{
-			Enabled:  false,
-			Domain:   "",
-			Email:    "",
-			CacheDir: filepath.Join(os.TempDir(), "tokenrouter-autocert"),
+			Enabled:    false,
+			Mode:       "letsencrypt",
+			ListenAddr: ":443",
+			Domain:     "",
+			Email:      "",
+			CacheDir:   DefaultTLSCacheDir(),
 		},
 	}
 }
@@ -385,8 +401,31 @@ func (c *ServerConfig) Normalize() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = ":8080"
 	}
+	c.HTTPMode = strings.ToLower(strings.TrimSpace(c.HTTPMode))
+	if c.HTTPMode == "" {
+		c.HTTPMode = "enabled"
+	}
+	if c.HTTPMode != "enabled" && c.HTTPMode != "when_required" && c.HTTPMode != "disabled" {
+		c.HTTPMode = "enabled"
+	}
+	c.TLS.Mode = strings.ToLower(strings.TrimSpace(c.TLS.Mode))
+	if c.TLS.Mode == "" {
+		c.TLS.Mode = "letsencrypt"
+	}
+	if c.TLS.Mode != "letsencrypt" && c.TLS.Mode != "self_signed" && c.TLS.Mode != "pem" {
+		c.TLS.Mode = "letsencrypt"
+	}
+	c.TLS.ListenAddr = strings.TrimSpace(c.TLS.ListenAddr)
+	if c.TLS.ListenAddr == "" {
+		c.TLS.ListenAddr = ":443"
+	}
+	c.TLS.Domain = strings.TrimSpace(c.TLS.Domain)
+	c.TLS.Email = strings.TrimSpace(c.TLS.Email)
+	c.TLS.CacheDir = strings.TrimSpace(c.TLS.CacheDir)
+	c.TLS.CertPEM = strings.TrimSpace(c.TLS.CertPEM)
+	c.TLS.KeyPEM = strings.TrimSpace(c.TLS.KeyPEM)
 	if c.TLS.CacheDir == "" {
-		c.TLS.CacheDir = filepath.Join(os.TempDir(), "tokenrouter-autocert")
+		c.TLS.CacheDir = DefaultTLSCacheDir()
 	}
 	if c.Conversations.MaxItems <= 0 {
 		c.Conversations.MaxItems = 5000
@@ -482,8 +521,20 @@ func (c *ServerConfig) Validate() error {
 			}
 		}
 	}
-	if c.TLS.Enabled && c.TLS.Domain == "" {
-		return errors.New("tls.domain is required when tls.enabled=true")
+	if c.TLS.Enabled {
+		switch c.TLS.Mode {
+		case "letsencrypt":
+			if c.TLS.Domain == "" {
+				return errors.New("tls.domain is required when tls.enabled=true and tls.mode=letsencrypt")
+			}
+		case "pem":
+			if c.TLS.CertPEM == "" || c.TLS.KeyPEM == "" {
+				return errors.New("tls.cert_pem and tls.key_pem are required when tls.enabled=true and tls.mode=pem")
+			}
+		case "self_signed":
+		default:
+			return errors.New("tls.mode must be one of letsencrypt, self_signed, pem")
+		}
 	}
 	if c.Conversations.MaxItems < 100 {
 		return errors.New("conversations.max_items must be >= 100")
@@ -499,6 +550,12 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.Logs.MaxLines > 200000 {
 		return errors.New("logs.max_lines must be <= 200000")
+	}
+	if c.HTTPMode != "enabled" && c.HTTPMode != "when_required" && c.HTTPMode != "disabled" {
+		return errors.New("http_mode must be one of enabled, when_required, disabled")
+	}
+	if c.TLS.Enabled && c.TLS.Mode == "letsencrypt" && c.HTTPMode == "disabled" {
+		return errors.New("http_mode cannot be disabled when tls.mode=letsencrypt")
 	}
 	nameSeen := map[string]struct{}{}
 	for _, p := range c.Providers {

@@ -79,10 +79,11 @@ type adminWSClient struct {
 }
 
 type pendingNetworkSwitch struct {
-	ID      string
-	OldAddr string
-	NewAddr string
-	Created time.Time
+	ID       string
+	OldAddr  string
+	NewAddr  string
+	HTTPMode string
+	Created  time.Time
 }
 
 type adminAuthContextKey struct{}
@@ -3184,39 +3185,112 @@ func (h *AdminHandler) tlsSettingsAPI(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		cfg := h.store.Snapshot()
+		bindMode, customBind, port := decomposeListenAddr(strings.TrimSpace(cfg.TLS.ListenAddr))
 		writeJSON(w, http.StatusOK, map[string]any{
-			"enabled":   cfg.TLS.Enabled,
-			"domain":    strings.TrimSpace(cfg.TLS.Domain),
-			"email":     strings.TrimSpace(cfg.TLS.Email),
-			"cache_dir": strings.TrimSpace(cfg.TLS.CacheDir),
+			"enabled":         cfg.TLS.Enabled,
+			"mode":            strings.TrimSpace(cfg.TLS.Mode),
+			"domain":          strings.TrimSpace(cfg.TLS.Domain),
+			"email":           strings.TrimSpace(cfg.TLS.Email),
+			"cache_dir":       strings.TrimSpace(cfg.TLS.CacheDir),
+			"listen_addr":     strings.TrimSpace(cfg.TLS.ListenAddr),
+			"bind_mode":       bindMode,
+			"custom_bind":     customBind,
+			"port":            port,
+			"cert_configured": strings.TrimSpace(cfg.TLS.CertPEM) != "",
+			"key_configured":  strings.TrimSpace(cfg.TLS.KeyPEM) != "",
 		})
 	case http.MethodPut:
 		var payload struct {
-			Enabled bool   `json:"enabled"`
-			Domain  string `json:"domain"`
-			Email   string `json:"email"`
+			Enabled    bool   `json:"enabled"`
+			Mode       string `json:"mode"`
+			BindMode   string `json:"bind_mode"`
+			CustomBind string `json:"custom_bind"`
+			Port       int    `json:"port"`
+			Domain     string `json:"domain"`
+			Email      string `json:"email"`
+			CertPEM    string `json:"cert_pem"`
+			KeyPEM     string `json:"key_pem"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
+		cfg := h.store.Snapshot()
+		mode := strings.ToLower(strings.TrimSpace(payload.Mode))
+		if mode == "" {
+			mode = "letsencrypt"
+		}
+		if mode != "letsencrypt" && mode != "self_signed" && mode != "pem" {
+			http.Error(w, "mode must be one of letsencrypt, self_signed, pem", http.StatusBadRequest)
+			return
+		}
 		domain := strings.TrimSpace(payload.Domain)
 		email := strings.TrimSpace(payload.Email)
-		if payload.Enabled && domain == "" {
-			http.Error(w, "domain is required when tls is enabled", http.StatusBadRequest)
+		listenAddr, bindMode, customBind, port, err := composeListenAddr(payload.BindMode, payload.CustomBind, payload.Port)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		if r.TLS != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"status":   "transition_required",
+				"error":    "switch to HTTP admin before applying HTTPS listener changes",
+				"http_url": redirectURLForListenerWithScheme(r, strings.TrimSpace(cfg.ListenAddr), "http"),
+			})
+			return
+		}
+		certPEM := strings.TrimSpace(payload.CertPEM)
+		keyPEM := strings.TrimSpace(payload.KeyPEM)
+		if payload.Enabled && mode == "letsencrypt" && domain == "" {
+			http.Error(w, "domain is required when tls mode is letsencrypt", http.StatusBadRequest)
+			return
+		}
+		if payload.Enabled && mode == "letsencrypt" && strings.ToLower(strings.TrimSpace(cfg.HTTPMode)) == "disabled" {
+			http.Error(w, "http mode must be enabled or when_required when tls mode is letsencrypt", http.StatusBadRequest)
+			return
+		}
+		if payload.Enabled && mode == "pem" && (certPEM == "" || keyPEM == "") {
+			// Permit preserving already configured PEM material when fields are omitted.
+			if strings.TrimSpace(cfg.TLS.CertPEM) == "" || strings.TrimSpace(cfg.TLS.KeyPEM) == "" {
+				http.Error(w, "cert_pem and key_pem are required when tls mode is pem", http.StatusBadRequest)
+				return
+			}
+		}
+		if payload.Enabled && isPublicFacingListenAddr(listenAddr) {
+			if cfg.AllowLocalhostNoAuth || cfg.AllowHostDockerInternalNoAuth {
+				http.Error(w, "disable unauth localhost/docker access before enabling public tls bind", http.StatusBadRequest)
+				return
+			}
+			if !config.HasAdminToken(cfg.IncomingTokens) {
+				http.Error(w, "configure at least one non-expired admin token before enabling public tls bind", http.StatusBadRequest)
+				return
+			}
 		}
 		if err := h.store.Update(func(c *config.ServerConfig) error {
 			c.TLS.Enabled = payload.Enabled
+			c.TLS.Mode = mode
+			c.TLS.ListenAddr = listenAddr
 			c.TLS.Domain = domain
 			c.TLS.Email = email
+			if certPEM != "" {
+				c.TLS.CertPEM = certPEM
+			}
+			if keyPEM != "" {
+				c.TLS.KeyPEM = keyPEM
+			}
 			return nil
 		}); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		h.notifyAdminChanged("network")
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":      "ok",
+			"mode":        mode,
+			"bind_mode":   bindMode,
+			"custom_bind": customBind,
+			"port":        port,
+		})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -3249,8 +3323,10 @@ func (h *AdminHandler) networkSettingsAPI(w http.ResponseWriter, r *http.Request
 		"bind_mode":   bindMode,
 		"custom_bind": customBind,
 		"port":        port,
+		"http_mode":   strings.TrimSpace(cfg.HTTPMode),
 		"listen_addr": strings.TrimSpace(cfg.ListenAddr),
 		"active":      active,
+		"local_addrs": detectLocalBindCandidates(),
 		"pending":     pending,
 	})
 }
@@ -3261,17 +3337,26 @@ func (h *AdminHandler) networkApplyAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := h.store.Snapshot()
-	if cfg.TLS.Enabled {
-		http.Error(w, "network apply is not supported while TLS listener mode is enabled", http.StatusBadRequest)
-		return
-	}
 	var payload struct {
 		BindMode   string `json:"bind_mode"`
 		CustomBind string `json:"custom_bind"`
 		Port       int    `json:"port"`
+		HTTPMode   string `json:"http_mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	httpMode := strings.ToLower(strings.TrimSpace(payload.HTTPMode))
+	if httpMode == "" {
+		httpMode = "enabled"
+	}
+	if httpMode != "enabled" && httpMode != "when_required" && httpMode != "disabled" {
+		http.Error(w, "http_mode must be one of enabled, when_required, disabled", http.StatusBadRequest)
+		return
+	}
+	if cfg.TLS.Enabled && strings.ToLower(strings.TrimSpace(cfg.TLS.Mode)) == "letsencrypt" && httpMode == "disabled" {
+		http.Error(w, "http_mode cannot be disabled while letsencrypt tls is enabled", http.StatusBadRequest)
 		return
 	}
 	newAddr, bindMode, customBind, port, err := composeListenAddr(payload.BindMode, payload.CustomBind, payload.Port)
@@ -3283,7 +3368,40 @@ func (h *AdminHandler) networkApplyAPI(w http.ResponseWriter, r *http.Request) {
 	if oldAddr == "" {
 		oldAddr = "127.0.0.1:8080"
 	}
-
+	if cfg.TLS.Enabled {
+		if newAddr != oldAddr {
+			http.Error(w, "network bind/port apply is not supported while TLS listener mode is enabled", http.StatusBadRequest)
+			return
+		}
+		if err := h.store.Update(func(c *config.ServerConfig) error {
+			c.HTTPMode = httpMode
+			return nil
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		h.notifyAdminChanged("network")
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":      "ok",
+			"http_mode":   httpMode,
+			"bind_mode":   bindMode,
+			"custom_bind": customBind,
+			"port":        port,
+			"new_addr":    newAddr,
+			"old_addr":    oldAddr,
+		})
+		return
+	}
+	if isPublicFacingListenAddr(newAddr) {
+		if cfg.AllowLocalhostNoAuth || cfg.AllowHostDockerInternalNoAuth {
+			http.Error(w, "disable unauth localhost/docker access before enabling public bind", http.StatusBadRequest)
+			return
+		}
+		if !config.HasAdminToken(cfg.IncomingTokens) {
+			http.Error(w, "configure at least one non-expired admin token before enabling public bind", http.StatusBadRequest)
+			return
+		}
+	}
 	h.networkMu.Lock()
 	addFn := h.addListener
 	h.networkMu.Unlock()
@@ -3302,10 +3420,11 @@ func (h *AdminHandler) networkApplyAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sw := pendingNetworkSwitch{
-		ID:      id,
-		OldAddr: oldAddr,
-		NewAddr: newAddr,
-		Created: time.Now().UTC(),
+		ID:       id,
+		OldAddr:  oldAddr,
+		NewAddr:  newAddr,
+		HTTPMode: httpMode,
+		Created:  time.Now().UTC(),
 	}
 	h.networkMu.Lock()
 	h.networkSwitch = map[string]pendingNetworkSwitch{id: sw}
@@ -3315,6 +3434,7 @@ func (h *AdminHandler) networkApplyAPI(w http.ResponseWriter, r *http.Request) {
 		"status":      "pending_probe",
 		"switch_id":   id,
 		"instance_id": h.instance,
+		"http_mode":   httpMode,
 		"bind_mode":   bindMode,
 		"custom_bind": customBind,
 		"port":        port,
@@ -3357,8 +3477,17 @@ func (h *AdminHandler) networkConfirmAPI(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, map[string]any{"status": "cancelled"})
 		return
 	}
+	hardened := false
 	if err := h.store.Update(func(c *config.ServerConfig) error {
 		c.ListenAddr = sw.NewAddr
+		c.HTTPMode = sw.HTTPMode
+		if isPublicFacingListenAddr(sw.NewAddr) {
+			if c.AllowLocalhostNoAuth || c.AllowHostDockerInternalNoAuth {
+				hardened = true
+			}
+			c.AllowLocalhostNoAuth = false
+			c.AllowHostDockerInternalNoAuth = false
+		}
 		return nil
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -3372,6 +3501,7 @@ func (h *AdminHandler) networkConfirmAPI(w http.ResponseWriter, r *http.Request)
 		"status":       "ok",
 		"listen_addr":  sw.NewAddr,
 		"redirect_url": redirectURLForNewListener(r, sw.NewAddr),
+		"hardened":     hardened,
 	})
 }
 
@@ -3457,9 +3587,15 @@ func splitHostPortLoose(addr string) (host string, port int) {
 }
 
 func redirectURLForNewListener(r *http.Request, listenAddr string) string {
+	return redirectURLForListenerWithScheme(r, listenAddr, "")
+}
+
+func redirectURLForListenerWithScheme(r *http.Request, listenAddr string, forceScheme string) string {
 	host, port := splitHostPortLoose(listenAddr)
 	scheme := "http"
-	if r.TLS != nil {
+	if strings.TrimSpace(forceScheme) != "" {
+		scheme = strings.TrimSpace(forceScheme)
+	} else if r.TLS != nil {
 		scheme = "https"
 	}
 	currentHost := strings.TrimSpace(r.Host)
@@ -3475,6 +3611,75 @@ func redirectURLForNewListener(r *http.Request, listenAddr string) string {
 		}
 	}
 	return fmt.Sprintf("%s://%s/admin", scheme, net.JoinHostPort(targetHost, strconv.Itoa(port)))
+}
+
+func isPublicFacingListenAddr(listenAddr string) bool {
+	host, _ := splitHostPortLoose(listenAddr)
+	h := strings.ToLower(strings.TrimSpace(host))
+	switch h {
+	case "", "0.0.0.0", "::":
+		return true
+	}
+	return !isLoopbackHost(h)
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "localhost" || h == "127.0.0.1" || h == "::1" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+func detectLocalBindCandidates() []string {
+	addrs := map[string]struct{}{}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return []string{}
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		iaddrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range iaddrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil {
+				continue
+			}
+			if ip.IsLoopback() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			ip = ip.To16()
+			if ip == nil {
+				continue
+			}
+			// Prefer IPv4 candidates in UI; include global/private unicast only.
+			if v4 := ip.To4(); v4 != nil {
+				addrs[v4.String()] = struct{}{}
+				continue
+			}
+			if ip.IsGlobalUnicast() {
+				addrs[ip.String()] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(addrs))
+	for ip := range addrs {
+		out = append(out, ip)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (h *AdminHandler) conversationsSettingsAPI(w http.ResponseWriter, r *http.Request) {
@@ -3722,6 +3927,13 @@ func (h *AdminHandler) tlsTestCertificateAPI(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	cfg := h.store.Snapshot()
+	if strings.TrimSpace(cfg.TLS.Mode) != "letsencrypt" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status": "error",
+			"error":  "certificate test is only available for letsencrypt mode",
+		})
+		return
+	}
 	notAfter, cacheDir, err := obtainManagedCertificate(cfg.TLS, true, false)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{
@@ -3748,6 +3960,13 @@ func (h *AdminHandler) tlsRenewCertificateAPI(w http.ResponseWriter, r *http.Req
 		return
 	}
 	cfg := h.store.Snapshot()
+	if strings.TrimSpace(cfg.TLS.Mode) != "letsencrypt" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"status": "error",
+			"error":  "certificate renew is only available for letsencrypt mode",
+		})
+		return
+	}
 	notAfter, cacheDir, err := obtainManagedCertificate(cfg.TLS, false, true)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{
@@ -3790,7 +4009,7 @@ func obtainManagedCertificate(tlsCfg config.TLSConfig, useStaging bool, forceRen
 	}
 	cacheDir := strings.TrimSpace(tlsCfg.CacheDir)
 	if cacheDir == "" {
-		cacheDir = filepath.Join(os.TempDir(), "tokenrouter-autocert")
+		cacheDir = config.DefaultTLSCacheDir()
 	}
 	if useStaging {
 		cacheDir = filepath.Join(cacheDir, "staging-test")

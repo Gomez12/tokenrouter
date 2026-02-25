@@ -28,8 +28,9 @@
     var type = String(o.type || 'info').toLowerCase();
     var message = String(o.message || '').trim();
     if (!message) return;
-    var duration = Number(o.duration || 3600);
-    if (!Number.isFinite(duration) || duration < 1200) duration = 1200;
+    message = message.replace(/^[a-z]/, function (c) { return c.toUpperCase(); });
+    var duration = Number(o.duration || 5200);
+    if (!Number.isFinite(duration) || duration < 1800) duration = 1800;
 
     var container = ensureContainer();
     var toast = document.createElement('div');
