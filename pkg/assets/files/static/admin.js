@@ -248,6 +248,29 @@ function adminApp() {
       }
       this.schedulePendingReloadCheck(this.reloadIdleThresholdMs - idle);
     },
+    reinitAlpineTreeWhenReady(rootEl) {
+      const root = rootEl || (document.body && document.body.firstElementChild);
+      if (!root) return;
+      const run = () => {
+        if (!(window.Alpine && typeof window.Alpine.initTree === 'function')) return;
+        try {
+          if (typeof window.Alpine.mutateDom === 'function') {
+            window.Alpine.mutateDom(() => window.Alpine.initTree(root));
+          } else {
+            window.Alpine.initTree(root);
+          }
+        } catch (_) {}
+      };
+      if (document.readyState === 'complete') {
+        if (typeof window.requestAnimationFrame === 'function') {
+          window.requestAnimationFrame(() => run());
+        } else {
+          setTimeout(run, 0);
+        }
+        return;
+      }
+      window.addEventListener('load', run, {once: true});
+    },
     requestUIReload(kind) {
       const reloadKind = String(kind || 'default').trim() || 'default';
       if (this.pendingReloadKind !== 'runtime_update' || reloadKind === 'runtime_update') {
@@ -453,15 +476,7 @@ function adminApp() {
       if (!currentRoot || !nextRoot) return false;
       this.syncHeadFromDocument(nextDoc);
       this.morphDOMNode(currentRoot, nextRoot);
-      if (window.Alpine && typeof window.Alpine.initTree === 'function') {
-        try {
-          if (typeof window.Alpine.mutateDom === 'function') {
-            window.Alpine.mutateDom(() => window.Alpine.initTree(currentRoot));
-          } else {
-            window.Alpine.initTree(currentRoot);
-          }
-        } catch (_) {}
-      }
+      this.reinitAlpineTreeWhenReady(currentRoot);
       this.runtimeScriptFingerprints = nextMap;
       return true;
     },
