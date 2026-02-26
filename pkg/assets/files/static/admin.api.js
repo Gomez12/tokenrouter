@@ -24,8 +24,9 @@
   function reloadForRuntimeUpdate() {
     if (this.reloadingForRuntimeUpdate) return;
     this.reloadingForRuntimeUpdate = true;
-    if (typeof this.stopRealtimeUpdates === 'function') {
-      try { this.stopRealtimeUpdates(); } catch (_) {}
+    if (typeof this.handleRuntimeUpdate === 'function') {
+      this.handleRuntimeUpdate();
+      return;
     }
     try {
       const u = new URL(window.location.href);

@@ -172,6 +172,9 @@
       </button>
     </li>
     <li class="nav-item">
+      <button class="nav-link rounded-top" :class="activeTab==='models' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('models')">Models/Pricing</button>
+    </li>
+    <li class="nav-item">
       <button class="nav-link rounded-top" :class="activeTab==='access' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('access')">
         <span>Access</span>
         <span
@@ -184,9 +187,6 @@
     </li>
     <li class="nav-item">
       <button class="nav-link rounded-top" :class="activeTab==='network' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('network')">Network</button>
-    </li>
-    <li class="nav-item">
-      <button class="nav-link rounded-top" :class="activeTab==='models' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('models')">Models</button>
     </li>
     <li class="nav-item">
       <button class="nav-link rounded-top" :class="activeTab==='conversations' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('conversations')">Conversations</button>

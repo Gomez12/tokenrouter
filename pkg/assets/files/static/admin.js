@@ -103,6 +103,13 @@ function adminApp() {
     editingProviderName: '',
     runtimeInstanceID: '',
     reloadingForRuntimeUpdate: false,
+    reloadIdleThresholdMs: 30000,
+    lastUserInteractionAt: 0,
+    userActivityTrackingInstalled: false,
+    pendingReloadTimer: null,
+    pendingReloadKind: '',
+    runtimePatchInProgress: false,
+    runtimeScriptFingerprints: null,
     wsFailureCount: 0,
     themeMode: 'auto',
     activeTabCacheKey: 'opp_admin_active_tab_v1',
@@ -132,7 +139,10 @@ function adminApp() {
     draft: {name:'',provider_type:'',base_url:'',api_key:'',auth_token:'',refresh_token:'',token_expires_at:'',account_id:'',device_auth_url:'',device_code:'',device_auth_id:'',device_code_url:'',device_token_url:'',device_client_id:'',device_scope:'',device_grant_type:'',oauth_authorize_url:'',oauth_token_url:'',oauth_client_id:'',oauth_client_secret:'',oauth_scope:'',enabled:true,timeout_seconds:60},
     oauthAdvanced: false,
     init() {
+      this.lastUserInteractionAt = Date.now();
+      this.installUserActivityTracking();
       this.restoreLocalStorageFromHandoff();
+      this.captureRuntimeScriptFingerprints();
       window.__adminSortModels = (col) => this.sortModelsBy(col);
       window.__adminProvidersFirstPage = () => this.setProvidersPage(1);
       window.__adminProvidersPrevPage = () => this.setProvidersPage(this.providersPage - 1);
@@ -189,6 +199,270 @@ function adminApp() {
           });
         }
       }
+    },
+    installUserActivityTracking() {
+      if (this.userActivityTrackingInstalled) return;
+      this.userActivityTrackingInstalled = true;
+      const markActive = () => this.noteUserInteraction();
+      const opts = {capture: true, passive: true};
+      window.addEventListener('pointerdown', markActive, opts);
+      window.addEventListener('keydown', markActive, opts);
+      window.addEventListener('input', markActive, opts);
+      window.addEventListener('wheel', markActive, opts);
+      window.addEventListener('touchstart', markActive, opts);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') markActive();
+      });
+    },
+    noteUserInteraction() {
+      this.lastUserInteractionAt = Date.now();
+      if (this.pendingReloadKind) this.schedulePendingReloadCheck(this.reloadIdleThresholdMs);
+    },
+    idleForMs() {
+      return Math.max(0, Date.now() - Number(this.lastUserInteractionAt || 0));
+    },
+    clearPendingReload() {
+      if (this.pendingReloadTimer) {
+        clearTimeout(this.pendingReloadTimer);
+        this.pendingReloadTimer = null;
+      }
+      this.pendingReloadKind = '';
+    },
+    schedulePendingReloadCheck(delayMs) {
+      if (this.pendingReloadTimer) clearTimeout(this.pendingReloadTimer);
+      const delay = Math.max(25, Math.trunc(Number(delayMs || 0)));
+      this.pendingReloadTimer = setTimeout(() => {
+        this.pendingReloadTimer = null;
+        this.tryRunPendingReload();
+      }, delay);
+    },
+    tryRunPendingReload() {
+      if (!this.pendingReloadKind) return;
+      const idle = this.idleForMs();
+      if (idle >= this.reloadIdleThresholdMs) {
+        const kind = this.pendingReloadKind;
+        this.clearPendingReload();
+        this.performReload(kind);
+        return;
+      }
+      this.schedulePendingReloadCheck(this.reloadIdleThresholdMs - idle);
+    },
+    requestUIReload(kind) {
+      const reloadKind = String(kind || 'default').trim() || 'default';
+      if (this.pendingReloadKind !== 'runtime_update' || reloadKind === 'runtime_update') {
+        this.pendingReloadKind = reloadKind;
+      }
+      const idle = this.idleForMs();
+      if (idle >= this.reloadIdleThresholdMs) {
+        this.clearPendingReload();
+        this.performReload(reloadKind);
+        return;
+      }
+      this.schedulePendingReloadCheck(this.reloadIdleThresholdMs - idle);
+    },
+    async handleRuntimeUpdate() {
+      if (this.runtimePatchInProgress) return;
+      this.runtimePatchInProgress = true;
+      try {
+        const patched = await this.tryHotPatchRuntimeHTMLOnly();
+        if (patched) {
+          this.reloadingForRuntimeUpdate = false;
+          return;
+        }
+        this.requestUIReload('runtime_update');
+      } finally {
+        this.runtimePatchInProgress = false;
+      }
+    },
+    runtimeManagedScriptURLsFromDoc(doc) {
+      const d = doc || document;
+      const out = [];
+      const nodes = d.querySelectorAll('script[src]');
+      for (let i = 0; i < nodes.length; i++) {
+        const raw = String(nodes[i].getAttribute('src') || '').trim();
+        if (!raw) continue;
+        let u = '';
+        try {
+          u = new URL(raw, window.location.href).toString();
+        } catch (_) {
+          continue;
+        }
+        if (!u.includes('/admin/static/') || !u.endsWith('.js')) continue;
+        if (!out.includes(u)) out.push(u);
+      }
+      return out.sort();
+    },
+    hashTextFNV1a(input) {
+      const s = String(input || '');
+      let h = 2166136261;
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+      }
+      return (h >>> 0).toString(16).padStart(8, '0');
+    },
+    async fetchScriptFingerprintMap(urls) {
+      const list = Array.isArray(urls) ? urls.slice() : [];
+      const out = {};
+      await Promise.all(list.map(async (u) => {
+        try {
+          const r = await fetch(u + (u.includes('?') ? '&' : '?') + '_rt_probe=' + String(Date.now()), {
+            method: 'GET',
+            cache: 'no-store',
+            credentials: 'same-origin'
+          });
+          if (!r.ok) {
+            out[u] = 'status:' + String(r.status || 0);
+            return;
+          }
+          const txt = await r.text().catch(() => '');
+          out[u] = this.hashTextFNV1a(txt);
+        } catch (_) {
+          out[u] = 'error';
+        }
+      }));
+      return out;
+    },
+    async captureRuntimeScriptFingerprints() {
+      const urls = this.runtimeManagedScriptURLsFromDoc(document);
+      if (!urls.length) {
+        this.runtimeScriptFingerprints = {};
+        return;
+      }
+      this.runtimeScriptFingerprints = await this.fetchScriptFingerprintMap(urls);
+    },
+    runtimeScriptMapsEqual(a, b) {
+      const left = a || {};
+      const right = b || {};
+      const keysA = Object.keys(left).sort();
+      const keysB = Object.keys(right).sort();
+      if (keysA.length !== keysB.length) return false;
+      for (let i = 0; i < keysA.length; i++) {
+        if (keysA[i] !== keysB[i]) return false;
+        if (String(left[keysA[i]] || '') !== String(right[keysA[i]] || '')) return false;
+      }
+      return true;
+    },
+    syncHeadFromDocument(nextDoc) {
+      try {
+        const nextTitle = String((nextDoc && nextDoc.title) || '').trim();
+        if (nextTitle) document.title = nextTitle;
+      } catch (_) {}
+      try {
+        const curStyles = Array.from(document.head.querySelectorAll('style'));
+        const nextStyles = Array.from((nextDoc && nextDoc.head ? nextDoc.head : document.head).querySelectorAll('style'));
+        const max = Math.max(curStyles.length, nextStyles.length);
+        for (let i = 0; i < max; i++) {
+          const cur = curStyles[i] || null;
+          const nxt = nextStyles[i] || null;
+          if (cur && !nxt) {
+            cur.remove();
+            continue;
+          }
+          if (!cur && nxt) {
+            document.head.appendChild(nxt.cloneNode(true));
+            continue;
+          }
+          if (cur && nxt) {
+            const nextText = String(nxt.textContent || '');
+            if (String(cur.textContent || '') !== nextText) cur.textContent = nextText;
+          }
+        }
+      } catch (_) {}
+    },
+    morphDOMNode(curNode, nextNode) {
+      if (!curNode || !nextNode) return;
+      if (curNode.nodeType !== nextNode.nodeType) {
+        curNode.replaceWith(nextNode.cloneNode(true));
+        return;
+      }
+      if (curNode.nodeType === Node.TEXT_NODE) {
+        const nextText = String(nextNode.nodeValue || '');
+        if (String(curNode.nodeValue || '') !== nextText) curNode.nodeValue = nextText;
+        return;
+      }
+      if (curNode.nodeType !== Node.ELEMENT_NODE) return;
+      const curTag = String(curNode.tagName || '').toLowerCase();
+      const nextTag = String(nextNode.tagName || '').toLowerCase();
+      if (curTag !== nextTag) {
+        curNode.replaceWith(nextNode.cloneNode(true));
+        return;
+      }
+      const curAttrs = curNode.attributes;
+      for (let i = curAttrs.length - 1; i >= 0; i--) {
+        const name = curAttrs[i].name;
+        if (!nextNode.hasAttribute(name)) curNode.removeAttribute(name);
+      }
+      const nextAttrs = nextNode.attributes;
+      for (let i = 0; i < nextAttrs.length; i++) {
+        const name = nextAttrs[i].name;
+        const value = String(nextAttrs[i].value || '');
+        if (curNode.getAttribute(name) !== value) curNode.setAttribute(name, value);
+      }
+      const curChildren = Array.from(curNode.childNodes);
+      const nextChildren = Array.from(nextNode.childNodes);
+      const max = Math.max(curChildren.length, nextChildren.length);
+      for (let i = 0; i < max; i++) {
+        const curChild = curChildren[i] || null;
+        const nextChild = nextChildren[i] || null;
+        if (curChild && !nextChild) {
+          curChild.remove();
+          continue;
+        }
+        if (!curChild && nextChild) {
+          curNode.appendChild(nextChild.cloneNode(true));
+          continue;
+        }
+        this.morphDOMNode(curChild, nextChild);
+      }
+    },
+    async tryHotPatchRuntimeHTMLOnly() {
+      const urls = this.runtimeManagedScriptURLsFromDoc(document);
+      const currentMap = this.runtimeScriptFingerprints || {};
+      if (!Object.keys(currentMap).length) {
+        await this.captureRuntimeScriptFingerprints();
+      }
+      const baseline = this.runtimeScriptFingerprints || {};
+      const nextMap = await this.fetchScriptFingerprintMap(urls);
+      if (!this.runtimeScriptMapsEqual(baseline, nextMap)) return false;
+      let nextDoc = null;
+      try {
+        const resp = await fetch('/admin?_rt_probe=' + String(Date.now()), {method: 'GET', cache: 'no-store', credentials: 'same-origin'});
+        if (!resp.ok) return false;
+        const html = await resp.text().catch(() => '');
+        if (!String(html || '').trim()) return false;
+        nextDoc = new DOMParser().parseFromString(html, 'text/html');
+      } catch (_) {
+        return false;
+      }
+      if (!nextDoc || !nextDoc.body) return false;
+      const nextDocURLs = this.runtimeManagedScriptURLsFromDoc(nextDoc);
+      if (urls.length !== nextDocURLs.length) return false;
+      for (let i = 0; i < urls.length; i++) {
+        if (urls[i] !== nextDocURLs[i]) return false;
+      }
+      const currentRoot = document.body && document.body.firstElementChild;
+      const nextRoot = nextDoc.body.firstElementChild;
+      if (!currentRoot || !nextRoot) return false;
+      this.syncHeadFromDocument(nextDoc);
+      this.morphDOMNode(currentRoot, nextRoot);
+      this.runtimeScriptFingerprints = nextMap;
+      return true;
+    },
+    performReload(kind) {
+      const reloadKind = String(kind || 'default').trim() || 'default';
+      if (typeof this.stopRealtimeUpdates === 'function') {
+        try { this.stopRealtimeUpdates(); } catch (_) {}
+      }
+      if (reloadKind === 'runtime_update') {
+        try {
+          const u = new URL(window.location.href);
+          u.searchParams.set('_rt_reload', String(Date.now()));
+          window.location.replace(u.toString());
+          return;
+        } catch (_) {}
+      }
+      window.location.reload();
     },
     startRealtimeUpdates() { return window.AdminRealtime.startRealtimeUpdates.call(this); },
     stopRealtimeUpdates() { return window.AdminRealtime.stopRealtimeUpdates.call(this); },
@@ -2463,7 +2737,7 @@ function adminApp() {
           window.location = this.appendLocalStorageHandoffToURL(redirectURL, payload);
           return 'redirect';
         }
-        window.location.reload();
+        this.requestUIReload('default');
         return 'redirect';
       } finally {
         this.networkApplyInProgress = false;
