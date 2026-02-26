@@ -1,0 +1,90 @@
+version: 2
+
+project_name: tokenrouter
+
+builds:
+  - id: torod
+    main: ./cmd/torod
+    binary: torod
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/lkarlslund/tokenrouter/pkg/version.Version={{ .Version }}
+      - -X github.com/lkarlslund/tokenrouter/pkg/version.Commit={{ .Commit }}
+      - -X github.com/lkarlslund/tokenrouter/pkg/version.Date={{ .Date }}
+      - -X github.com/lkarlslund/tokenrouter/pkg/version.Dirty=false
+
+  - id: toro
+    main: ./cmd/toro
+    binary: toro
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/lkarlslund/tokenrouter/pkg/version.Version={{ .Version }}
+      - -X github.com/lkarlslund/tokenrouter/pkg/version.Commit={{ .Commit }}
+      - -X github.com/lkarlslund/tokenrouter/pkg/version.Date={{ .Date }}
+      - -X github.com/lkarlslund/tokenrouter/pkg/version.Dirty=false
+
+archives:
+  - id: binaries
+    builds:
+      - torod
+      - toro
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+release:
+  draft: false
+  prerelease: false
+  make_latest: false
+  name_template: "{{ .Tag }}"
+
+nfpms:
+  - id: linux-packages
+    package_name: tokenrouter
+    builds:
+      - torod
+      - toro
+    formats:
+      - deb
+      - rpm
+      - archlinux
+    bindir: /usr/bin
+    homepage: https://github.com/lkarlslund/tokenrouter
+    maintainer: tokenrouter maintainers
+    description: OpenAI API-compatible proxy router in Go.
+    section: utils
+    priority: optional
+    contents:
+      - src: README.md
+        dst: /usr/share/doc/tokenrouter/README.md

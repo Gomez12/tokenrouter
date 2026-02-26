@@ -1,0 +1,81 @@
+name: Rolling Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rolling-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: |
+          go test $(go list ./... | grep -v '^github.com/lkarlslund/tokenrouter/tests$')
+
+      - name: Compute rolling tag
+        id: tag
+        run: |
+          BUILD_NUMBER="$(git rev-list --count HEAD)"
+          TAG="b${BUILD_NUMBER}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Rolling tag: ${TAG}"
+
+      - name: Create rolling tag if missing
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Rolling release ${TAG}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Skip if release already exists
+        id: release-check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} already exists"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} does not exist yet"
+          fi
+
+      - name: Checkout rolling tag
+        if: steps.release-check.outputs.exists != 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          git fetch --tags --force
+          git checkout "refs/tags/${TAG}"
+
+      - name: Run GoReleaser
+        if: steps.release-check.outputs.exists != 'true'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --config .goreleaser.rolling.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

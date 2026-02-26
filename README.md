@@ -71,6 +71,11 @@ Pass through `serve` args if needed:
 ## CI/CD
 
 - Every push/PR commit triggers a `devbuild` workflow run and uploads build artifacts.
+- Every push to `master` also triggers a rolling release workflow.
+  - Rolling tag format: `b<commit_count>` (example: `b742`)
+  - Rolling release assets include:
+    - Windows/macOS/Linux binary archives
+    - Linux packages: `deb`, `rpm`, `archlinux`
 - Semantic tags trigger releases automatically.
   - Tag format: `vX.Y.Z` (example: `v0.4.2`)
   - Release workflow builds cross-platform artifacts and publishes a GitHub Release.
