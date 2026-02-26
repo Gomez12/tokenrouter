@@ -151,6 +151,76 @@ func (s *Store) List(filter ListFilter) []Entry {
 	return out
 }
 
+func (s *Store) ListPage(filter ListFilter, page, pageSize int) ([]Entry, int, int, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	level := normalizeLevel(filter.Level)
+	query := strings.ToLower(strings.TrimSpace(filter.Query))
+	if page <= 0 {
+		page = 1
+	}
+	size := pageSize
+	if size < 0 {
+		size = 25
+	}
+	if size > 1000 {
+		size = 1000
+	}
+
+	total := 0
+	start := 0
+	end := 0
+	if size > 0 {
+		start = (page - 1) * size
+		end = start + size
+	}
+	out := make([]Entry, 0, min(max(0, size), len(s.entries)))
+	for i := len(s.entries) - 1; i >= 0; i-- {
+		e := s.entries[i]
+		if !logLevelMatchesFilter(level, e.Level) {
+			continue
+		}
+		if query != "" {
+			hay := strings.ToLower(e.Message + "\n" + e.Level)
+			if !strings.Contains(hay, query) {
+				continue
+			}
+		}
+		if size == 0 || (total >= start && total < end) {
+			out = append(out, e)
+		}
+		total++
+	}
+	if size > 0 {
+		totalPages := max(1, (total+size-1)/size)
+		if page > totalPages {
+			page = totalPages
+			start = (page - 1) * size
+			end = start + size
+			out = out[:0]
+			matched := 0
+			for i := len(s.entries) - 1; i >= 0; i-- {
+				e := s.entries[i]
+				if !logLevelMatchesFilter(level, e.Level) {
+					continue
+				}
+				if query != "" {
+					hay := strings.ToLower(e.Message + "\n" + e.Level)
+					if !strings.Contains(hay, query) {
+						continue
+					}
+				}
+				if matched >= start && matched < end {
+					out = append(out, e)
+				}
+				matched++
+			}
+		}
+	}
+	return out, total, page, size
+}
+
 func logLevelMatchesFilter(filterLevel, entryLevel string) bool {
 	f := normalizeLevel(filterLevel)
 	if f == "" || f == "all" {

@@ -3903,14 +3903,33 @@ func (h *AdminHandler) logsAPI(w http.ResponseWriter, r *http.Request) {
 		Level: strings.TrimSpace(r.URL.Query().Get("level")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")),
 	}
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
-			filter.Limit = n
+	page := 1
+	pageSize := 25
+	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			page = n
 		}
 	}
-	entries := h.logs.List(filter)
+	if raw := strings.TrimSpace(r.URL.Query().Get("page_size")); raw != "" {
+		if strings.EqualFold(raw, "all") || raw == "0" {
+			pageSize = 0
+		} else if n, err := strconv.Atoi(raw); err == nil {
+			pageSize = n
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			// Backward-compat for older clients that only set limit.
+			page = 1
+			pageSize = n
+		}
+	}
+	entries, total, outPage, outPageSize := h.logs.ListPage(filter, page, pageSize)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"entries": entries,
+		"entries":   entries,
+		"total":     total,
+		"page":      outPage,
+		"page_size": outPageSize,
 	})
 }
 

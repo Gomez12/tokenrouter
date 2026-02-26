@@ -73,10 +73,10 @@ type ProviderQuotaMetric struct {
 	MeteredFeature string  `json:"metered_feature,omitempty"`
 	Window         string  `json:"window,omitempty"`
 	WindowSeconds  int64   `json:"window_seconds,omitempty"`
-	LeftPercent    float64 `json:"left_percent,omitempty"`
-	UsedValue      float64 `json:"used_value,omitempty"`
-	RemainingValue float64 `json:"remaining_value,omitempty"`
-	LimitValue     float64 `json:"limit_value,omitempty"`
+	LeftPercent    float64 `json:"left_percent"`
+	UsedValue      float64 `json:"used_value"`
+	RemainingValue float64 `json:"remaining_value"`
+	LimitValue     float64 `json:"limit_value"`
 	Unit           string  `json:"unit,omitempty"`
 	ResetAt        string  `json:"reset_at,omitempty"`
 }

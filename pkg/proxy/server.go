@@ -876,19 +876,7 @@ func (s *Server) forwardRequest(ctx context.Context, provider config.ProviderCon
 	if err != nil {
 		return nil, 0, nil, 0, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if provider.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
-	} else if strings.TrimSpace(provider.AuthToken) != "" {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(provider.AuthToken))
-	}
-	if isOpenAICodexProvider(provider) {
-		req.Header.Set("OpenAI-Beta", "responses=experimental")
-		req.Header.Set("originator", "codex_cli_rs")
-		if strings.TrimSpace(provider.AccountID) != "" {
-			req.Header.Set("chatgpt-account-id", strings.TrimSpace(provider.AccountID))
-		}
-	}
+	applyUpstreamProviderHeaders(req, provider)
 
 	cli := &http.Client{Timeout: time.Duration(provider.TimeoutSeconds) * time.Second}
 	upstreamStart := time.Now()
@@ -943,19 +931,7 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 	if err != nil {
 		return 0, nil, usageTokenCounts{}, 0, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if provider.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
-	} else if strings.TrimSpace(provider.AuthToken) != "" {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(provider.AuthToken))
-	}
-	if isOpenAICodexProvider(provider) {
-		req.Header.Set("OpenAI-Beta", "responses=experimental")
-		req.Header.Set("originator", "codex_cli_rs")
-		if strings.TrimSpace(provider.AccountID) != "" {
-			req.Header.Set("chatgpt-account-id", strings.TrimSpace(provider.AccountID))
-		}
-	}
+	applyUpstreamProviderHeaders(req, provider)
 
 	cli := &http.Client{Timeout: time.Duration(provider.TimeoutSeconds) * time.Second}
 	upstreamStart := time.Now()
@@ -1143,6 +1119,33 @@ func isOpenAICodexProvider(provider config.ProviderConfig) bool {
 	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
 	pathLower := strings.ToLower(strings.Trim(strings.TrimSpace(u.Path), "/"))
 	return host == "chatgpt.com" || strings.Contains(pathLower, "backend-api")
+}
+
+func applyUpstreamProviderHeaders(req *http.Request, provider config.ProviderConfig) {
+	req.Header.Set("Content-Type", "application/json")
+	if provider.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	} else if strings.TrimSpace(provider.AuthToken) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(provider.AuthToken))
+	}
+	if !isOpenAICodexProvider(provider) {
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("OpenAI-Beta", "responses=experimental")
+	req.Header.Set("originator", openAICodexOriginator())
+	req.Header.Set("User-Agent", "codex-cli/0.104.0")
+	if strings.TrimSpace(provider.AccountID) != "" {
+		req.Header.Set("ChatGPT-Account-ID", strings.TrimSpace(provider.AccountID))
+	}
+}
+
+func openAICodexOriginator() string {
+	originator := strings.TrimSpace(os.Getenv("CODEX_INTERNAL_ORIGINATOR_OVERRIDE"))
+	if originator == "" {
+		return "codex_cli_rs"
+	}
+	return originator
 }
 
 func (s *Server) ensureOAuthTokenFresh(ctx context.Context, provider config.ProviderConfig) config.ProviderConfig {

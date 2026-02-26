@@ -82,3 +82,38 @@ func TestClearRemovesEntries(t *testing.T) {
 		t.Fatalf("expected 0 entries after clear, got %d", got)
 	}
 }
+
+func TestListPageFiltersAndPaginates(t *testing.T) {
+	s := NewStore("", Settings{MaxLines: 100})
+	s.Add("info", "alpha", time.Unix(1, 0))
+	s.Add("error", "beta", time.Unix(2, 0))
+	s.Add("warn", "gamma", time.Unix(3, 0))
+	s.Add("info", "delta", time.Unix(4, 0))
+
+	rows, total, page, size := s.ListPage(ListFilter{Level: "info"}, 1, 2)
+	if total != 4 {
+		t.Fatalf("expected total 4 for info-and-below, got %d", total)
+	}
+	if page != 1 || size != 2 {
+		t.Fatalf("unexpected page metadata: page=%d size=%d", page, size)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows on page 1, got %d", len(rows))
+	}
+	if rows[0].Message != "delta" || rows[1].Message != "gamma" {
+		t.Fatalf("unexpected page 1 rows: %+v", rows)
+	}
+
+	rows2, total2, page2, size2 := s.ListPage(ListFilter{Level: "info"}, 2, 2)
+	if total2 != 4 || page2 != 2 || size2 != 2 {
+		t.Fatalf("unexpected page 2 metadata: total=%d page=%d size=%d", total2, page2, size2)
+	}
+	if len(rows2) != 2 || rows2[0].Message != "beta" || rows2[1].Message != "alpha" {
+		t.Fatalf("unexpected page 2 rows: %+v", rows2)
+	}
+
+	qRows, qTotal, _, _ := s.ListPage(ListFilter{Level: "all", Query: "gam"}, 1, 25)
+	if qTotal != 1 || len(qRows) != 1 || qRows[0].Message != "gamma" {
+		t.Fatalf("query paging mismatch: total=%d rows=%+v", qTotal, qRows)
+	}
+}

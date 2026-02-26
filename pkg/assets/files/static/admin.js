@@ -354,6 +354,7 @@ function adminApp() {
       if (raw !== 'all' && raw !== 'trace' && raw !== 'debug' && raw !== 'info' && raw !== 'warn' && raw !== 'error' && raw !== 'fatal') return;
       this.logLevelFilter = raw;
       this.persistLogLevelFilter();
+      this.logsPage = 1;
       this.loadLogs();
     },
     restoreStatsRangeHours() {
@@ -653,12 +654,12 @@ function adminApp() {
       let n = Number(v);
       if (!Number.isFinite(n)) n = 1;
       this.logsPage = Math.max(1, Math.floor(n));
-      this.renderLogs();
+      this.loadLogs();
     },
     setLogsPageSize(v) {
       this.logsPageSize = this.parsePageSize(v);
       this.logsPage = 1;
-      this.renderLogs();
+      this.loadLogs();
     },
     setUsageChartGroup(v) {
       const key = String(v || '').trim();
@@ -2624,7 +2625,10 @@ function adminApp() {
     },
     debouncedLoadLogs() {
       if (this.logDebounceTimer) clearTimeout(this.logDebounceTimer);
-      this.logDebounceTimer = setTimeout(() => this.loadLogs(), 250);
+      this.logDebounceTimer = setTimeout(() => {
+        this.logsPage = 1;
+        this.loadLogs();
+      }, 250);
     },
     async loadLogSettings() {
       const r = await this.apiFetch('/admin/api/settings/logs', {headers:this.headers()});
@@ -2679,14 +2683,21 @@ function adminApp() {
       const query = String(this.logSearch || '').trim();
       if (level && level !== 'all') params.set('level', level);
       if (query) params.set('q', query);
-      params.set('limit', '1500');
+      params.set('page', String(Math.max(1, Number(this.logsPage || 1))));
+      params.set('page_size', String(this.logsPageSize === 0 ? 0 : this.parsePageSize(this.logsPageSize)));
       const u = '/admin/api/logs' + (params.toString() ? ('?' + params.toString()) : '');
       const r = await this.apiFetch(u, {headers:this.headers()});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) return;
       const body = await r.json().catch(() => ({}));
       this.logEntries = Array.isArray(body.entries) ? body.entries : [];
-      this.logsPage = 1;
+      const serverPage = Number(body.page || 1);
+      if (Number.isFinite(serverPage) && serverPage > 0) this.logsPage = Math.floor(serverPage);
+      const serverPageSize = Number(body.page_size);
+      if (serverPageSize === 0 || serverPageSize === 25 || serverPageSize === 50 || serverPageSize === 100) {
+        this.logsPageSize = serverPageSize;
+      }
+      this.logEntriesTotalCount = Number(body.total || this.logEntries.length || 0);
       this.renderLogs();
     },
     async clearLogs() {
@@ -2705,6 +2716,7 @@ function adminApp() {
         return;
       }
       this.logEntries = [];
+      this.logEntriesTotalCount = 0;
       this.renderLogs();
       this.toastSuccess('Log cleared.');
     },
@@ -2729,7 +2741,7 @@ function adminApp() {
       return out.join(' ');
     },
     renderLogs() {
-      const allRows = (this.logEntries || []).map((e) => {
+      const rows = (this.logEntries || []).map((e) => {
         const level = String(e.level || 'info').trim().toLowerCase();
         const badgeCls =
           level === 'trace' ? 'text-bg-light border text-dark' :
@@ -2750,17 +2762,19 @@ function adminApp() {
             '<td class="small" title="' + this.escapeHtml(msgRaw) + '"><code style="white-space:pre-wrap;">' + msg + '</code></td>' +
           '</tr>';
       });
-      const page = this.paginateRows(allRows, this.logsPage, this.logsPageSize);
-      this.logsPage = page.page;
-      this.logsPageSize = page.pageSize;
-      this.logEntriesShownCount = (page.rows || []).length;
-      this.logEntriesTotalCount = page.totalRows;
+      const totalRows = Math.max(0, Number(this.logEntriesTotalCount || 0));
+      const pageSize = this.parsePageSize(this.logsPageSize);
+      const totalPages = pageSize === 0 ? 1 : Math.max(1, Math.ceil(totalRows / pageSize));
+      const page = Math.min(totalPages, Math.max(1, Number(this.logsPage || 1)));
+      this.logsPage = page;
+      this.logsPageSize = pageSize;
+      this.logEntriesShownCount = (rows || []).length;
       this.logEntriesHtml =
         '<table class="table table-sm align-middle mb-0">' +
           '<thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead>' +
-          '<tbody>' + (page.rows.join('') || '<tr><td colspan="3" class="text-body-secondary small">No log entries.</td></tr>') + '</tbody>' +
+          '<tbody>' + (rows.join('') || '<tr><td colspan="3" class="text-body-secondary small">No log entries.</td></tr>') + '</tbody>' +
         '</table>';
-      this.logPagerHtml = this.renderPager(page.totalRows, page.page, page.totalPages, page.pageSize, 'Logs');
+      this.logPagerHtml = this.renderPager(totalRows, page, totalPages, pageSize, 'Logs');
     },
     formatTimestamp(raw) {
       const s = String(raw || '').trim();
