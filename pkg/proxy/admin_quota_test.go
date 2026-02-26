@@ -156,6 +156,60 @@ func TestReadProviderQuotaCachedUsesTTL(t *testing.T) {
 	}
 }
 
+func TestReadProviderQuotaCachedRecoversFromStuckRefreshingLoading(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":300,"reset_at":1735689600}}}`))
+	}))
+	defer srv.Close()
+
+	now := time.Now().UTC()
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:      "openai-stuck",
+		BaseURL:   srv.URL,
+		AuthToken: "token-abc",
+	}
+	preset := assets.PopularProvider{
+		ProviderConfig: config.ProviderConfig{Name: "openai"},
+		DisplayName:    "OpenAI",
+		QuotaReader:    "openai_codex",
+	}
+	h.quotaCache.SetWithExpiry(p.Name, quotaCacheValue{
+		Snapshot: ProviderQuotaSnapshot{
+			Provider:  p.Name,
+			Status:    "loading",
+			Reader:    "openai_codex",
+			CheckedAt: now.Add(-2 * time.Minute).Format(time.RFC3339),
+		},
+		LastGood:   ProviderQuotaSnapshot{},
+		Refreshing: true,
+	}, now.Add(-2*time.Minute))
+
+	snap := h.readProviderQuotaCached(context.Background(), p, preset)
+	if strings.TrimSpace(strings.ToLower(snap.Status)) != "loading" {
+		t.Fatalf("expected initial loading snapshot while retry starts, got %+v", snap)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		cur := h.readProviderQuotaCached(context.Background(), p, preset)
+		if strings.TrimSpace(strings.ToLower(cur.Status)) == "ok" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	final := h.readProviderQuotaCached(context.Background(), p, preset)
+	if strings.TrimSpace(strings.ToLower(final.Status)) != "ok" {
+		t.Fatalf("expected quota refresh recovery to reach ok status, got %+v", final)
+	}
+	if atomic.LoadInt32(&calls) < 1 {
+		t.Fatalf("expected at least one quota refresh call, got %d", calls)
+	}
+}
+
 func TestReadAutoHeaderQuotaAllowsPublicNoAuthProviderWithoutKey(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -216,6 +270,27 @@ func TestReadAutoHeaderQuotaRequiresKeyForNonPublicProvider(t *testing.T) {
 	}
 	if snap.Error != "missing api key" {
 		t.Fatalf("expected missing api key, got %q", snap.Error)
+	}
+}
+
+func TestQuotaProvidersExcludesDisabledConfiguredProviders(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.AutoEnablePublicFreeModels = false
+	cfg.Providers = []config.ProviderConfig{
+		{Name: "enabled-one", ProviderType: "openai", BaseURL: "https://api.openai.com/v1", Enabled: true, TimeoutSeconds: 30},
+		{Name: "disabled-one", ProviderType: "openai", BaseURL: "https://api.openai.com/v1", Enabled: false, TimeoutSeconds: 30},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	h := &AdminHandler{
+		store:    store,
+		resolver: NewProviderResolver(store),
+	}
+	got := h.quotaProviders()
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 active quota provider, got %d (%+v)", len(got), got)
+	}
+	if strings.TrimSpace(got[0].Name) != "enabled-one" {
+		t.Fatalf("expected enabled-one as active quota provider, got %+v", got[0])
 	}
 }
 

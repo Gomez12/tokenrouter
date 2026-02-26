@@ -1209,8 +1209,15 @@ func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.Pro
 	_ = ctx
 	now := time.Now().UTC()
 	reader := quotaReaderFromPreset(preset)
+	const refreshStaleGrace = 45 * time.Second
 	h.quotaMu.Lock()
 	if val, expiry, ok := h.quotaCache.Get(p.Name); ok {
+		// Recover from stuck refresh workers: if entry is expired and still marked
+		// refreshing long after expiry, allow a fresh background refresh.
+		if val.Refreshing && !expiry.IsZero() && !now.Before(expiry.Add(refreshStaleGrace)) {
+			val.Refreshing = false
+			h.quotaCache.SetWithExpiry(p.Name, val, expiry)
+		}
 		snap := val.Snapshot
 		if snap.Provider == "" {
 			snap = newProviderQuotaSnapshot(now, p, preset, reader)
@@ -1257,6 +1264,31 @@ func newProviderQuotaSnapshot(now time.Time, p config.ProviderConfig, preset ass
 }
 
 func (h *AdminHandler) refreshProviderQuota(p config.ProviderConfig, preset assets.PopularProvider) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			now := time.Now().UTC()
+			reader := quotaReaderFromPreset(preset)
+			snap := newProviderQuotaSnapshot(now, p, preset, reader)
+			snap.Status = "error"
+			snap.Error = "quota refresh panic"
+			h.quotaMu.Lock()
+			lastGood := ProviderQuotaSnapshot{}
+			if prev, _, ok := h.quotaCache.Get(p.Name); ok {
+				lastGood = prev.LastGood
+			}
+			storeSnap := snap
+			if lastGood.Provider != "" {
+				storeSnap = lastGood
+			}
+			h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
+				Snapshot:   storeSnap,
+				LastGood:   lastGood,
+				Refreshing: false,
+			}, now, quotaRefreshError)
+			h.quotaMu.Unlock()
+			log.Warn("quota refresh panic recovered", "provider", strings.TrimSpace(p.Name))
+		}
+	}()
 	h.computeProviderQuotaAndStore(p, preset)
 }
 
@@ -3191,7 +3223,7 @@ func (h *AdminHandler) securitySettingsAPI(w http.ResponseWriter, r *http.Reques
 		}
 		cfg := h.store.Snapshot()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status":                              "ok",
+			"status":                             "ok",
 			"allow_localhost_no_auth":            cfg.AllowLocalhostNoAuth,
 			"allow_host_docker_internal_no_auth": cfg.AllowHostDockerInternalNoAuth,
 			"auto_enable_public_free_models":     cfg.AutoEnablePublicFreeModels,
@@ -5830,21 +5862,21 @@ func quotaModelIsIncluded(providerName, providerType, modelID string, quota map[
 }
 
 func (h *AdminHandler) catalogProviders() []config.ProviderConfig {
-	return h.resolver.ListProviders()
+	return h.activeProviders()
 }
 
 func (h *AdminHandler) quotaProviders() []config.ProviderConfig {
-	active := h.catalogProviders()
+	return h.activeProviders()
+}
+
+func (h *AdminHandler) activeProviders() []config.ProviderConfig {
+	if h == nil || h.resolver == nil {
+		return nil
+	}
+	active := h.resolver.ListProviders()
 	out := make([]config.ProviderConfig, 0, len(active))
 	seen := map[string]struct{}{}
 	for _, p := range active {
-		out = append(out, p)
-		if n := strings.TrimSpace(p.Name); n != "" {
-			seen[n] = struct{}{}
-		}
-	}
-	cfg := h.store.Snapshot()
-	for _, p := range cfg.Providers {
 		name := strings.TrimSpace(p.Name)
 		if name == "" {
 			continue
@@ -5852,12 +5884,8 @@ func (h *AdminHandler) quotaProviders() []config.ProviderConfig {
 		if _, ok := seen[name]; ok {
 			continue
 		}
-		resolved := h.applyPresetProviderDefaults(p)
-		if strings.TrimSpace(resolved.Name) == "" {
-			resolved.Name = name
-		}
-		out = append(out, resolved)
 		seen[name] = struct{}{}
+		out = append(out, p)
 	}
 	return out
 }

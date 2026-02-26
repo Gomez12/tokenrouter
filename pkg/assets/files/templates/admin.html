@@ -153,10 +153,10 @@
       <button class="nav-link rounded-top" :class="activeTab==='quota' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('quota')">
         <span>Quota</span>
         <span
-          x-show="hasAnyProviderOutOfQuota()"
+          x-show.important="hasAnyQuotaAlerts()"
           style="display:none;width:1.05rem;height:1.05rem;line-height:1.05rem;font-size:0.74rem;"
           class="ms-1 d-inline-flex align-items-center justify-content-center rounded-circle bg-danger text-white fw-bold align-middle"
-          title="One or more providers are fully out of quota."
+          title="One or more providers are out of quota or have quota errors."
         >!</span>
       </button>
     </li>
@@ -164,7 +164,7 @@
       <button class="nav-link rounded-top" :class="activeTab==='providers' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('providers')">
         <span>Providers</span>
         <span
-          x-show="hasAnyProviderFailing()"
+          x-show.important="failingManagedProviders().length > 0"
           style="display:none;width:1.05rem;height:1.05rem;line-height:1.05rem;font-size:0.74rem;"
           class="ms-1 d-inline-flex align-items-center justify-content-center rounded-circle bg-danger text-white fw-bold align-middle"
           :title="providersFailureTooltip()"
@@ -175,7 +175,7 @@
       <button class="nav-link rounded-top" :class="activeTab==='access' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('access')">
         <span>Access</span>
         <span
-          x-show="allowLocalhostNoAuthEffective || allowHostDockerInternalNoAuthEffective"
+          x-show.important="allowLocalhostNoAuthEffective || allowHostDockerInternalNoAuthEffective"
           style="display:none;width:1.05rem;height:1.05rem;line-height:1.05rem;font-size:0.74rem;"
           class="ms-1 d-inline-flex align-items-center justify-content-center rounded-circle bg-warning text-dark fw-bold align-middle"
           title="Unauthenticated API access is enabled."
@@ -728,9 +728,21 @@
                 <label class="form-label">Name</label>
                 <input class="form-control" x-model="draft.name" placeholder="name" />
               </div>
-              <div class="col-md-8" x-show="selectedPresetRequiresBaseURLInput() || overrideProviderSettings || !selectedPreset" style="display:none;">
+              <div class="col-md-8">
                 <label class="form-label">Base URL</label>
-                <input class="form-control" x-model="draft.base_url" :placeholder="selectedPresetBaseURLTemplate() || 'base_url'" />
+                <input
+                  class="form-control"
+                  x-model="draft.base_url"
+                  :placeholder="selectedPresetBaseURLTemplate() || 'base_url'"
+                  :readonly="!!selectedPreset && !selectedPresetRequiresBaseURLInput() && !overrideProviderSettings"
+                />
+                <div
+                  class="small text-body-secondary mt-1"
+                  x-show="selectedPreset && !selectedPresetRequiresBaseURLInput() && !overrideProviderSettings"
+                  style="display:none;"
+                >
+                  Using preset endpoint. Enable override to edit.
+                </div>
                 <div class="small text-body-secondary mt-1" x-show="selectedPresetBaseURLHint()" x-text="selectedPresetBaseURLHint()" style="display:none;"></div>
                 <div class="small text-body-secondary" x-show="selectedPresetBaseURLExample()" style="display:none;">
                   Example: <code x-text="selectedPresetBaseURLExample()"></code>

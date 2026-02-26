@@ -1305,22 +1305,41 @@ function adminApp() {
       }
       return false;
     },
-    hasAnyProviderFailing() {
-      const list = Array.isArray(this.providers) ? this.providers : [];
-      for (let i = 0; i < list.length; i++) {
-        const p = list[i] || {};
-        if (!p.managed) continue;
-        if (this.providerHasProblem(p)) return true;
+    hasAnyProviderQuotaErrors() {
+      const map = (this.stats && this.stats.provider_quotas && typeof this.stats.provider_quotas === 'object')
+        ? this.stats.provider_quotas
+        : {};
+      const snaps = Object.values(map);
+      for (let i = 0; i < snaps.length; i++) {
+        const q = snaps[i] || {};
+        const status = String(q.status || '').trim().toLowerCase();
+        if (!status || status === 'ok' || status === 'loading') continue;
+        return true;
       }
       return false;
     },
-    providersFailureTooltip() {
+    hasAnyQuotaAlerts() {
+      return this.hasAnyProviderOutOfQuota() || this.hasAnyProviderQuotaErrors();
+    },
+    failingManagedProviders() {
       const list = Array.isArray(this.providers) ? this.providers : [];
       const failing = [];
       for (let i = 0; i < list.length; i++) {
         const p = list[i] || {};
         if (!p.managed) continue;
         if (!this.providerHasProblem(p)) continue;
+        failing.push(p);
+      }
+      return failing;
+    },
+    hasAnyProviderFailing() {
+      return this.failingManagedProviders().length > 0;
+    },
+    providersFailureTooltip() {
+      const list = this.failingManagedProviders();
+      const failing = [];
+      for (let i = 0; i < list.length; i++) {
+        const p = list[i] || {};
         const name = String((p.display_name || p.name) || '').trim() || 'provider';
         const status = String(p.status || '').trim().toLowerCase() || 'unknown';
         failing.push(name + ' (' + status + ')');
@@ -1432,7 +1451,7 @@ function adminApp() {
         const providerName = String(q.display_name || q.provider || 'provider').trim();
         if (status !== 'ok') {
           const key = providerName || 'quota';
-          if (!groups[key]) groups[key] = {name: key, provider: providerName, requests: null, tokens: null, other: [], status: status || 'unknown', error: String(q.error || '').trim()};
+          if (!groups[key]) groups[key] = {name: key, provider: providerName, requestMetrics: [], tokenMetrics: [], other: [], status: status || 'unknown', error: String(q.error || '').trim()};
           if (!groups[key].status || groups[key].status === 'ok') groups[key].status = status || 'unknown';
           if (!groups[key].error) groups[key].error = String(q.error || '').trim();
           return;
@@ -1450,10 +1469,10 @@ function adminApp() {
             groupName = feature;
           }
           const key = groupName || providerName || 'quota';
-          if (!groups[key]) groups[key] = {name: key, provider: providerName, requests: null, tokens: null, other: [], status: 'ok', error: ''};
+          if (!groups[key]) groups[key] = {name: key, provider: providerName, requestMetrics: [], tokenMetrics: [], other: [], status: 'ok', error: ''};
           const kind = this.quotaMetricKind(m);
-          if (kind === 'requests') groups[key].requests = m;
-          else if (kind === 'tokens') groups[key].tokens = m;
+          if (kind === 'requests') groups[key].requestMetrics.push(m);
+          else if (kind === 'tokens') groups[key].tokenMetrics.push(m);
           else groups[key].other.push(m);
         });
       });
@@ -1471,14 +1490,28 @@ function adminApp() {
         .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
       const cards = visibleGroups.map((g) => {
         if (String(g.status || '').toLowerCase() !== 'ok') {
-          const msg = this.escapeHtml(String(g.error || g.status || 'quota unavailable'));
+          const statusNorm = String(g.status || '').trim().toLowerCase();
+          const isLoading = statusNorm === 'loading';
+          const rawMsg = String(g.error || g.status || (isLoading ? 'loading' : 'quota unavailable'));
+          const msg = this.escapeHtml(rawMsg);
+          const statusLabel = isLoading ? 'Loading quota...' : 'Quota unavailable';
+          const msgClass = isLoading ? 'small text-body-secondary mt-1' : 'small text-danger mt-1';
           return '<div class="border rounded p-2 bg-body">' +
             '<div class="fw-semibold small mb-2" title="' + this.escapeHtml(g.name || 'quota') + '" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + this.escapeHtml(g.name || 'quota') + '</div>' +
-            '<div class="small text-body-secondary">Quota unavailable</div>' +
-            '<div class="small text-danger mt-1">' + msg + '</div>' +
+            '<div class="small text-body-secondary">' + this.escapeHtml(statusLabel) + '</div>' +
+            '<div class="' + msgClass + '">' + msg + '</div>' +
           '</div>';
         }
         const ringColorFromUsed = (used) => (used >= 90 ? '#dc3545' : (used >= 70 ? '#fd7e14' : '#198754'));
+        const metricLabel = (metric, fallback) => {
+          const m = metric || {};
+          const feature = String(m.metered_feature || '').trim();
+          const windowLabel = String(m.window || '').trim();
+          if (feature && windowLabel) return feature + ' · ' + windowLabel;
+          if (feature) return feature;
+          if (windowLabel) return fallback + ' · ' + windowLabel;
+          return fallback;
+        };
         const renderCircle = (metric, label) => {
           if (!metric) return '';
           const left = Number(this.metricLeftPercent(metric) || 0);
@@ -1493,7 +1526,7 @@ function adminApp() {
             '<div class="small"><div class="fw-semibold">' + this.escapeHtml(label) + '</div><div class="text-body-secondary">' + (resetAge ? ('resets ' + this.escapeHtml(resetAge)) : 'reset unknown') + '</div></div>' +
           '</div>';
         };
-        const renderDualCircle = (reqMetric, tokMetric) => {
+        const renderDualCircle = (reqMetric, tokMetric, label) => {
           if (!reqMetric || !tokMetric) return '';
           const reqLeft = Number(this.metricLeftPercent(reqMetric) || 0);
           const tokLeft = Number(this.metricLeftPercent(tokMetric) || 0);
@@ -1513,24 +1546,52 @@ function adminApp() {
               '</div>' +
             '</div>' +
             '<div class="small">' +
-              '<div class="fw-semibold">Tokens ' + Math.round(tokLeft) + '%</div>' +
+              '<div class="fw-semibold">' + this.escapeHtml(label || 'Tokens') + ' ' + Math.round(tokLeft) + '%</div>' +
               '<div class="text-body-secondary">' + (tokReset ? ('resets ' + this.escapeHtml(tokReset)) : 'reset unknown') + '</div>' +
               '<div class="fw-semibold mt-1">Requests ' + Math.round(reqLeft) + '%</div>' +
               '<div class="text-body-secondary">' + (reqReset ? ('resets ' + this.escapeHtml(reqReset)) : 'reset unknown') + '</div>' +
             '</div>' +
           '</div>';
         };
-        const dualCircle = renderDualCircle(g.requests, g.tokens);
-        const reqCircle = dualCircle ? '' : renderCircle(g.requests, 'Requests');
-        const tokCircle = dualCircle ? '' : renderCircle(g.tokens, 'Tokens');
-        const fallbackCircle = (!reqCircle && !tokCircle) ? renderCircle(g.other[0] || null, 'Quota') : '';
+        const requestMetrics = Array.isArray(g.requestMetrics) ? g.requestMetrics : [];
+        const tokenMetrics = Array.isArray(g.tokenMetrics) ? g.tokenMetrics : [];
+        const windows = {};
+        requestMetrics.forEach((m) => {
+          const key = String((m && m.window) || '').trim() || 'quota';
+          if (!windows[key]) windows[key] = {request: null, token: null};
+          windows[key].request = m;
+        });
+        tokenMetrics.forEach((m) => {
+          const key = String((m && m.window) || '').trim() || 'quota';
+          if (!windows[key]) windows[key] = {request: null, token: null};
+          windows[key].token = m;
+        });
+        const metricBlocks = [];
+        Object.keys(windows).sort().forEach((w) => {
+          const pair = windows[w] || {};
+          if (pair.request && pair.token) {
+            metricBlocks.push(renderDualCircle(pair.request, pair.token, metricLabel(pair.token, 'Tokens')));
+            return;
+          }
+          if (pair.request) {
+            metricBlocks.push(renderCircle(pair.request, metricLabel(pair.request, 'Requests')));
+            return;
+          }
+          if (pair.token) {
+            metricBlocks.push(renderCircle(pair.token, metricLabel(pair.token, 'Tokens')));
+          }
+        });
+        (Array.isArray(g.other) ? g.other : []).forEach((m) => {
+          metricBlocks.push(renderCircle(m, metricLabel(m, 'Quota')));
+        });
+        const fallbackCircle = metricBlocks.length ? '' : renderCircle(null, 'Quota');
         const subtitle = (String(g.provider || '').trim() && String(g.provider || '').trim() !== String(g.name || '').trim())
           ? ('<div class="small text-body-secondary text-break">' + this.escapeHtml(g.provider) + '</div>')
           : '';
         return '<div class="border rounded p-2 bg-body">' +
           subtitle +
           '<div class="fw-semibold small mb-2" title="' + this.escapeHtml(g.name || 'quota') + '" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + this.escapeHtml(g.name || 'quota') + '</div>' +
-          '<div class="d-flex flex-wrap gap-3 align-items-center mt-2">' + (dualCircle + reqCircle + tokCircle + fallbackCircle) + '</div>' +
+          '<div class="d-flex flex-wrap gap-3 align-items-center mt-2">' + (metricBlocks.join('') + fallbackCircle) + '</div>' +
         '</div>';
       }).join('');
       const emptyMsg = quotaSearch ? 'No matching quotas.' : 'No quota data.';
