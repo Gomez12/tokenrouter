@@ -90,6 +90,7 @@ type ServerConfig struct {
 	AllowLocalhostNoAuth          bool                `toml:"allow_localhost_no_auth"`
 	AllowHostDockerInternalNoAuth bool                `toml:"allow_host_docker_internal_no_auth"`
 	AutoEnablePublicFreeModels    bool                `toml:"auto_enable_public_free_models"`
+	AutoDetectLocalServers        bool                `toml:"auto_detect_local_servers"`
 	AutoRemoveExpiredTokens       bool                `toml:"auto_remove_expired_tokens"`
 	AutoRemoveEmptyQuotaTokens    bool                `toml:"auto_remove_empty_quota_tokens"`
 	DefaultProvider               string              `toml:"default_provider"`
@@ -177,6 +178,7 @@ func NewDefaultServerConfig() *ServerConfig {
 		DefaultProvider:            "",
 		Providers:                  []ProviderConfig{},
 		AutoEnablePublicFreeModels: true,
+		AutoDetectLocalServers:     true,
 		AutoRemoveExpiredTokens:    true,
 		AutoRemoveEmptyQuotaTokens: false,
 		Conversations: ConversationsConfig{
@@ -312,6 +314,10 @@ func load(path string, v any) error {
 }
 
 func unmarshalServerConfigTOML(b []byte, cfg *ServerConfig) error {
+	var top map[string]any
+	_ = toml.Unmarshal(b, &top)
+	_, hasAutoDetectLocalServers := top["auto_detect_local_servers"]
+
 	type legacyServerConfig struct {
 		ServerConfig
 		IncomingAPIKeys []string `toml:"incoming_api_keys"`
@@ -322,6 +328,9 @@ func unmarshalServerConfigTOML(b []byte, cfg *ServerConfig) error {
 		return fmt.Errorf("parse toml: %w", err)
 	}
 	*cfg = raw.ServerConfig
+	if !hasAutoDetectLocalServers {
+		cfg.AutoDetectLocalServers = true
+	}
 	if len(cfg.IncomingTokens) == 0 && len(raw.IncomingAPIKeys) > 0 {
 		cfg.IncomingTokens = make([]IncomingAPIToken, 0, len(raw.IncomingAPIKeys))
 		for i, k := range raw.IncomingAPIKeys {

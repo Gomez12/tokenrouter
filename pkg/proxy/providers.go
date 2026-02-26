@@ -7,6 +7,11 @@ import (
 	"io"
 	"net/http"
 	neturl "net/url"
+	"os"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +58,8 @@ type ProviderResolver struct {
 const autoProviderProbeTTL = 20 * time.Second
 
 var autoProviderProbeFn = probeAutoProviderOnline
+var autoProviderEnvLookup = os.Getenv
+var llamaProcessProbeFn = probeLlamaCPPProcesses
 
 var autoProviderProbeState struct {
 	mu    sync.Mutex
@@ -62,6 +69,19 @@ var autoProviderProbeState struct {
 type autoProviderProbeResult struct {
 	checkedAt time.Time
 	online    bool
+}
+
+type llamaProcessInfo struct {
+	Host string
+	Port int
+}
+
+const llamaProcessProbeTTL = 20 * time.Second
+
+var llamaProcessProbeState struct {
+	mu        sync.Mutex
+	checkedAt time.Time
+	processes []llamaProcessInfo
 }
 
 func NewProviderResolver(store *config.ServerConfigStore) *ProviderResolver {
@@ -93,6 +113,10 @@ func (r *ProviderResolver) ListProviders() []config.ProviderConfig {
 				if !p.PublicFreeNoAuth {
 					continue
 				}
+				// Local endpoints are handled by dedicated local auto-detection.
+				if p.Name == "lmstudio" || p.Name == "ollama" {
+					continue
+				}
 				if _, ok := seen[p.Name]; ok {
 					continue
 				}
@@ -106,7 +130,345 @@ func (r *ProviderResolver) ListProviders() []config.ProviderConfig {
 			}
 		}
 	}
+	for _, p := range autoDetectedProviders(popularByName, seen, cfg.AutoEnablePublicFreeModels, cfg.AutoDetectLocalServers) {
+		out = append(out, p)
+	}
 	return out
+}
+
+func autoDetectedProviders(popularByName map[string]config.ProviderConfig, seen map[string]struct{}, autoMergeEnabled bool, autoDetectLocal bool) []config.ProviderConfig {
+	out := make([]config.ProviderConfig, 0, 4)
+	addIfOnline := func(p config.ProviderConfig) {
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		p.Enabled = true
+		if p.TimeoutSeconds <= 0 {
+			p.TimeoutSeconds = 60
+		}
+		if !autoProviderOnline(p) {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, p)
+	}
+
+	if autoDetectLocal {
+		if lmstudio, ok := popularByName["lmstudio"]; ok {
+			addIfOnline(lmstudio)
+		}
+		if ollama, ok := popularByName["ollama"]; ok {
+			addIfOnline(ollama)
+		}
+		for _, p := range autoDetectedLlamaCPPProviders() {
+			addIfOnline(p)
+		}
+	}
+	if autoMergeEnabled {
+		if cloud, ok := popularByName["ollama-cloud"]; ok {
+			if key := strings.TrimSpace(autoProviderEnvLookup("OLLAMA_API_KEY")); key != "" {
+				cloud.APIKey = key
+				addIfOnline(cloud)
+			}
+		}
+	}
+	return out
+}
+
+func autoDetectedLlamaCPPProviders() []config.ProviderConfig {
+	processes := cachedLlamaCPPProcesses()
+	if len(processes) == 0 {
+		return nil
+	}
+	out := make([]config.ProviderConfig, 0, len(processes))
+	for _, proc := range processes {
+		port := proc.Port
+		if port <= 0 || port > 65535 {
+			continue
+		}
+		host := normalizeLocalProbeHost(proc.Host)
+		baseURL := "http://" + host + ":" + strconv.Itoa(port) + "/v1"
+		name := "llama-cpp-local-" + strconv.Itoa(port)
+		out = append(out, config.ProviderConfig{
+			Name:           name,
+			ProviderType:   "llama-cpp-local",
+			BaseURL:        baseURL,
+			Enabled:        true,
+			TimeoutSeconds: 60,
+		})
+	}
+	return out
+}
+
+func cachedLlamaCPPProcesses() []llamaProcessInfo {
+	now := time.Now().UTC()
+	llamaProcessProbeState.mu.Lock()
+	if !llamaProcessProbeState.checkedAt.IsZero() && now.Sub(llamaProcessProbeState.checkedAt) < llamaProcessProbeTTL {
+		cached := append([]llamaProcessInfo(nil), llamaProcessProbeState.processes...)
+		llamaProcessProbeState.mu.Unlock()
+		return cached
+	}
+	llamaProcessProbeState.mu.Unlock()
+
+	found := []llamaProcessInfo{}
+	if llamaProcessProbeFn != nil {
+		found = llamaProcessProbeFn()
+	}
+	found = dedupeAndSortLlamaProcesses(found)
+
+	llamaProcessProbeState.mu.Lock()
+	llamaProcessProbeState.checkedAt = now
+	llamaProcessProbeState.processes = append([]llamaProcessInfo(nil), found...)
+	llamaProcessProbeState.mu.Unlock()
+	return found
+}
+
+func dedupeAndSortLlamaProcesses(in []llamaProcessInfo) []llamaProcessInfo {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]llamaProcessInfo, 0, len(in))
+	for _, p := range in {
+		host := normalizeLocalProbeHost(p.Host)
+		if p.Port <= 0 || p.Port > 65535 {
+			continue
+		}
+		key := host + ":" + strconv.Itoa(p.Port)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, llamaProcessInfo{Host: host, Port: p.Port})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Port == out[j].Port {
+			return out[i].Host < out[j].Host
+		}
+		return out[i].Port < out[j].Port
+	})
+	return out
+}
+
+func normalizeLocalProbeHost(host string) string {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		return "127.0.0.1"
+	}
+	h = strings.Trim(h, "[]")
+	switch h {
+	case "0.0.0.0", "::", "::0", "::1", "*":
+		return "127.0.0.1"
+	}
+	return h
+}
+
+var (
+	llamaPortLongRE  = regexp.MustCompile(`(?:^|\s)--port(?:=|\s+)(\d{2,5})(?:\s|$)`)
+	llamaPortShortRE = regexp.MustCompile(`(?:^|\s)-p\s+(\d{2,5})(?:\s|$)`)
+	llamaHostLongRE  = regexp.MustCompile(`(?:^|\s)--host(?:=|\s+)([^\s]+)`)
+	llamaHostShortRE = regexp.MustCompile(`(?:^|\s)-h\s+([^\s]+)`)
+)
+
+func probeLlamaCPPProcesses() []llamaProcessInfo {
+	switch runtime.GOOS {
+	case "linux":
+		byProc := probeLlamaCPPProcessesLinux()
+		byProbe := probeLlamaCPPProcessesByLocalProbe()
+		return dedupeAndSortLlamaProcesses(append(byProc, byProbe...))
+	case "darwin", "windows":
+		return probeLlamaCPPProcessesByLocalProbe()
+	default:
+		return nil
+	}
+}
+
+func probeLlamaCPPProcessesLinux() []llamaProcessInfo {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	found := make([]llamaProcessInfo, 0, 4)
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			continue
+		}
+		pid := strings.TrimSpace(ent.Name())
+		if pid == "" {
+			continue
+		}
+		if _, err := strconv.Atoi(pid); err != nil {
+			continue
+		}
+		raw, err := os.ReadFile("/proc/" + pid + "/cmdline")
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		line := strings.TrimSpace(strings.ReplaceAll(string(raw), "\x00", " "))
+		if line == "" {
+			continue
+		}
+		low := strings.ToLower(line)
+		if !strings.Contains(low, "llama-server") && !strings.Contains(low, "llama_cpp.server") && !strings.Contains(low, "llama-cpp-python") {
+			continue
+		}
+		port := 8080
+		host := "127.0.0.1"
+		if m := llamaPortLongRE.FindStringSubmatch(line); len(m) == 2 {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				port = n
+			}
+		} else if m := llamaPortShortRE.FindStringSubmatch(line); len(m) == 2 {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				port = n
+			}
+		}
+		if m := llamaHostLongRE.FindStringSubmatch(line); len(m) == 2 {
+			host = m[1]
+		} else if m := llamaHostShortRE.FindStringSubmatch(line); len(m) == 2 {
+			host = m[1]
+		}
+		found = append(found, llamaProcessInfo{Host: normalizeLocalProbeHost(host), Port: port})
+	}
+	return dedupeAndSortLlamaProcesses(found)
+}
+
+func probeLlamaCPPProcessesByLocalProbe() []llamaProcessInfo {
+	hosts := []string{"127.0.0.1", "localhost"}
+	ports := []int{8080, 8081, 8082, 8083, 8000, 1337}
+	out := make([]llamaProcessInfo, 0, len(ports))
+	for _, h := range hosts {
+		for _, p := range ports {
+			if probeLlamaCPPHostPort(h, p) {
+				out = append(out, llamaProcessInfo{Host: "127.0.0.1", Port: p})
+			}
+		}
+	}
+	return dedupeAndSortLlamaProcesses(out)
+}
+
+func probeLlamaCPPHostPort(host string, port int) bool {
+	if strings.TrimSpace(host) == "" || port <= 0 || port > 65535 {
+		return false
+	}
+	base := "http://" + host + ":" + strconv.Itoa(port)
+	cli := &http.Client{Timeout: 1000 * time.Millisecond}
+	if probeLlamaCPPProps(cli, base) {
+		return true
+	}
+	if probeLlamaCPPModels(cli, base) {
+		return true
+	}
+	if probeLlamaCPPHealth(cli, base) {
+		return true
+	}
+	return false
+}
+
+func probeLlamaCPPProps(cli *http.Client, base string) bool {
+	req, err := http.NewRequest(http.MethodGet, base+"/props", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return false
+	}
+	if obj == nil {
+		return false
+	}
+	if _, ok := obj["default_generation_settings"]; ok {
+		return true
+	}
+	if _, ok := obj["model_path"]; ok {
+		return true
+	}
+	if _, ok := obj["total_slots"]; ok {
+		return true
+	}
+	return false
+}
+
+func probeLlamaCPPModels(cli *http.Client, base string) bool {
+	req, err := http.NewRequest(http.MethodGet, base+"/v1/models", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return false
+	}
+	data, ok := obj["data"]
+	if !ok {
+		return false
+	}
+	arr, ok := data.([]any)
+	if !ok {
+		return false
+	}
+	if len(arr) == 0 {
+		// Empty models still indicates OpenAI-compatible server is running.
+		return true
+	}
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, ok := m["id"].(string); ok && strings.TrimSpace(id) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func probeLlamaCPPHealth(cli *http.Client, base string) bool {
+	req, err := http.NewRequest(http.MethodGet, base+"/health", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+	text := strings.ToLower(strings.TrimSpace(string(body)))
+	server := strings.ToLower(strings.TrimSpace(resp.Header.Get("Server")))
+	poweredBy := strings.ToLower(strings.TrimSpace(resp.Header.Get("X-Powered-By")))
+	if strings.Contains(text, "llama") || strings.Contains(server, "llama") || strings.Contains(poweredBy, "llama") {
+		return true
+	}
+	// Many llama.cpp builds answer "ok"/"healthy" on /health.
+	if text == "ok" || text == "healthy" {
+		return true
+	}
+	return false
 }
 
 func autoLMStudioOnline(p config.ProviderConfig) bool {

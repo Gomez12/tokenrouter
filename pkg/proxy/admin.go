@@ -3271,16 +3271,18 @@ func (h *AdminHandler) securitySettingsAPI(w http.ResponseWriter, r *http.Reques
 			"allow_localhost_no_auth":            cfg.AllowLocalhostNoAuth,
 			"allow_host_docker_internal_no_auth": cfg.AllowHostDockerInternalNoAuth,
 			"auto_enable_public_free_models":     cfg.AutoEnablePublicFreeModels,
+			"auto_detect_local_servers":          cfg.AutoDetectLocalServers,
 			"auto_remove_expired_tokens":         cfg.AutoRemoveExpiredTokens,
 			"auto_remove_empty_quota_tokens":     cfg.AutoRemoveEmptyQuotaTokens,
 		})
 	case http.MethodPut:
 		var payload struct {
-			AllowLocalhostNoAuth          bool `json:"allow_localhost_no_auth"`
-			AllowHostDockerInternalNoAuth bool `json:"allow_host_docker_internal_no_auth"`
-			AutoEnablePublicFreeModels    bool `json:"auto_enable_public_free_models"`
-			AutoRemoveExpiredTokens       bool `json:"auto_remove_expired_tokens"`
-			AutoRemoveEmptyQuotaTokens    bool `json:"auto_remove_empty_quota_tokens"`
+			AllowLocalhostNoAuth          bool  `json:"allow_localhost_no_auth"`
+			AllowHostDockerInternalNoAuth bool  `json:"allow_host_docker_internal_no_auth"`
+			AutoEnablePublicFreeModels    bool  `json:"auto_enable_public_free_models"`
+			AutoDetectLocalServers        *bool `json:"auto_detect_local_servers"`
+			AutoRemoveExpiredTokens       bool  `json:"auto_remove_expired_tokens"`
+			AutoRemoveEmptyQuotaTokens    bool  `json:"auto_remove_empty_quota_tokens"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
@@ -3290,6 +3292,9 @@ func (h *AdminHandler) securitySettingsAPI(w http.ResponseWriter, r *http.Reques
 			c.AllowLocalhostNoAuth = payload.AllowLocalhostNoAuth
 			c.AllowHostDockerInternalNoAuth = payload.AllowHostDockerInternalNoAuth
 			c.AutoEnablePublicFreeModels = payload.AutoEnablePublicFreeModels
+			if payload.AutoDetectLocalServers != nil {
+				c.AutoDetectLocalServers = *payload.AutoDetectLocalServers
+			}
 			c.AutoRemoveExpiredTokens = payload.AutoRemoveExpiredTokens
 			c.AutoRemoveEmptyQuotaTokens = payload.AutoRemoveEmptyQuotaTokens
 			return nil
@@ -3303,6 +3308,7 @@ func (h *AdminHandler) securitySettingsAPI(w http.ResponseWriter, r *http.Reques
 			"allow_localhost_no_auth":            cfg.AllowLocalhostNoAuth,
 			"allow_host_docker_internal_no_auth": cfg.AllowHostDockerInternalNoAuth,
 			"auto_enable_public_free_models":     cfg.AutoEnablePublicFreeModels,
+			"auto_detect_local_servers":          cfg.AutoDetectLocalServers,
 			"auto_remove_expired_tokens":         cfg.AutoRemoveExpiredTokens,
 			"auto_remove_empty_quota_tokens":     cfg.AutoRemoveEmptyQuotaTokens,
 		})

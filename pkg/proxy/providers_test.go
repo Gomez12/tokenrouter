@@ -4,7 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
@@ -301,5 +304,266 @@ func TestProbeOllamaOnlineAcceptsTagsEndpoint(t *testing.T) {
 
 	if !probeOllamaOnline(config.ProviderConfig{Name: "ollama", BaseURL: srv.URL + "/v1"}) {
 		t.Fatal("expected ollama probe to accept /api/tags signature")
+	}
+}
+
+func TestListProvidersAutoDetectsLocalOllama(t *testing.T) {
+	prevProbeFn := autoProviderProbeFn
+	prevEnv := autoProviderEnvLookup
+	prevLlamaProbe := llamaProcessProbeFn
+	autoProviderProbeFn = func(p config.ProviderConfig) bool { return strings.TrimSpace(p.Name) == "ollama" }
+	autoProviderEnvLookup = func(string) string { return "" }
+	llamaProcessProbeFn = func() []llamaProcessInfo { return nil }
+	autoProviderProbeState.mu.Lock()
+	autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+	autoProviderProbeState.mu.Unlock()
+	llamaProcessProbeState.mu.Lock()
+	llamaProcessProbeState.checkedAt = time.Time{}
+	llamaProcessProbeState.processes = nil
+	llamaProcessProbeState.mu.Unlock()
+	defer func() {
+		autoProviderProbeFn = prevProbeFn
+		autoProviderEnvLookup = prevEnv
+		llamaProcessProbeFn = prevLlamaProbe
+		autoProviderProbeState.mu.Lock()
+		autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+		autoProviderProbeState.mu.Unlock()
+		llamaProcessProbeState.mu.Lock()
+		llamaProcessProbeState.checkedAt = time.Time{}
+		llamaProcessProbeState.processes = nil
+		llamaProcessProbeState.mu.Unlock()
+	}()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = nil
+	cfg.AutoEnablePublicFreeModels = false
+	cfg.AutoDetectLocalServers = true
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	providers := r.ListProviders()
+	found := false
+	for _, p := range providers {
+		if p.Name == "ollama" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected local ollama to be auto-detected")
+	}
+}
+
+func TestListProvidersSkipsLocalAutoDetectionWhenDisabled(t *testing.T) {
+	prevProbeFn := autoProviderProbeFn
+	prevEnv := autoProviderEnvLookup
+	prevLlamaProbe := llamaProcessProbeFn
+	autoProviderProbeFn = func(config.ProviderConfig) bool { return true }
+	autoProviderEnvLookup = func(string) string { return "" }
+	llamaProcessProbeFn = func() []llamaProcessInfo {
+		return []llamaProcessInfo{{Host: "127.0.0.1", Port: 8081}}
+	}
+	autoProviderProbeState.mu.Lock()
+	autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+	autoProviderProbeState.mu.Unlock()
+	llamaProcessProbeState.mu.Lock()
+	llamaProcessProbeState.checkedAt = time.Time{}
+	llamaProcessProbeState.processes = nil
+	llamaProcessProbeState.mu.Unlock()
+	defer func() {
+		autoProviderProbeFn = prevProbeFn
+		autoProviderEnvLookup = prevEnv
+		llamaProcessProbeFn = prevLlamaProbe
+		autoProviderProbeState.mu.Lock()
+		autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+		autoProviderProbeState.mu.Unlock()
+		llamaProcessProbeState.mu.Lock()
+		llamaProcessProbeState.checkedAt = time.Time{}
+		llamaProcessProbeState.processes = nil
+		llamaProcessProbeState.mu.Unlock()
+	}()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = nil
+	cfg.AutoEnablePublicFreeModels = true
+	cfg.AutoDetectLocalServers = false
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	providers := r.ListProviders()
+	for _, p := range providers {
+		if p.Name == "ollama" || p.Name == "lmstudio" || strings.HasPrefix(p.Name, "llama-cpp-local-") {
+			t.Fatalf("did not expect local auto-detected provider %q when local detection is disabled", p.Name)
+		}
+	}
+}
+
+func TestListProvidersAutoDetectsOllamaCloudFromEnv(t *testing.T) {
+	prevProbeFn := autoProviderProbeFn
+	prevEnv := autoProviderEnvLookup
+	prevLlamaProbe := llamaProcessProbeFn
+	autoProviderProbeFn = func(p config.ProviderConfig) bool { return strings.TrimSpace(p.Name) == "ollama-cloud" }
+	autoProviderEnvLookup = func(key string) string {
+		if key == "OLLAMA_API_KEY" {
+			return "test-key"
+		}
+		return ""
+	}
+	llamaProcessProbeFn = func() []llamaProcessInfo { return nil }
+	autoProviderProbeState.mu.Lock()
+	autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+	autoProviderProbeState.mu.Unlock()
+	llamaProcessProbeState.mu.Lock()
+	llamaProcessProbeState.checkedAt = time.Time{}
+	llamaProcessProbeState.processes = nil
+	llamaProcessProbeState.mu.Unlock()
+	defer func() {
+		autoProviderProbeFn = prevProbeFn
+		autoProviderEnvLookup = prevEnv
+		llamaProcessProbeFn = prevLlamaProbe
+		autoProviderProbeState.mu.Lock()
+		autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+		autoProviderProbeState.mu.Unlock()
+		llamaProcessProbeState.mu.Lock()
+		llamaProcessProbeState.checkedAt = time.Time{}
+		llamaProcessProbeState.processes = nil
+		llamaProcessProbeState.mu.Unlock()
+	}()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = nil
+	cfg.AutoEnablePublicFreeModels = true
+	cfg.AutoDetectLocalServers = true
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	providers := r.ListProviders()
+	found := false
+	for _, p := range providers {
+		if p.Name == "ollama-cloud" {
+			found = true
+			if strings.TrimSpace(p.APIKey) != "test-key" {
+				t.Fatalf("expected auto-detected ollama-cloud to use env api key, got %q", p.APIKey)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected ollama-cloud to be auto-detected when OLLAMA_API_KEY is set")
+	}
+}
+
+func TestListProvidersAutoDetectsLlamaCPPProcesses(t *testing.T) {
+	prevProbeFn := autoProviderProbeFn
+	prevEnv := autoProviderEnvLookup
+	prevLlamaProbe := llamaProcessProbeFn
+	autoProviderProbeFn = func(p config.ProviderConfig) bool {
+		return strings.HasPrefix(strings.TrimSpace(p.Name), "llama-cpp-local-")
+	}
+	autoProviderEnvLookup = func(string) string { return "" }
+	llamaProcessProbeFn = func() []llamaProcessInfo {
+		return []llamaProcessInfo{
+			{Host: "0.0.0.0", Port: 8081},
+			{Host: "127.0.0.1", Port: 8082},
+		}
+	}
+	autoProviderProbeState.mu.Lock()
+	autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+	autoProviderProbeState.mu.Unlock()
+	llamaProcessProbeState.mu.Lock()
+	llamaProcessProbeState.checkedAt = time.Time{}
+	llamaProcessProbeState.processes = nil
+	llamaProcessProbeState.mu.Unlock()
+	defer func() {
+		autoProviderProbeFn = prevProbeFn
+		autoProviderEnvLookup = prevEnv
+		llamaProcessProbeFn = prevLlamaProbe
+		autoProviderProbeState.mu.Lock()
+		autoProviderProbeState.byKey = map[string]autoProviderProbeResult{}
+		autoProviderProbeState.mu.Unlock()
+		llamaProcessProbeState.mu.Lock()
+		llamaProcessProbeState.checkedAt = time.Time{}
+		llamaProcessProbeState.processes = nil
+		llamaProcessProbeState.mu.Unlock()
+	}()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = nil
+	cfg.AutoEnablePublicFreeModels = false
+	cfg.AutoDetectLocalServers = true
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	providers := r.ListProviders()
+	want := map[string]string{
+		"llama-cpp-local-8081": "http://127.0.0.1:8081/v1",
+		"llama-cpp-local-8082": "http://127.0.0.1:8082/v1",
+	}
+	for _, p := range providers {
+		if u, ok := want[p.Name]; ok {
+			if p.BaseURL != u {
+				t.Fatalf("expected %s base_url %q, got %q", p.Name, u, p.BaseURL)
+			}
+			delete(want, p.Name)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing auto-detected llama.cpp providers: %+v", want)
+	}
+}
+
+func TestProbeLlamaCPPHostPortAcceptsV1Models(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/props":
+			http.NotFound(w, r)
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"qwen2.5-7b-instruct"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	u := strings.TrimPrefix(srv.URL, "http://")
+	host, portStr, ok := strings.Cut(u, ":")
+	if !ok {
+		t.Fatalf("unexpected test server url %q", srv.URL)
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(portStr))
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+	if !probeLlamaCPPHostPort(host, port) {
+		t.Fatal("expected llama.cpp probe to accept /v1/models signature")
+	}
+}
+
+func TestProbeLlamaCPPHostPortAcceptsHealthHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/props", "/v1/models":
+			http.NotFound(w, r)
+		case "/health":
+			w.Header().Set("Server", "llama.cpp")
+			_, _ = w.Write([]byte("ok"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	u := strings.TrimPrefix(srv.URL, "http://")
+	host, portStr, ok := strings.Cut(u, ":")
+	if !ok {
+		t.Fatalf("unexpected test server url %q", srv.URL)
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(portStr))
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+	if !probeLlamaCPPHostPort(host, port) {
+		t.Fatal("expected llama.cpp probe to accept /health signature")
 	}
 }

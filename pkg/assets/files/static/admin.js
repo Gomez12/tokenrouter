@@ -34,6 +34,7 @@ function adminApp() {
     allowLocalhostNoAuthEffective: false,
     allowHostDockerInternalNoAuthEffective: false,
     autoEnablePublicFreeModels: false,
+    autoDetectLocalServers: true,
     autoRemoveExpiredTokens: true,
     autoRemoveEmptyQuotaTokens: false,
     securitySaveInProgress: false,
@@ -452,6 +453,15 @@ function adminApp() {
       if (!currentRoot || !nextRoot) return false;
       this.syncHeadFromDocument(nextDoc);
       this.morphDOMNode(currentRoot, nextRoot);
+      if (window.Alpine && typeof window.Alpine.initTree === 'function') {
+        try {
+          if (typeof window.Alpine.mutateDom === 'function') {
+            window.Alpine.mutateDom(() => window.Alpine.initTree(currentRoot));
+          } else {
+            window.Alpine.initTree(currentRoot);
+          }
+        } catch (_) {}
+      }
       this.runtimeScriptFingerprints = nextMap;
       return true;
     },
@@ -2495,6 +2505,7 @@ function adminApp() {
       this.allowLocalhostNoAuth = this.allowLocalhostNoAuthEffective;
       this.allowHostDockerInternalNoAuth = this.allowHostDockerInternalNoAuthEffective;
       this.autoEnablePublicFreeModels = !!body.auto_enable_public_free_models;
+      this.autoDetectLocalServers = (body.auto_detect_local_servers === undefined) ? true : !!body.auto_detect_local_servers;
       this.autoRemoveExpiredTokens = !!body.auto_remove_expired_tokens;
       this.autoRemoveEmptyQuotaTokens = !!body.auto_remove_empty_quota_tokens;
     },
@@ -2506,6 +2517,7 @@ function adminApp() {
           allow_localhost_no_auth: !!this.allowLocalhostNoAuth,
           allow_host_docker_internal_no_auth: !!this.allowHostDockerInternalNoAuth,
           auto_enable_public_free_models: !!this.autoEnablePublicFreeModels,
+          auto_detect_local_servers: !!this.autoDetectLocalServers,
           auto_remove_expired_tokens: !!this.autoRemoveExpiredTokens,
           auto_remove_empty_quota_tokens: !!this.autoRemoveEmptyQuotaTokens
         };
@@ -2518,6 +2530,7 @@ function adminApp() {
           this.allowLocalhostNoAuth = this.allowLocalhostNoAuthEffective;
           this.allowHostDockerInternalNoAuth = this.allowHostDockerInternalNoAuthEffective;
           this.autoEnablePublicFreeModels = !!body.auto_enable_public_free_models;
+          this.autoDetectLocalServers = (body.auto_detect_local_servers === undefined) ? true : !!body.auto_detect_local_servers;
           this.autoRemoveExpiredTokens = !!body.auto_remove_expired_tokens;
           this.autoRemoveEmptyQuotaTokens = !!body.auto_remove_empty_quota_tokens;
           await this.loadAccessTokens();
