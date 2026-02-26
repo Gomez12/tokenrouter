@@ -58,9 +58,13 @@ type Server struct {
 	modelsCached          atomic.Pointer[[]ModelCard]
 	activeProxyRequests   atomic.Int64
 	draining              atomic.Bool
+	modelRefreshMu        sync.Mutex
+	modelRefreshLast      map[string]time.Time
+	modelRefreshRunning   map[string]bool
 }
 
 const accessTokenCleanupInterval = 1 * time.Minute
+const modelNotFoundRefreshDebounce = 2 * time.Minute
 
 func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 	store := config.NewServerConfigStore(configPath, cfg)
@@ -81,6 +85,8 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 		logs: logstore.NewStore(config.DefaultLogsPath(), logstore.Settings{
 			MaxLines: cfg.Logs.MaxLines,
 		}),
+		modelRefreshLast:    map[string]time.Time{},
+		modelRefreshRunning: map[string]bool{},
 	}
 	logutil.SetOutputTee(s.logs.Writer())
 	s.loadModelsCacheFromDisk()
@@ -825,6 +831,9 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	if isProviderModelNotFoundError(statusCode, respBody) {
+		s.triggerProviderModelRefresh(provider, "model_not_found")
+	}
 	s.providerHealthChecker.RecordProxyResult(provider.Name, latency, statusCode, nil)
 	if statusCode >= 200 && statusCode <= 299 && s.adminHandler != nil {
 		s.adminHandler.RecordQuotaFromResponse(provider, header)
@@ -900,6 +909,103 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
+}
+
+func isProviderModelNotFoundError(status int, body []byte) bool {
+	if status != http.StatusNotFound || len(body) == 0 {
+		return false
+	}
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	return payloadContainsModelNotFound(payload)
+}
+
+func payloadContainsModelNotFound(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, vv := range x {
+			key := strings.ToLower(strings.TrimSpace(k))
+			if key == "code" || key == "type" || key == "error" || key == "message" {
+				val := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", vv)))
+				if strings.Contains(val, "model_not_found") || strings.Contains(val, "not_found_error") || strings.Contains(val, "model does not exist") {
+					return true
+				}
+			}
+			if payloadContainsModelNotFound(vv) {
+				return true
+			}
+		}
+	case []any:
+		for _, vv := range x {
+			if payloadContainsModelNotFound(vv) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) triggerProviderModelRefresh(provider config.ProviderConfig, reason string) {
+	name := strings.TrimSpace(provider.Name)
+	if s == nil || name == "" {
+		return
+	}
+	now := time.Now().UTC()
+	s.modelRefreshMu.Lock()
+	if s.modelRefreshRunning[name] {
+		s.modelRefreshMu.Unlock()
+		return
+	}
+	if last := s.modelRefreshLast[name]; !last.IsZero() && now.Sub(last) < modelNotFoundRefreshDebounce {
+		s.modelRefreshMu.Unlock()
+		return
+	}
+	s.modelRefreshRunning[name] = true
+	s.modelRefreshLast[name] = now
+	s.modelRefreshMu.Unlock()
+
+	log.Infof("triggering provider model refresh provider=%s reason=%s", name, strings.TrimSpace(reason))
+	go func(p config.ProviderConfig) {
+		defer func() {
+			s.modelRefreshMu.Lock()
+			s.modelRefreshRunning[name] = false
+			s.modelRefreshMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		cards, err := NewProviderClient(p).ListModels(ctx)
+		if err != nil {
+			log.Warnf("provider model refresh failed provider=%s err=%v", name, err)
+			return
+		}
+		s.mergeProviderModelsCache(name, cards)
+		if s.adminHandler != nil {
+			s.adminHandler.notifyAdminChanged("models")
+		}
+		log.Infof("provider model refresh completed provider=%s models=%d", name, len(cards))
+	}(provider)
+}
+
+func (s *Server) mergeProviderModelsCache(providerName string, cards []ModelCard) {
+	if s == nil || strings.TrimSpace(providerName) == "" {
+		return
+	}
+	existing := []ModelCard{}
+	if cur := s.modelsCached.Load(); cur != nil {
+		existing = append(existing, (*cur)...)
+	}
+	out := make([]ModelCard, 0, len(existing)+len(cards))
+	for _, m := range existing {
+		if strings.TrimSpace(m.Provider) == providerName {
+			continue
+		}
+		out = append(out, m)
+	}
+	out = append(out, cards...)
+	s.modelsCached.Store(&out)
+	s.saveModelsCacheToDisk(out)
 }
 
 func dedupeConversationText(text string) string {
