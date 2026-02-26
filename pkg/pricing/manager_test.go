@@ -226,3 +226,34 @@ func TestCerebrasPublicPricingSourceFetch(t *testing.T) {
 		t.Fatal("did not expect source to match non-cerebras provider")
 	}
 }
+
+func TestModelsEndpointPricingSourceFetchHuggingFaceUsesPer1MPricing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"Qwen/Qwen2.5-7B-Instruct","pricing":{"input":0.12,"output":0.35}}]}`))
+	}))
+	defer srv.Close()
+
+	src := &ModelsEndpointPricingSource{}
+	provider := config.ProviderConfig{
+		Name:         "hf-main",
+		ProviderType: "huggingface",
+		BaseURL:      srv.URL + "/v1",
+	}
+	entries, source, err := src.Fetch(context.Background(), provider)
+	if err != nil {
+		t.Fatalf("fetch pricing: %v", err)
+	}
+	if source != "v1/models" {
+		t.Fatalf("unexpected source: %q", source)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].InputPer1M != 0.12 || entries[0].OutputPer1M != 0.35 {
+		t.Fatalf("unexpected huggingface pricing: in=%f out=%f", entries[0].InputPer1M, entries[0].OutputPer1M)
+	}
+}

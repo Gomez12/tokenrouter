@@ -370,12 +370,13 @@ func (s *ModelsEndpointPricingSource) Fetch(ctx context.Context, p config.Provid
 		return nil, "", err
 	}
 	out := make([]ModelPricing, 0)
+	multiplier := pricingMultiplierForModelsEndpointProvider(p)
 	for _, item := range payload.Data {
 		modelID, _ := item["id"].(string)
 		if modelID == "" {
 			continue
 		}
-		in, outp, ok := parsePricingFields(item)
+		in, outp, ok := parsePricingFieldsWithMultiplier(item, multiplier)
 		if !ok {
 			continue
 		}
@@ -387,6 +388,14 @@ func (s *ModelsEndpointPricingSource) Fetch(ctx context.Context, p config.Provid
 		})
 	}
 	return out, "v1/models", nil
+}
+
+func pricingMultiplierForModelsEndpointProvider(p config.ProviderConfig) float64 {
+	// Hugging Face router pricing in /v1/models is already quoted in USD per 1M tokens.
+	if providerTypeOrName(p) == "huggingface" {
+		return 1
+	}
+	return 1_000_000
 }
 
 type OpenCodeZenPricingSource struct{}
@@ -628,6 +637,13 @@ func (s *CerebrasPublicPricingSource) Fetch(ctx context.Context, p config.Provid
 }
 
 func parsePricingFields(item map[string]any) (inputPer1M, outputPer1M float64, ok bool) {
+	return parsePricingFieldsWithMultiplier(item, 1_000_000)
+}
+
+func parsePricingFieldsWithMultiplier(item map[string]any, multiplier float64) (inputPer1M, outputPer1M float64, ok bool) {
+	if multiplier <= 0 {
+		multiplier = 1_000_000
+	}
 	if pricing, ok := item["pricing"].(map[string]any); ok {
 		inTok, inOK := parseNumber(pricing["prompt"])
 		outTok, outOK := parseNumber(pricing["completion"])
@@ -638,16 +654,16 @@ func parsePricingFields(item map[string]any) (inputPer1M, outputPer1M float64, o
 			outTok, outOK = parseNumber(pricing["output"])
 		}
 		if inOK || outOK {
-			return inTok * 1_000_000, outTok * 1_000_000, true
+			return inTok * multiplier, outTok * multiplier, true
 		}
 	}
 	if inTok, outTok, nestedOK := parseProviderArrayPricing(item["providers"]); nestedOK {
-		return inTok * 1_000_000, outTok * 1_000_000, true
+		return inTok * multiplier, outTok * multiplier, true
 	}
 	inTok, inOK := parseNumber(item["input_cost_per_token"])
 	outTok, outOK := parseNumber(item["output_cost_per_token"])
 	if inOK || outOK {
-		return inTok * 1_000_000, outTok * 1_000_000, true
+		return inTok * multiplier, outTok * multiplier, true
 	}
 	return 0, 0, false
 }
