@@ -9,6 +9,7 @@ import (
 )
 
 func TestCleanupAccessTokens_RemovesExpiredAndEmptyQuotaAndOrphans(t *testing.T) {
+	isolateDefaultDataPaths(t)
 	cfg := config.NewDefaultServerConfig()
 	cfg.AutoRemoveExpiredTokens = true
 	cfg.AutoRemoveEmptyQuotaTokens = true
@@ -57,6 +58,7 @@ func TestCleanupAccessTokens_RemovesExpiredAndEmptyQuotaAndOrphans(t *testing.T)
 }
 
 func TestCleanupAccessTokens_DisabledSettingsNoChanges(t *testing.T) {
+	isolateDefaultDataPaths(t)
 	cfg := config.NewDefaultServerConfig()
 	cfg.AutoRemoveExpiredTokens = false
 	cfg.AutoRemoveEmptyQuotaTokens = false

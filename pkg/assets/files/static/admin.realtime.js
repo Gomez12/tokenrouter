@@ -4,6 +4,10 @@
     window.addEventListener('beforeunload', () => this.stopRealtimeUpdates());
   }
 
+  function realtimePaused() {
+    return !!this.realtimePausedForReload;
+  }
+
   function stopRealtimeUpdates() {
     if (this.wsReconnectTimer) {
       clearTimeout(this.wsReconnectTimer);
@@ -32,6 +36,7 @@
   }
 
   function configureStatusUpdates() {
+    if (realtimePaused.call(this)) return;
     const intervalMs = this.statusUpdateIntervalMs();
     if (intervalMs < 0) {
       if (this.wsReconnectTimer) {
@@ -58,6 +63,7 @@
   }
 
   function scheduleRealtimeReconnect() {
+    if (realtimePaused.call(this)) return;
     if (this.statusUpdateIntervalMs() < 0) return;
     if (this.wsReconnectTimer) return;
     const delay = Math.min(this.wsBackoffMs, 30000);
@@ -69,6 +75,7 @@
   }
 
   function connectRealtimeWebSocket() {
+    if (realtimePaused.call(this)) return;
     if (this.statusUpdateIntervalMs() < 0) return;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
     const wsProto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
@@ -122,6 +129,7 @@
   }
 
   function noteWSFailure() {
+    if (realtimePaused.call(this)) return;
     this.wsFailureCount = Number(this.wsFailureCount || 0) + 1;
     if (this.wsFailureCount >= 8 && !this.reloadingForRuntimeUpdate && this.statusUpdateIntervalMs() >= 0) {
       this.statusHtml = '<span class="text-warning">Realtime connection unstable. Reloading admin page to recover.</span>';

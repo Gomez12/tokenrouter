@@ -37,7 +37,7 @@ func TestBuildConversationRecordViews(t *testing.T) {
 		{RequestTextMarkdown: "hello", ResponseTextMarkdown: "hi"},
 		{RequestTextMarkdown: "hello\nhow are you", ResponseTextMarkdown: "hi\nall good"},
 	}
-	views := buildConversationRecordViews(records)
+	views := buildConversationRecordViews(records, false)
 	if len(views) != 2 {
 		t.Fatalf("expected 2 views, got %d", len(views))
 	}
@@ -57,4 +57,3 @@ func TestBuildConversationRecordViews(t *testing.T) {
 		t.Fatalf("unexpected response delta %q", views[1].ResponseDeltaMarkdown)
 	}
 }
-

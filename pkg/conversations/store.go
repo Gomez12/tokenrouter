@@ -43,8 +43,12 @@ type Record struct {
 	APIKeyName           string            `json:"api_key_name,omitempty"`
 	RequestHeaders       map[string]string `json:"request_headers,omitempty"`
 	ResponseHeaders      map[string]string `json:"response_headers,omitempty"`
+	RequestHeadersRaw    string            `json:"request_headers_raw,omitempty"`
+	ResponseHeadersRaw   string            `json:"response_headers_raw,omitempty"`
 	RequestPayload       json.RawMessage   `json:"request_payload,omitempty"`
 	ResponsePayload      json.RawMessage   `json:"response_payload,omitempty"`
+	RequestPayloadRaw    string            `json:"request_payload_raw,omitempty"`
+	ResponsePayloadRaw   string            `json:"response_payload_raw,omitempty"`
 	RequestTextMarkdown  string            `json:"request_text_markdown,omitempty"`
 	ResponseTextMarkdown string            `json:"response_text_markdown,omitempty"`
 	StatusCode           int               `json:"status_code"`
@@ -62,6 +66,8 @@ type ThreadSummary struct {
 	APIKeyName      string    `json:"api_key_name,omitempty"`
 	RemoteIP        string    `json:"remote_ip,omitempty"`
 	LastPreview     string    `json:"last_preview,omitempty"`
+	TokenCount      int64     `json:"token_count,omitempty"`
+	Title           string    `json:"title,omitempty"`
 }
 
 type ListFilter struct {
@@ -83,8 +89,12 @@ type CaptureInput struct {
 	APIKeyName           string
 	RequestHeaders       map[string]string
 	ResponseHeaders      map[string]string
+	RequestHeadersRaw    string
+	ResponseHeadersRaw   string
 	RequestPayload       []byte
 	ResponsePayload      []byte
+	RequestPayloadRaw    string
+	ResponsePayloadRaw   string
 	RequestTextMarkdown  string
 	ResponseTextMarkdown string
 	StatusCode           int
@@ -175,25 +185,23 @@ func (s *Store) Add(in CaptureInput) (Record, bool) {
 
 	convKey := s.resolveConversationKeyLocked(in, now)
 	rec := Record{
-		ID:                   fmt.Sprintf("conv-%d-%d", now.UnixNano(), len(s.records)+1),
-		ConversationKey:      convKey,
-		CreatedAt:            now,
-		UpdatedAt:            now,
-		Endpoint:             strings.TrimSpace(in.Endpoint),
-		Provider:             strings.TrimSpace(in.Provider),
-		Model:                strings.TrimSpace(in.Model),
-		RemoteIP:             strings.TrimSpace(in.RemoteIP),
-		APIKeyName:           strings.TrimSpace(in.APIKeyName),
-		RequestHeaders:       cloneMap(in.RequestHeaders),
-		ResponseHeaders:      cloneMap(in.ResponseHeaders),
-		RequestPayload:       cloneBytes(in.RequestPayload),
-		ResponsePayload:      cloneBytes(in.ResponsePayload),
-		RequestTextMarkdown:  strings.TrimSpace(in.RequestTextMarkdown),
-		ResponseTextMarkdown: strings.TrimSpace(in.ResponseTextMarkdown),
-		StatusCode:           in.StatusCode,
-		LatencyMS:            in.LatencyMS,
-		Stream:               in.Stream,
-		ProtocolIDs:          in.ProtocolIDs,
+		ID:                 fmt.Sprintf("conv-%d-%d", now.UnixNano(), len(s.records)+1),
+		ConversationKey:    convKey,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		Endpoint:           strings.TrimSpace(in.Endpoint),
+		Provider:           strings.TrimSpace(in.Provider),
+		Model:              strings.TrimSpace(in.Model),
+		RemoteIP:           strings.TrimSpace(in.RemoteIP),
+		APIKeyName:         strings.TrimSpace(in.APIKeyName),
+		RequestHeadersRaw:  strings.TrimSpace(in.RequestHeadersRaw),
+		ResponseHeadersRaw: strings.TrimSpace(in.ResponseHeadersRaw),
+		RequestPayloadRaw:  strings.TrimSpace(in.RequestPayloadRaw),
+		ResponsePayloadRaw: strings.TrimSpace(in.ResponsePayloadRaw),
+		StatusCode:         in.StatusCode,
+		LatencyMS:          in.LatencyMS,
+		Stream:             in.Stream,
+		ProtocolIDs:        in.ProtocolIDs,
 	}
 	s.records = append(s.records, rec)
 
@@ -254,8 +262,8 @@ func (s *Store) ListThreads(filter ListFilter) ([]ThreadSummary, string, int) {
 				r.Model,
 				r.APIKeyName,
 				r.RemoteIP,
-				r.RequestTextMarkdown,
-				r.ResponseTextMarkdown,
+				r.RequestPayloadRaw,
+				r.ResponsePayloadRaw,
 				string(r.RequestPayload),
 				string(r.ResponsePayload),
 			}, "\n"))
@@ -283,12 +291,12 @@ func (s *Store) ListThreads(filter ListFilter) ([]ThreadSummary, string, int) {
 			t.Model = r.Model
 			t.APIKeyName = r.APIKeyName
 			t.RemoteIP = r.RemoteIP
-			if preview := strings.TrimSpace(r.ResponseTextMarkdown); preview != "" {
+			if preview := strings.TrimSpace(r.ResponsePayloadRaw); preview != "" {
 				if len(preview) > 160 {
 					preview = preview[:160] + "..."
 				}
 				t.LastPreview = preview
-			} else if preview := strings.TrimSpace(r.RequestTextMarkdown); preview != "" {
+			} else if preview := strings.TrimSpace(r.RequestPayloadRaw); preview != "" {
 				if len(preview) > 160 {
 					preview = preview[:160] + "..."
 				}
@@ -452,6 +460,14 @@ func (s *Store) load() {
 		return
 	}
 	s.records = append([]Record(nil), p.Records...)
+	for i := range s.records {
+		s.records[i].RequestHeaders = nil
+		s.records[i].ResponseHeaders = nil
+		s.records[i].RequestPayload = nil
+		s.records[i].ResponsePayload = nil
+		s.records[i].RequestTextMarkdown = ""
+		s.records[i].ResponseTextMarkdown = ""
+	}
 	if p.Settings.MaxItems > 0 || p.Settings.MaxAgeDays > 0 {
 		s.settings = normalizeSettings(p.Settings)
 	}
@@ -510,5 +526,9 @@ func cloneRecord(in Record) Record {
 	in.ResponseHeaders = cloneMap(in.ResponseHeaders)
 	in.RequestPayload = cloneBytes(in.RequestPayload)
 	in.ResponsePayload = cloneBytes(in.ResponsePayload)
+	in.RequestHeadersRaw = strings.TrimSpace(in.RequestHeadersRaw)
+	in.ResponseHeadersRaw = strings.TrimSpace(in.ResponseHeadersRaw)
+	in.RequestPayloadRaw = strings.TrimSpace(in.RequestPayloadRaw)
+	in.ResponsePayloadRaw = strings.TrimSpace(in.ResponsePayloadRaw)
 	return in
 }

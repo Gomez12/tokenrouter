@@ -112,6 +112,23 @@
         -6px 0 10px -8px color-mix(in srgb, var(--bs-primary) 45%, transparent),
         6px 0 10px -8px color-mix(in srgb, var(--bs-primary) 45%, transparent);
     }
+
+    .conversation-markdown p,
+    .conversation-markdown ul,
+    .conversation-markdown ol,
+    .conversation-markdown pre,
+    .conversation-markdown blockquote {
+      margin-bottom: 0.45rem;
+    }
+
+    .conversation-markdown > :last-child,
+    .conversation-markdown p:last-child,
+    .conversation-markdown ul:last-child,
+    .conversation-markdown ol:last-child,
+    .conversation-markdown pre:last-child,
+    .conversation-markdown blockquote:last-child {
+      margin-bottom: 0;
+    }
   </style>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
@@ -233,6 +250,14 @@
         <div class="d-flex flex-wrap align-items-start justify-content-between gap-2 mb-2">
           <h2 class="h5 mb-0">Conversations</h2>
           <div class="d-flex flex-wrap align-items-center gap-2">
+            <span
+              x-show="!conversationsCaptureEnabled"
+              style="display:none;"
+              class="badge text-bg-warning text-dark"
+              title="Conversation capture is disabled in settings."
+            >
+              Warning: capture disabled &rarr;
+            </span>
             <button class="icon-btn" title="Conversation settings" aria-label="Conversation settings" @click="openConversationsSettingsModal()">⚙</button>
             <input class="form-control form-control-sm" style="width:320px;" placeholder="Filter conversations..." x-model.trim="conversationsSearch" @input="debouncedLoadConversations()" />
             <button class="icon-btn icon-btn-danger" @click="clearConversations()" :disabled="!conversationThreads || conversationThreads.length === 0" title="Clear conversations" aria-label="Clear conversations">
@@ -241,22 +266,38 @@
             <button class="icon-btn" @click="loadConversations()" title="Refresh" aria-label="Refresh">↻</button>
           </div>
         </div>
-        <div class="border rounded p-2" style="max-height:68vh; overflow:auto;" x-html="conversationsListHtml"></div>
+        <div class="table-responsive border rounded p-2" style="max-height:68vh; overflow:auto;" x-html="conversationsListHtml"></div>
         <div x-html="conversationsPagerHtml"></div>
         <div class="small text-body-secondary mt-2">Click a conversation to open chat view.</div>
       </div>
     </div>
   </div>
 
-  <div x-show="showConversationDetailModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeConversationDetailModal()">
+  <div x-show="showConversationDetailModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeConversationDetailModal()" @keydown.enter.window.prevent="closeConversationDetailModal()">
     <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.55;" @click="closeConversationDetailModal()"></div>
     <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
       <div class="card shadow" style="width:100%;max-width:1100px;max-height:88vh;">
         <div class="card-header d-flex justify-content-between align-items-center">
-          <h3 class="h5 mb-0">Conversation</h3>
+          <div class="d-flex align-items-center gap-2">
+            <h3 class="h5 mb-0" x-text="conversationModalTitle()"></h3>
+            <button class="btn btn-sm py-0 px-2" :class="conversationIncludeInternal ? 'btn-primary' : 'btn-outline-secondary'" type="button" @click="toggleConversationIncludeInternal()">Show Internal</button>
+          </div>
           <button class="icon-btn" @click="closeConversationDetailModal()" title="Close" aria-label="Close">✕</button>
         </div>
         <div class="card-body" style="overflow:auto;max-height:calc(88vh - 58px);" x-html="conversationDetailHtml"></div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="showConversationRawModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeConversationRawModal()" @keydown.enter.window.prevent="closeConversationRawModal()">
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.55;" @click="closeConversationRawModal()"></div>
+    <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
+      <div class="card shadow" style="width:100%;max-width:1200px;max-height:90vh;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="h5 mb-0">Raw Message</h3>
+          <button class="icon-btn" @click="closeConversationRawModal()" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="card-body" style="overflow:auto;max-height:calc(90vh - 58px);" x-html="conversationRawHtml"></div>
       </div>
     </div>
   </div>
@@ -1010,21 +1051,21 @@
     </div>
   </div>
 
-  <div x-show="showConfirmModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeConfirmModal()">
+  <div x-show="showConfirmModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeConfirmModal()" @keydown.enter.window.prevent="confirmModalProceed()">
     <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeConfirmModal()"></div>
     <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
       <div class="card shadow" style="width:100%;max-width:520px;">
         <div class="card-header d-flex justify-content-between align-items-center">
           <h3 class="h5 mb-0" x-text="confirmModalTitle"></h3>
-          <button class="icon-btn" :disabled="confirmModalBusy" @click="closeConfirmModal()" title="Close" aria-label="Close">✕</button>
+          <button class="icon-btn" :disabled="(typeof confirmModalBusy !== 'undefined') ? !!confirmModalBusy : false" @click="closeConfirmModal()" title="Close" aria-label="Close">✕</button>
         </div>
         <div class="card-body">
           <p class="mb-3" x-text="confirmModalMessage"></p>
           <div class="d-flex justify-content-end gap-2">
-            <button class="btn btn-outline-secondary" :disabled="confirmModalBusy" @click="closeConfirmModal()">Cancel</button>
-            <button class="btn btn-danger" :disabled="confirmModalBusy" @click="confirmModalProceed()">
-              <span x-show="!confirmModalBusy" x-text="confirmModalConfirmLabel"></span>
-              <span x-show="confirmModalBusy">Working...</span>
+            <button class="btn btn-outline-secondary" :disabled="(typeof confirmModalBusy !== 'undefined') ? !!confirmModalBusy : false" @click="closeConfirmModal()">Cancel</button>
+            <button class="btn btn-danger" :disabled="(typeof confirmModalBusy !== 'undefined') ? !!confirmModalBusy : false" @click="confirmModalProceed()">
+              <span x-show="(typeof confirmModalBusy !== 'undefined') ? !confirmModalBusy : true" x-text="(typeof confirmModalConfirmLabel !== 'undefined') ? confirmModalConfirmLabel : 'Confirm'"></span>
+              <span x-show="(typeof confirmModalBusy !== 'undefined') ? !!confirmModalBusy : false">Working...</span>
             </button>
           </div>
         </div>

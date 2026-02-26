@@ -762,3 +762,25 @@ func NormalizeIncomingTokenRole(role string) string {
 		return ""
 	}
 }
+
+func RoleAtLeast(actualRole, requiredRole string) bool {
+	actual := NormalizeIncomingTokenRole(actualRole)
+	required := NormalizeIncomingTokenRole(requiredRole)
+	if actual == "" || required == "" {
+		return false
+	}
+	return roleLevel(actual) >= roleLevel(required)
+}
+
+func roleLevel(role string) int {
+	switch NormalizeIncomingTokenRole(role) {
+	case TokenRoleAdmin:
+		return 3
+	case TokenRoleKeymaster:
+		return 2
+	case TokenRoleInferrer:
+		return 1
+	default:
+		return 0
+	}
+}

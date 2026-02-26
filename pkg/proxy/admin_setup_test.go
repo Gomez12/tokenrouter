@@ -40,6 +40,7 @@ func TestLegacySetupPathRedirectsToAdmin(t *testing.T) {
 }
 
 func TestFirstRunLocalhostCanOpenAdminWithoutAuth(t *testing.T) {
+	isolateDefaultDataPaths(t)
 	cfg := config.NewDefaultServerConfig()
 	cfg.IncomingTokens = nil
 	cfg.AllowLocalhostNoAuth = true
@@ -58,6 +59,7 @@ func TestFirstRunLocalhostCanOpenAdminWithoutAuth(t *testing.T) {
 }
 
 func TestFirstRunLocalhostCanUseAccessTokensAPIWithoutAuth(t *testing.T) {
+	isolateDefaultDataPaths(t)
 	cfg := config.NewDefaultServerConfig()
 	cfg.IncomingTokens = nil
 	cfg.AllowLocalhostNoAuth = true

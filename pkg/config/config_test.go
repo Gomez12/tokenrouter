@@ -97,3 +97,27 @@ func TestIncomingTokenQuotaNormalizeClampAndValidateWindow(t *testing.T) {
 		t.Fatalf("expected validate success, got %v", err)
 	}
 }
+
+func TestRoleAtLeastHierarchy(t *testing.T) {
+	tests := []struct {
+		name     string
+		actual   string
+		required string
+		ok       bool
+	}{
+		{name: "admin satisfies keymaster", actual: TokenRoleAdmin, required: TokenRoleKeymaster, ok: true},
+		{name: "admin satisfies inferrer", actual: TokenRoleAdmin, required: TokenRoleInferrer, ok: true},
+		{name: "keymaster satisfies inferrer", actual: TokenRoleKeymaster, required: TokenRoleInferrer, ok: true},
+		{name: "keymaster does not satisfy admin", actual: TokenRoleKeymaster, required: TokenRoleAdmin, ok: false},
+		{name: "inferrer does not satisfy keymaster", actual: TokenRoleInferrer, required: TokenRoleKeymaster, ok: false},
+		{name: "blank normalizes to inferrer", actual: "", required: TokenRoleInferrer, ok: true},
+		{name: "unknown role rejected", actual: "owner", required: TokenRoleInferrer, ok: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RoleAtLeast(tc.actual, tc.required); got != tc.ok {
+				t.Fatalf("RoleAtLeast(%q, %q)=%v want %v", tc.actual, tc.required, got, tc.ok)
+			}
+		})
+	}
+}

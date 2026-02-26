@@ -13,6 +13,7 @@ import (
 )
 
 func TestProxyQuotaBlocksAndEmitsHeadersAndJSON(t *testing.T) {
+	isolateDefaultDataPaths(t)
 	var upstreamCalls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls.Add(1)
@@ -98,6 +99,7 @@ func TestProxyQuotaBlocksAndEmitsHeadersAndJSON(t *testing.T) {
 }
 
 func TestProxyQuotaSubordinateUsesOwnerQuota(t *testing.T) {
+	isolateDefaultDataPaths(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -153,6 +155,7 @@ func TestProxyQuotaSubordinateUsesOwnerQuota(t *testing.T) {
 }
 
 func TestProxyNoQuotaSkipsQuotaMetadata(t *testing.T) {
+	isolateDefaultDataPaths(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

@@ -15,7 +15,7 @@ func TestApplyUpstreamProviderHeaders_OpenAICodex(t *testing.T) {
 		AccountID: "acct_123",
 	}
 
-	applyUpstreamProviderHeaders(req, provider)
+	applyUpstreamProviderHeaders(req, provider, req.Header.Clone())
 
 	if got := req.Header.Get("Content-Type"); got != "application/json" {
 		t.Fatalf("expected content-type application/json, got %q", got)
@@ -49,7 +49,7 @@ func TestApplyUpstreamProviderHeaders_OriginatorOverrideAndAPIKey(t *testing.T) 
 		AuthToken: "auth-token",
 	}
 
-	applyUpstreamProviderHeaders(req, provider)
+	applyUpstreamProviderHeaders(req, provider, req.Header.Clone())
 
 	if got := req.Header.Get("Authorization"); got != "Bearer api-key" {
 		t.Fatalf("expected api key precedence, got %q", got)
@@ -66,7 +66,7 @@ func TestApplyUpstreamProviderHeaders_NonCodexProvider(t *testing.T) {
 		APIKey:  "sk-test",
 	}
 
-	applyUpstreamProviderHeaders(req, provider)
+	applyUpstreamProviderHeaders(req, provider, req.Header.Clone())
 
 	if got := req.Header.Get("Authorization"); got != "Bearer sk-test" {
 		t.Fatalf("expected auth header, got %q", got)

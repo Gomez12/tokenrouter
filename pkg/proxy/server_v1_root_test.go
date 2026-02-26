@@ -10,6 +10,7 @@ import (
 )
 
 func TestV1RootAndModelsRequireAuth(t *testing.T) {
+	isolateDefaultDataPaths(t)
 	cfg := config.NewDefaultServerConfig()
 	cfg.AllowLocalhostNoAuth = false
 	cfg.IncomingTokens = nil
@@ -34,6 +35,7 @@ func TestV1RootAndModelsRequireAuth(t *testing.T) {
 }
 
 func TestV1StatusAuthByRole(t *testing.T) {
+	isolateDefaultDataPaths(t)
 	cfg := config.NewDefaultServerConfig()
 	cfg.AllowLocalhostNoAuth = false
 	cfg.IncomingTokens = []config.IncomingAPIToken{
@@ -68,6 +70,40 @@ func TestV1StatusAuthByRole(t *testing.T) {
 			s.httpServer.Handler.ServeHTTP(w, req)
 			if w.Code != http.StatusOK {
 				t.Fatalf("expected /v1/status status 200, got %d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestV1ModelsAuthByRoleHierarchy(t *testing.T) {
+	isolateDefaultDataPaths(t)
+	cfg := config.NewDefaultServerConfig()
+	cfg.AllowLocalhostNoAuth = false
+	cfg.IncomingTokens = []config.IncomingAPIToken{
+		{ID: "adm", Name: "Admin", Key: "adm-key", Role: config.TokenRoleAdmin},
+		{ID: "km", Name: "Keymaster", Key: "km-key", Role: config.TokenRoleKeymaster},
+		{ID: "inf", Name: "Inferrer", Key: "inf-key", Role: config.TokenRoleInferrer},
+	}
+	s, err := NewServer(filepath.Join(t.TempDir(), "torod.toml"), cfg)
+	if err != nil {
+		t.Fatalf("NewServer returned error: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		key  string
+	}{
+		{name: "admin", key: "adm-key"},
+		{name: "keymaster", key: "km-key"},
+		{name: "inferrer", key: "inf-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			req.Header.Set("Authorization", "Bearer "+tc.key)
+			w := httptest.NewRecorder()
+			s.httpServer.Handler.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected /v1/models status 200, got %d body=%s", w.Code, w.Body.String())
 			}
 		})
 	}

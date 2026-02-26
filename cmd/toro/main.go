@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,11 +19,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/lkarlslund/tokenrouter/pkg/config"
 	"github.com/lkarlslund/tokenrouter/pkg/logutil"
 	"github.com/lkarlslund/tokenrouter/pkg/version"
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/spf13/cobra"
 )
@@ -105,6 +110,23 @@ func main() {
 	modelsCmd.Flags().StringVar(&modelsConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	modelsCmd.Flags().BoolVar(&modelsAsJSON, "json", false, "Output models as JSON")
 	root.AddCommand(modelsCmd)
+
+	var pingPongConfigPath string
+	var pingPongModels string
+	var pingPongIterations int
+	var pingPongStarter string
+	pingPongCmd := &cobra.Command{
+		Use:   "pingpong",
+		Short: "Run a ping-pong chat loop between two models",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPingPong(cmd, pingPongConfigPath, pingPongModels, pingPongIterations, pingPongStarter)
+		},
+	}
+	pingPongCmd.Flags().StringVar(&pingPongConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
+	pingPongCmd.Flags().StringVar(&pingPongModels, "models", "", "Model pair as model1,model2 (or one model to use the same on both sides)")
+	pingPongCmd.Flags().IntVar(&pingPongIterations, "iterations", 10, "Number of back-and-forth iterations")
+	pingPongCmd.Flags().StringVar(&pingPongStarter, "starter", "", "Starter question text (skips auto-generated question)")
+	root.AddCommand(pingPongCmd)
 
 	var opencodeConfigPath string
 	var opencodeProviderID string
@@ -196,7 +218,7 @@ func runConnectTUI(cmd *cobra.Command, path, explicitServerConfigPath string) er
 	fmt.Fprintln(out, "Enter '-' for API key to clear it.")
 
 	defaultURL := strings.TrimSpace(cfg.ServerURL)
-	if defaultURL == "" || defaultURL == config.NewDefaultClientConfig().ServerURL {
+	if shouldUseHintURL(defaultURL) {
 		if strings.TrimSpace(hints.ServerURL) != "" {
 			defaultURL = strings.TrimSpace(hints.ServerURL)
 		} else {
@@ -343,6 +365,34 @@ func connectURLFromServerConfig(httpListen string, tlsEnabled bool, tlsListen st
 		host = "[" + host + "]"
 	}
 	return scheme + "://" + host + ":" + port
+}
+
+func shouldUseHintURL(serverURL string) bool {
+	serverURL = strings.TrimSpace(serverURL)
+	if serverURL == "" {
+		return true
+	}
+	defaultURL := strings.TrimSpace(config.NewDefaultClientConfig().ServerURL)
+	if strings.EqualFold(serverURL, defaultURL) {
+		return true
+	}
+	u, err := neturl.Parse(serverURL)
+	if err != nil || strings.TrimSpace(u.Host) == "" {
+		return false
+	}
+	host, port := connectHostPort(u.Host)
+	host = strings.ToLower(strings.TrimSpace(host))
+	path := strings.TrimSpace(strings.TrimSuffix(u.Path, "/"))
+	if host != "localhost" && host != "127.0.0.1" {
+		return false
+	}
+	if port != "" && port != "8080" {
+		return false
+	}
+	if path != "" && path != "/v1" {
+		return false
+	}
+	return true
 }
 
 func connectHostPort(addr string) (string, string) {
@@ -505,6 +555,11 @@ type modelsReport struct {
 	Models    []modelsModel `json:"models"`
 }
 
+type pingPongMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 func runStatus(cmd *cobra.Command, cfgPath string, asJSON bool, periodSeconds int) error {
 	cfg, err := config.LoadClientConfig(cfgPath)
 	if err != nil {
@@ -616,6 +671,343 @@ func printModelsReportHuman(w io.Writer, report modelsReport) {
 		fmt.Fprintf(w, "  - %s\n", id)
 	}
 }
+
+func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int, starter string) error {
+	if iterations <= 0 {
+		return fmt.Errorf("iterations must be > 0")
+	}
+	cfg, err := config.LoadClientConfig(cfgPath)
+	if err != nil {
+		return fmt.Errorf("load client config (run `toro connect` first): %w", err)
+	}
+	serverBase, err := deriveServerBaseURL(cfg.ServerURL)
+	if err != nil {
+		return err
+	}
+	modelA, modelB, err := selectPingPongModels(serverBase, cfg.APIKey, modelsFlag)
+	if err != nil {
+		return err
+	}
+
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "Server: %s\n", strings.TrimSuffix(serverBase, "/")+"/v1")
+	fmt.Fprintf(out, "Models: A=%s, B=%s\n", modelA, modelB)
+	fmt.Fprintf(out, "Iterations: %d\n", iterations)
+
+	seedQuestion := compactPingPongText(starter)
+	if seedQuestion == "" {
+		seedPrompt := "Give me a short random question. Return only the question."
+		var err error
+		fmt.Fprintf(out, "Seed (%s): ", modelA)
+		seedQuestion, err = streamChatCompletion(serverBase, cfg.APIKey, modelA, []pingPongMessage{
+			{Role: "system", Content: "You produce concise, random conversation starters. Do not output reasoning. Output only the final question text."},
+			{Role: "user", Content: seedPrompt},
+		}, 0.9, 256, out, cmd.ErrOrStderr())
+		fmt.Fprintln(out)
+		if err != nil {
+			return fmt.Errorf("seed question from %s: %w", modelA, err)
+		}
+		seedQuestion = compactPingPongText(seedQuestion)
+	} else {
+		fmt.Fprintf(out, "Starter: manual\n")
+		fmt.Fprintf(out, "Seed (%s): %s\n", modelA, seedQuestion)
+	}
+	if seedQuestion == "" {
+		return fmt.Errorf("seed question from %s was empty (provider returned no final content)", modelA)
+	}
+
+	convA := []pingPongMessage{
+		{Role: "system", Content: "You are participant A in a ping-pong conversation. Reply with one or two short sentences."},
+	}
+	convB := []pingPongMessage{
+		{Role: "system", Content: "You are participant B in a ping-pong conversation. Reply with one or two short sentences."},
+	}
+
+	current := seedQuestion
+	for i := 1; i <= iterations; i++ {
+		convB = append(convB, pingPongMessage{Role: "user", Content: current})
+		fmt.Fprintf(out, "B[%d] (%s): ", i, modelB)
+		replyB, err := streamChatCompletion(serverBase, cfg.APIKey, modelB, convB, 0.7, 256, out, cmd.ErrOrStderr())
+		fmt.Fprintln(out)
+		if err != nil {
+			return fmt.Errorf("iteration %d model %s: %w", i, modelB, err)
+		}
+		replyB = compactPingPongText(replyB)
+		if replyB == "" {
+			return fmt.Errorf("iteration %d model %s returned empty content", i, modelB)
+		}
+		convB = append(convB, pingPongMessage{Role: "assistant", Content: replyB})
+		convB = trimPingPongConversation(convB, 14)
+
+		convA = append(convA, pingPongMessage{Role: "user", Content: replyB})
+		fmt.Fprintf(out, "A[%d] (%s): ", i, modelA)
+		replyA, err := streamChatCompletion(serverBase, cfg.APIKey, modelA, convA, 0.7, 256, out, cmd.ErrOrStderr())
+		fmt.Fprintln(out)
+		if err != nil {
+			return fmt.Errorf("iteration %d model %s: %w", i, modelA, err)
+		}
+		replyA = compactPingPongText(replyA)
+		if replyA == "" {
+			return fmt.Errorf("iteration %d model %s returned empty content", i, modelA)
+		}
+		convA = append(convA, pingPongMessage{Role: "assistant", Content: replyA})
+		convA = trimPingPongConversation(convA, 14)
+		current = replyA
+	}
+	return nil
+}
+
+func parsePingPongModelsFlag(raw string) (string, string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", nil
+	}
+	parts := strings.Split(raw, ",")
+	items := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		items = append(items, p)
+	}
+	if len(items) == 0 {
+		return "", "", fmt.Errorf("models flag is empty")
+	}
+	if len(items) > 2 {
+		return "", "", fmt.Errorf("models flag supports at most two models")
+	}
+	if len(items) == 1 {
+		return items[0], items[0], nil
+	}
+	return items[0], items[1], nil
+}
+
+func selectPingPongModels(serverBase, apiKey, modelsFlag string) (string, string, error) {
+	a, b, err := parsePingPongModelsFlag(modelsFlag)
+	if err != nil {
+		return "", "", err
+	}
+	if a != "" {
+		return a, b, nil
+	}
+	auto, err := discoverZeroCostModels(serverBase, apiKey)
+	if err != nil {
+		return "", "", err
+	}
+	if len(auto) == 0 {
+		return "", "", fmt.Errorf("could not auto-detect zero-cost models; set --models model1,model2")
+	}
+	if len(auto) == 1 {
+		return auto[0], auto[0], nil
+	}
+	return auto[0], auto[1], nil
+}
+
+func discoverZeroCostModels(serverBase, apiKey string) ([]string, error) {
+	models, err := fetchModels(serverBase, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	set := map[string]struct{}{}
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		id := strings.TrimSpace(m.ID)
+		if id == "" || !looksLikeFreeModel(id) {
+			continue
+		}
+		if _, exists := set[id]; exists {
+			continue
+		}
+		set[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func looksLikeFreeModel(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	if id == "" {
+		return false
+	}
+	return strings.Contains(id, ":free") || strings.Contains(id, "/free") || strings.Contains(id, "-free") || strings.Contains(id, ".free")
+}
+
+func streamChatCompletion(serverBase, apiKey, model string, messages []pingPongMessage, temperature float64, maxTokens int, tokenOut, spinnerOut io.Writer) (string, error) {
+	cfg := openai.DefaultConfig(strings.TrimSpace(apiKey))
+	cfg.BaseURL = strings.TrimSuffix(serverBase, "/") + "/v1"
+	client := openai.NewClientWithConfig(cfg)
+	stopSpinner := startWaitingSpinner(spinnerOut)
+	defer stopSpinner()
+
+	reqMessages := make([]openai.ChatCompletionMessage, 0, len(messages))
+	for _, m := range messages {
+		reqMessages = append(reqMessages, openai.ChatCompletionMessage{
+			Role:    strings.TrimSpace(m.Role),
+			Content: m.Content,
+		})
+	}
+	req := openai.ChatCompletionRequest{
+		Model:       strings.TrimSpace(model),
+		Messages:    reqMessages,
+		Stream:      true,
+		Temperature: float32(temperature),
+		// Prefer minimal reasoning so output tokens are used for final content.
+		ReasoningEffort: "low",
+	}
+	if maxTokens > 0 {
+		req.MaxCompletionTokens = maxTokens
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	stream, err := client.CreateChatCompletionStream(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	defer stream.Close()
+
+	var b strings.Builder
+	lastFinish := ""
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		if fr := strings.TrimSpace(string(chunk.Choices[0].FinishReason)); fr != "" {
+			lastFinish = fr
+		}
+		delta := chunk.Choices[0].Delta.Content
+		if delta == "" {
+			continue
+		}
+		stopSpinner()
+		b.WriteString(delta)
+		if tokenOut != nil {
+			_, _ = io.WriteString(tokenOut, delta)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if out != "" {
+		return out, nil
+	}
+
+	if lastFinish != "" {
+		return "", fmt.Errorf("chat completion returned empty content (finish_reason=%s)", lastFinish)
+	}
+	return "", fmt.Errorf("chat completion returned empty content")
+}
+
+func startWaitingSpinner(w io.Writer) func() {
+	if !isTerminalWriter(w) {
+		return func() {}
+	}
+
+	model := newWaitSpinnerModel()
+	program := tea.NewProgram(
+		model,
+		tea.WithOutput(w),
+		tea.WithInput(os.Stdin),
+		tea.WithoutSignals(),
+	)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = program.Run()
+		close(done)
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			program.Quit()
+			<-done
+			_, _ = io.WriteString(w, "\r\033[2K")
+		})
+	}
+}
+
+type waitSpinnerModel struct {
+	idx int
+}
+
+func newWaitSpinnerModel() waitSpinnerModel {
+	return waitSpinnerModel{}
+}
+
+func (m waitSpinnerModel) Init() tea.Cmd {
+	return tickSpinner()
+}
+
+type spinnerTickMsg struct{}
+
+func tickSpinner() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
+}
+
+func (m waitSpinnerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg.(type) {
+	case spinnerTickMsg:
+		m.idx = (m.idx + 1) % 4
+		return m, tickSpinner()
+	default:
+		return m, nil
+	}
+}
+
+func (m waitSpinnerModel) View() tea.View {
+	frames := []string{"|", "/", "-", `\`}
+	return tea.NewView("\r" + frames[m.idx] + " waiting...")
+}
+
+func isTerminalWriter(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
+}
+
+func trimPingPongConversation(messages []pingPongMessage, maxTail int) []pingPongMessage {
+	if maxTail <= 0 || len(messages) == 0 {
+		return messages
+	}
+	start := 0
+	head := []pingPongMessage{}
+	if messages[0].Role == "system" {
+		head = append(head, messages[0])
+		start = 1
+	}
+	if len(messages)-start <= maxTail {
+		return messages
+	}
+	tail := messages[len(messages)-maxTail:]
+	out := make([]pingPongMessage, 0, len(head)+len(tail))
+	out = append(out, head...)
+	out = append(out, tail...)
+	return out
+}
+
+func compactPingPongText(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.Join(strings.Fields(s), " ")
+}
+
 
 func checkServerHealth(serverBase string) statusHealth {
 	u := strings.TrimSuffix(serverBase, "/") + "/healthz"

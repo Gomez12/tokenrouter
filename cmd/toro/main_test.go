@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lkarlslund/tokenrouter/pkg/config"
@@ -32,6 +36,30 @@ func TestIsValidEnvVarName(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isValidEnvVarName(tc.in); got != tc.ok {
 				t.Fatalf("isValidEnvVarName(%q) = %v, want %v", tc.in, got, tc.ok)
+			}
+		})
+	}
+}
+
+func TestShouldUseHintURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{name: "empty", in: "", want: true},
+		{name: "default with v1", in: "http://127.0.0.1:8080/v1", want: true},
+		{name: "localhost no path", in: "http://localhost:8080", want: true},
+		{name: "loopback no v1 path", in: "http://127.0.0.1:8080", want: true},
+		{name: "non-default localhost port", in: "http://127.0.0.1:7050", want: false},
+		{name: "remote host", in: "https://api.example.com", want: false},
+		{name: "custom path", in: "http://127.0.0.1:8080/custom", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldUseHintURL(tc.in)
+			if got != tc.want {
+				t.Fatalf("shouldUseHintURL(%q)=%v want %v", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -111,5 +139,222 @@ func TestRunModelsJSON(t *testing.T) {
 	}
 	if len(report.Models) != 2 || report.Models[0].ID != "p/a" || report.Models[1].ID != "p/b" {
 		t.Fatalf("unexpected models: %+v", report.Models)
+	}
+}
+
+func TestParsePingPongModelsFlag(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		a       string
+		b       string
+		wantErr bool
+	}{
+		{name: "empty", in: "", a: "", b: ""},
+		{name: "one model", in: "provider/model", a: "provider/model", b: "provider/model"},
+		{name: "two models", in: "a/m1,b/m2", a: "a/m1", b: "b/m2"},
+		{name: "with spaces", in: " a/m1 , b/m2 ", a: "a/m1", b: "b/m2"},
+		{name: "too many", in: "a,b,c", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b, err := parsePingPongModelsFlag(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", tc.in, err)
+			}
+			if a != tc.a || b != tc.b {
+				t.Fatalf("parsePingPongModelsFlag(%q) => %q,%q want %q,%q", tc.in, a, b, tc.a, tc.b)
+			}
+		})
+	}
+}
+
+func TestDiscoverZeroCostModelsFromV1Models(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"p/alpha:free"},{"id":"p/beta"},{"id":"q/gamma-free"}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	models, err := discoverZeroCostModels(srv.URL, "")
+	if err != nil {
+		t.Fatalf("discoverZeroCostModels: %v", err)
+	}
+	if len(models) != 2 || models[0] != "p/alpha:free" || models[1] != "q/gamma-free" {
+		t.Fatalf("unexpected models: %v", models)
+	}
+}
+
+func TestRunPingPongWithProvidedModels(t *testing.T) {
+	var mu sync.Mutex
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+			case "/v1/chat/completions":
+				var req struct {
+					Model    string `json:"model"`
+					Stream   bool   `json:"stream"`
+					Messages []struct {
+						Role    string `json:"role"`
+						Content string `json:"content"`
+					} `json:"messages"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatalf("decode request: %v", err)
+				}
+				if !req.Stream {
+					t.Fatal("expected stream=true request")
+				}
+				content := ""
+				if len(req.Messages) >= 2 && strings.Contains(strings.ToLower(req.Messages[len(req.Messages)-1].Content), "short random question") {
+					content = "What is your favorite season?"
+			} else {
+				mu.Lock()
+				callCount++
+					n := callCount
+					mu.Unlock()
+					content = req.Model + " reply " + strconv.Itoa(n)
+				}
+				writeChatStreamChunk(w, content)
+			default:
+				http.NotFound(w, r)
+			}
+	}))
+	defer srv.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "toro.toml")
+	if err := config.Save(cfgPath, &config.ClientConfig{
+		ServerURL: strings.TrimRight(srv.URL, "/") + "/v1",
+		APIKey:    "test-key",
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	if err := runPingPong(cmd, cfgPath, "provider-a/m1,provider-b/m2", 2, ""); err != nil {
+		t.Fatalf("runPingPong: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Seed (provider-a/m1): What is your favorite season?") {
+		t.Fatalf("missing seed output:\n%s", got)
+	}
+	if !strings.Contains(got, "B[2] (provider-b/m2):") || !strings.Contains(got, "A[2] (provider-a/m1):") {
+		t.Fatalf("missing iteration output:\n%s", got)
+	}
+}
+
+func TestRunPingPongWithManualStarter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if !req.Stream {
+			t.Fatal("expected stream=true request")
+		}
+		writeChatStreamChunk(w, req.Model+" ok")
+	}))
+	defer srv.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "toro.toml")
+	if err := config.Save(cfgPath, &config.ClientConfig{
+		ServerURL: strings.TrimRight(srv.URL, "/"),
+		APIKey:    "test-key",
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	if err := runPingPong(cmd, cfgPath, "a/m,b/m", 1, "What is one tiny win today?"); err != nil {
+		t.Fatalf("runPingPong: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Starter: manual") {
+		t.Fatalf("missing manual starter marker:\n%s", got)
+	}
+	if !strings.Contains(got, "Seed (a/m): What is one tiny win today?") {
+		t.Fatalf("missing seed output:\n%s", got)
+	}
+}
+
+func writeChatStreamChunk(w http.ResponseWriter, content string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, _ := w.(http.Flusher)
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{
+		"id":     "chatcmpl-test",
+		"object": "chat.completion.chunk",
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"delta": map[string]any{
+					"content": content,
+				},
+			},
+		},
+	}))
+	if flusher != nil {
+		flusher.Flush()
+	}
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func TestStreamChatCompletionErrorsWhenStreamIsEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if !req.Stream {
+			t.Fatal("expected stream request")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	var out bytes.Buffer
+	got, err := streamChatCompletion(srv.URL, "k", "p/m", []pingPongMessage{{Role: "user", Content: "hi"}}, 0.7, 32, &out, nil)
+	if err == nil {
+		t.Fatalf("expected error, got content %q", got)
+	}
+	if !strings.Contains(err.Error(), "empty content") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

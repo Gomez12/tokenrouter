@@ -11,11 +11,19 @@ function adminApp() {
     conversationsSaveInProgress: false,
     showConversationsSettingsModal: false,
     showConversationDetailModal: false,
+    showConversationRawModal: false,
     showLogSettingsModal: false,
     conversationsSearch: '',
     conversationsListHtml: '',
     conversationsPagerHtml: '',
     conversationDetailHtml: '<div class="small text-body-secondary">Select a conversation to inspect chat flow.</div>',
+    conversationRawHtml: '<div class="small text-body-secondary">Select a conversation message to inspect raw payloads.</div>',
+    conversationTitle: '',
+    conversationDetailMessageCount: 0,
+    conversationThinkVisible: {},
+    conversationSystemVisible: {},
+    conversationIncludeInternal: false,
+    conversationsCaptureEnabled: true,
     conversationsDebounceTimer: null,
     logEntries: [],
     logEntriesHtml: '',
@@ -109,6 +117,7 @@ function adminApp() {
     userActivityTrackingInstalled: false,
     pendingReloadTimer: null,
     pendingReloadKind: '',
+    realtimePausedForReload: false,
     runtimePatchInProgress: false,
     runtimeScriptFingerprints: null,
     wsFailureCount: 0,
@@ -273,6 +282,12 @@ function adminApp() {
     },
     requestUIReload(kind) {
       const reloadKind = String(kind || 'default').trim() || 'default';
+      if (reloadKind === 'runtime_update') {
+        this.realtimePausedForReload = true;
+        if (typeof this.stopRealtimeUpdates === 'function') {
+          try { this.stopRealtimeUpdates(); } catch (_) {}
+        }
+      }
       if (this.pendingReloadKind !== 'runtime_update' || reloadKind === 'runtime_update') {
         this.pendingReloadKind = reloadKind;
       }
@@ -3167,6 +3182,11 @@ function adminApp() {
     },
     closeConversationDetailModal() {
       this.showConversationDetailModal = false;
+      this.showConversationRawModal = false;
+      this.conversationDetailMessageCount = 0;
+    },
+    closeConversationRawModal() {
+      this.showConversationRawModal = false;
     },
     async loadConversationsSettings() {
       const r = await this.apiFetch('/admin/api/settings/conversations', {headers:this.headers()});
@@ -3238,12 +3258,7 @@ function adminApp() {
       }
       const body = await r.json().catch(() => ({}));
       this.conversationThreads = Array.isArray(body.threads) ? body.threads : [];
-      if (!body.enabled) {
-        this.conversationsListHtml = '<div class=\"small text-warning\">Conversation capture is disabled in settings.</div>';
-        this.conversationsPagerHtml = '';
-        this.conversationDetailHtml = '<div class=\"small text-body-secondary\">Enable conversation capture in settings to start recording.</div>';
-        return;
-      }
+      this.conversationsCaptureEnabled = !!body.enabled;
       this.conversationsPage = 1;
       if (resetSelection) {
         this.selectedConversationKey = '';
@@ -3258,21 +3273,55 @@ function adminApp() {
         this.conversationRecords = [];
         this.conversationDetailHtml = this.conversationThreads.length
           ? '<div class="small text-body-secondary">Select a conversation above to inspect details.</div>'
-          : '<div class="small text-body-secondary">No conversations found for current filters.</div>';
+          : '<div class="small text-body-secondary">No conversation data.</div>';
       }
     },
     async loadConversationDetail(conversationKey) {
       const key = String(conversationKey || '').trim();
       if (!key) return;
-      const r = await this.apiFetch('/admin/api/conversations/' + encodeURIComponent(key), {headers:this.headers()});
+      const params = new URLSearchParams();
+      if (this.conversationIncludeInternal) params.set('include_internal', '1');
+      const url = '/admin/api/conversations/' + encodeURIComponent(key) + (params.toString() ? ('?' + params.toString()) : '');
+      const r = await this.apiFetch(url, {headers:this.headers()});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) return;
       const body = await r.json().catch(() => ({}));
       this.selectedConversationKey = key;
+      this.conversationTitle = String(body.title || '').trim();
       this.conversationRecords = Array.isArray(body.records) ? body.records : [];
+      this.conversationThinkVisible = {};
+      this.conversationSystemVisible = {};
+      this.showConversationRawModal = false;
       this.renderConversationsList();
       this.renderConversationDetail();
       this.showConversationDetailModal = true;
+    },
+    conversationModalTitle() {
+      const title = String(this.conversationTitle || '').trim();
+      const count = Math.max(0, Number(this.conversationDetailMessageCount || 0));
+      if (!title) return 'Conversation';
+      return title + ' - ' + String(count) + ' messages';
+    },
+    async toggleConversationIncludeInternal() {
+      this.conversationIncludeInternal = !this.conversationIncludeInternal;
+      const key = String(this.selectedConversationKey || '').trim();
+      if (!key) {
+        this.renderConversationDetail();
+        return;
+      }
+      await this.loadConversationDetail(key);
+    },
+    toggleConversationThink(recordIndex) {
+      const idx = Math.max(0, Math.floor(Number(recordIndex || 0)));
+      const cur = !!(this.conversationThinkVisible && this.conversationThinkVisible[idx]);
+      this.conversationThinkVisible = Object.assign({}, this.conversationThinkVisible || {}, {[idx]: !cur});
+      this.renderConversationDetail();
+    },
+    toggleConversationSystem(recordIndex) {
+      const idx = Math.max(0, Math.floor(Number(recordIndex || 0)));
+      const cur = !!(this.conversationSystemVisible && this.conversationSystemVisible[idx]);
+      this.conversationSystemVisible = Object.assign({}, this.conversationSystemVisible || {}, {[idx]: !cur});
+      this.renderConversationDetail();
     },
     async removeConversation(conversationKey) {
       const key = String(conversationKey || '').trim();
@@ -3294,6 +3343,8 @@ function adminApp() {
       this.toastSuccess('Conversation deleted.');
       if (this.selectedConversationKey === key) {
         this.selectedConversationKey = '';
+        this.conversationTitle = '';
+        this.conversationDetailMessageCount = 0;
         this.conversationRecords = [];
         this.showConversationDetailModal = false;
         this.conversationDetailHtml = '<div class=\"small text-body-secondary\">Select a conversation to inspect chat flow.</div>';
@@ -3317,6 +3368,8 @@ function adminApp() {
       }
       this.conversationThreads = [];
       this.conversationRecords = [];
+      this.conversationTitle = '';
+      this.conversationDetailMessageCount = 0;
       this.selectedConversationKey = '';
       this.showConversationDetailModal = false;
       this.conversationsListHtml = '<div class=\"small text-body-secondary\">No conversations yet.</div>';
@@ -3329,31 +3382,40 @@ function adminApp() {
       const allRows = (this.conversationThreads || []).map((t) => {
         const key = String(t.conversation_key || '').trim();
         const selected = key && key === this.selectedConversationKey;
-        const cls = selected ? 'border-primary bg-primary-subtle' : 'border-secondary-subtle';
-        const provider = this.escapeHtml(this.conversationProviderDisplayName(t.provider || ''));
+        const rowClass = selected ? 'table-primary' : '';
         const model = this.escapeHtml(this.conversationModelDisplayName(t.provider || '', t.model || ''));
         const keyName = this.escapeHtml(t.api_key_name || '-');
         const remote = this.escapeHtml(t.remote_ip || '-');
         const updated = this.escapeHtml(this.formatRelativeAge(t.last_at || ''));
-        const preview = this.escapeHtml(t.last_preview || '');
         const count = Math.max(0, Number(t.count || 0));
+        const tokenCount = Math.max(0, Number(t.token_count || 0));
+        const title = this.escapeHtml(String(t.title || '').trim());
         return '' +
-          '<div class=\"border rounded p-2 mb-2 ' + cls + '\">' +
-            '<div class=\"d-flex align-items-start justify-content-between gap-2\">' +
-              '<button type=\"button\" class=\"btn btn-sm text-start p-0 border-0 bg-transparent flex-grow-1\" data-conversation-key=\"' + this.escapeHtml(key) + '\" onclick=\"window.__adminOpenConversation(this.getAttribute(\'data-conversation-key\'))\">' +
-                '<div class=\"fw-semibold small\">' + provider + ' - ' + model + ' - ' + keyName + ' - ' + remote + ' - ' + updated + ' - ' + count + ' msgs</div>' +
-                '<div class=\"small text-body-secondary text-break\">' + preview + '</div>' +
-              '</button>' +
+          '<tr class="' + rowClass + '">' +
+            '<td>' +
+              '<button type="button" class="btn btn-sm text-start p-0 border-0 bg-transparent w-100" data-conversation-key="' + this.escapeHtml(key) + '" onclick="window.__adminOpenConversation(this.getAttribute(\'data-conversation-key\'))">' + keyName + '</button>' +
+            '</td>' +
+            '<td>' + model + '</td>' +
+            '<td class="text-nowrap">' + updated + '</td>' +
+            '<td class="text-nowrap">' + remote + '</td>' +
+            '<td class="text-end text-nowrap">' + count + '</td>' +
+            '<td class="text-end text-nowrap">' + tokenCount + '</td>' +
+            '<td>' + title + '</td>' +
+            '<td class="text-end">' +
               '<button class=\"icon-btn icon-btn-danger\" type=\"button\" title=\"Delete conversation\" aria-label=\"Delete conversation\" data-conversation-key=\"' + this.escapeHtml(key) + '\" onclick=\"window.__adminDeleteConversation(this.getAttribute(\'data-conversation-key\'))\">' +
                 '<svg xmlns=\"http://www.w3.org/2000/svg\" fill=\"currentColor\" viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z\"/><path d=\"M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z\"/></svg>' +
               '</button>' +
-            '</div>' +
-          '</div>';
+            '</td>' +
+          '</tr>';
       });
       const page = this.paginateRows(allRows, this.conversationsPage, this.conversationsPageSize);
       this.conversationsPage = page.page;
       this.conversationsPageSize = page.pageSize;
-      this.conversationsListHtml = page.rows.join('') || '<div class=\"small text-body-secondary\">No conversations yet.</div>';
+      this.conversationsListHtml =
+        '<table class="table table-sm align-middle mb-0">' +
+          '<thead><tr><th>Key</th><th>Model</th><th>Timestamp</th><th>Remote IP</th><th class="text-end">Messages</th><th class="text-end">Tokens</th><th>Title</th><th class="text-end"></th></tr></thead>' +
+          '<tbody>' + (page.rows.join('') || '<tr><td colspan="8" class="text-body-secondary">No conversation data.</td></tr>') + '</tbody>' +
+        '</table>';
       this.conversationsPagerHtml = this.renderPager(page.totalRows, page.page, page.totalPages, page.pageSize, 'Conversations');
       window.__adminOpenConversation = (key) => this.loadConversationDetail(key);
       window.__adminDeleteConversation = (key) => this.removeConversation(key);
@@ -3361,53 +3423,101 @@ function adminApp() {
     renderConversationDetail() {
       const records = this.conversationRecords || [];
       if (!records.length) {
+        this.conversationDetailMessageCount = 0;
         this.conversationDetailHtml = '<div class=\"small text-body-secondary\">No messages captured for this conversation.</div>';
         return;
       }
       const rows = [];
-      let prevSentRaw = '';
-      let prevRecvRaw = '';
-      records.forEach((rec) => {
+      records.forEach((rec, idx) => {
         const ts = this.escapeHtml(this.formatRelativeAge(rec.created_at || ''));
         const tsTitle = this.escapeHtml(this.formatTimestamp(rec.created_at || ''));
         const status = this.escapeHtml(String(rec.status_code || ''));
         const latency = this.escapeHtml(String(rec.latency_ms || 0) + 'ms');
         const rawSent = String(rec.request_text_markdown || '');
         const rawRecv = String(rec.response_text_markdown || '');
-        const apiSentDelta = String(rec.request_delta_markdown || '');
-        const apiRecvDelta = String(rec.response_delta_markdown || '');
-        const sentCollapsed = this.collapseRepeatedConversationText(rawSent, prevSentRaw);
-        const recvCollapsed = this.collapseRepeatedConversationText(rawRecv, prevRecvRaw);
-        prevSentRaw = rawSent;
-        prevRecvRaw = rawRecv;
-        const sentText = apiSentDelta || sentCollapsed;
-        const recvText = apiRecvDelta || recvCollapsed;
+        const systemText = String(rec.request_system_markdown || '').trim();
+        const systemVisible = !!(this.conversationSystemVisible && this.conversationSystemVisible[idx]);
+        const systemTokens = systemText ? Math.max(1, Math.ceil(systemText.length / 4)) : 0;
+        const systemButton = systemText
+          ? '<button class=\"btn btn-sm btn-outline-secondary py-0 px-2\" type=\"button\" data-record-index=\"' + String(idx) + '\" onclick=\"window.__adminToggleConversationSystem(this.dataset.recordIndex)\">System (' + String(systemTokens) + ' tok)</button>'
+          : '';
+        const systemBlock = (systemText && systemVisible)
+          ? '<div class=\"mb-2 border rounded p-2 bg-body-tertiary\"><div class=\"small text-body-secondary mb-1\">System Prompt</div><div class=\"small\">' + this.renderMarkdown(systemText) + '</div></div>'
+          : '';
+        const sentText = String(rec.request_render_markdown || rec.request_delta_markdown || rawSent || '').trim();
+        const recvText = String(rec.response_render_markdown || rec.response_delta_markdown || rawRecv || '').trim();
         if (!sentText && !recvText) return;
         const sent = this.renderMarkdown(sentText);
         const recv = this.renderMarkdown(recvText);
-        const reqHeaders = this.escapeHtml(JSON.stringify(rec.request_headers || {}, null, 2));
-        const respHeaders = this.escapeHtml(JSON.stringify(rec.response_headers || {}, null, 2));
+        const internalBadge = rec.is_internal
+          ? '<span class=\"badge text-bg-warning\">Internal' + (rec.internal_kind ? (': ' + this.escapeHtml(String(rec.internal_kind))) : '') + '</span>'
+          : '';
+        const thinkText = String(rec.response_think_markdown || '').trim();
+        const thinkVisible = !!(this.conversationThinkVisible && this.conversationThinkVisible[idx]);
+        const thinkTokens = thinkText ? Math.max(1, Math.ceil(thinkText.length / 4)) : 0;
+        const thinkBtnClass = thinkVisible ? 'btn-primary' : 'btn-outline-secondary';
+        const thinkButton = thinkText
+          ? '<button class=\"btn btn-sm ' + thinkBtnClass + ' py-0 px-2\" type=\"button\" data-record-index=\"' + String(idx) + '\" onclick=\"window.__adminToggleConversationThink(this.dataset.recordIndex)\">Think (' + String(thinkTokens) + ' tok)</button>'
+          : '';
+        const recvMetaRow = '<div class=\"mb-2 d-flex flex-wrap gap-2 align-items-center\"><span class=\"badge text-bg-secondary\">status ' + status + '</span><span class=\"badge text-bg-light border\">' + latency + '</span>' + thinkButton + '</div>';
+        const thinkBlock = (thinkText && thinkVisible)
+          ? '<div class=\"mt-2 border rounded p-2 bg-body-tertiary\"><div class=\"small text-body-secondary mb-1\">Reasoning</div><div class=\"small\">' + this.renderMarkdown(thinkText) + '</div></div>'
+          : '';
         rows.push('' +
-          '<div class=\"text-center small text-body-secondary mb-2\" title=\"' + tsTitle + '\">· ' + ts + ' ·</div>' +
+          '<div class=\"d-flex justify-content-center align-items-center gap-2 small text-body-secondary mb-2\" title=\"' + tsTitle + '\">· ' + ts + ' ·<button class=\"btn btn-sm btn-outline-secondary py-0 px-2\" type=\"button\" data-record-index=\"' + String(idx) + '\" onclick=\"window.__adminOpenConversationRaw(this.dataset.recordIndex)\">Raw</button>' + systemButton + internalBadge + '</div>' +
+          systemBlock +
           '<div class=\"d-flex justify-content-end mb-2\">' +
             '<div class=\"rounded-3 p-2 border bg-primary-subtle\" style=\"max-width:78%;\">' +
-              '<div class=\"small\">' + sent + '</div>' +
-              '<div class=\"mt-2\"><details><summary class=\"btn btn-sm btn-outline-secondary py-0 px-2\">Headers</summary><pre class=\"small mt-1 mb-0\"><code>' + reqHeaders + '</code></pre></details></div>' +
+              '<div class=\"small conversation-markdown\">' + sent + '</div>' +
             '</div>' +
           '</div>' +
           '<div class=\"d-flex justify-content-start mb-3\">' +
-            '<div class=\"rounded-3 p-2 border bg-body\" style=\"max-width:78%;\">' +
-              '<div class=\"small\">' + recv + '</div>' +
-              '<div class=\"mt-2 d-flex flex-wrap gap-2 align-items-center\"><span class=\"badge text-bg-secondary\">status ' + status + '</span><span class=\"badge text-bg-light border\">' + latency + '</span><details><summary class=\"btn btn-sm btn-outline-secondary py-0 px-2\">Headers</summary><pre class=\"small mt-1 mb-0\"><code>' + respHeaders + '</code></pre></details></div>' +
+            '<div class=\"rounded-3 p-2 border bg-body-tertiary\" style=\"max-width:78%;\">' +
+              recvMetaRow +
+              (thinkBlock ? ('<div class=\"conversation-markdown\">' + thinkBlock + '</div>') : '') +
+              '<div class=\"small conversation-markdown\">' + recv + '</div>' +
             '</div>' +
-	          '</div>');
+		          '</div>');
 	      });
       if (!rows.length) {
+        this.conversationDetailMessageCount = 0;
         this.conversationDetailHtml = '<div class=\"small text-body-secondary\">No new messages to display after deduplication.</div>';
         return;
       }
-      const head = '<div class=\"d-flex align-items-center justify-content-between mb-3\"><div class=\"small text-body-secondary\">Messages: <strong>' + rows.length + '</strong></div></div>';
-      this.conversationDetailHtml = head + rows.join('');
+      this.conversationDetailMessageCount = rows.length;
+      this.conversationDetailHtml = rows.join('');
+      window.__adminOpenConversationRaw = (recordIndex) => this.openConversationRawModal(recordIndex);
+      window.__adminToggleConversationThink = (recordIndex) => this.toggleConversationThink(recordIndex);
+      window.__adminToggleConversationSystem = (recordIndex) => this.toggleConversationSystem(recordIndex);
+    },
+    openConversationRawModal(recordIndex) {
+      const idx = Math.max(0, Math.floor(Number(recordIndex || 0)));
+      const rec = (this.conversationRecords || [])[idx];
+      if (!rec) return;
+      const title = this.escapeHtml(this.formatTimestamp(rec.created_at || ''));
+      const reqHeaders = this.escapeHtml(String(rec.request_headers_raw || '').trim());
+      const reqBody = this.escapeHtml(String(rec.request_payload_raw || '').trim());
+      const respHeaders = this.escapeHtml(String(rec.response_headers_raw || '').trim());
+      const respBody = this.escapeHtml(String(rec.response_payload_raw || '').trim());
+      this.conversationRawHtml = '' +
+        '<div class="small text-body-secondary mb-3">Message timestamp: ' + title + '</div>' +
+        '<div class="mb-3">' +
+          '<div class="fw-semibold mb-1">Outgoing Headers</div>' +
+          '<pre class="small border rounded p-2 bg-body-tertiary mb-0" style="max-height:28vh; overflow:auto;"><code>' + reqHeaders + '</code></pre>' +
+        '</div>' +
+        '<div class="mb-3">' +
+          '<div class="fw-semibold mb-1">Outgoing Body</div>' +
+          '<pre class="small border rounded p-2 bg-body-tertiary mb-0" style="max-height:28vh; overflow:auto;"><code>' + reqBody + '</code></pre>' +
+        '</div>' +
+        '<div class="mb-3">' +
+          '<div class="fw-semibold mb-1">Incoming Headers</div>' +
+          '<pre class="small border rounded p-2 bg-body-tertiary mb-0" style="max-height:28vh; overflow:auto;"><code>' + respHeaders + '</code></pre>' +
+        '</div>' +
+        '<div>' +
+          '<div class="fw-semibold mb-1">Incoming Body</div>' +
+          '<pre class="small border rounded p-2 bg-body-tertiary mb-0" style="max-height:28vh; overflow:auto;"><code>' + respBody + '</code></pre>' +
+        '</div>';
+      this.showConversationRawModal = true;
     },
     collapseRepeatedConversationText(currentText, previousText) {
       const cur = String(currentText || '').replaceAll('\r\n', '\n');

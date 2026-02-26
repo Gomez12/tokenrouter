@@ -46,34 +46,36 @@ const adminSessionCookie = "opp_admin_session"
 const adminInstanceHeader = "X-OPP-Instance-ID"
 
 type AdminHandler struct {
-	store                 *config.ServerConfigStore
-	stats                 *StatsStore
-	resolver              *ProviderResolver
-	pricing               *pricing.Manager
-	conversations         *conversations.Store
-	logs                  *logstore.Store
-	healthChecker         *ProviderHealthChecker
-	instance              string
-	oauthMu               sync.Mutex
-	oauthPending          map[string]*oauthSession
-	oauthSrvMu            sync.Mutex
-	oauthSrv              *http.Server
-	oauthSrvAddr          string
-	quotaMu               sync.Mutex
-	quotaCache            *cache.TTLMap[string, quotaCacheValue]
-	quotaCachePath        string
-	quotaPersistMu        sync.Mutex
-	quotaPersistPending   bool
-	statsCache            *cache.TTLMap[int64, StatsSummary]
-	wsMu                  sync.Mutex
-	wsClients             map[*adminWSClient]struct{}
-	statsNotifyAt         time.Time
-	networkMu             sync.Mutex
-	networkSwitch         map[string]pendingNetworkSwitch
-	addListener           func(string) error
-	removeListener        func(string) error
-	listListeners         func() []string
-	runAccessTokenCleanup func()
+	store                   *config.ServerConfigStore
+	stats                   *StatsStore
+	resolver                *ProviderResolver
+	pricing                 *pricing.Manager
+	conversations           *conversations.Store
+	logs                    *logstore.Store
+	healthChecker           *ProviderHealthChecker
+	instance                string
+	oauthMu                 sync.Mutex
+	oauthPending            map[string]*oauthSession
+	oauthSrvMu              sync.Mutex
+	oauthSrv                *http.Server
+	oauthSrvAddr            string
+	quotaMu                 sync.Mutex
+	quotaCache              *cache.TTLMap[string, quotaCacheValue]
+	quotaCachePath          string
+	quotaPersistMu          sync.Mutex
+	quotaPersistPending     bool
+	statsCache              *cache.TTLMap[int64, StatsSummary]
+	wsMu                    sync.Mutex
+	wsClients               map[*adminWSClient]struct{}
+	statsNotifyAt           time.Time
+	networkMu               sync.Mutex
+	networkSwitch           map[string]pendingNetworkSwitch
+	addListener             func(string) error
+	removeListener          func(string) error
+	listListeners           func() []string
+	runAccessTokenCleanup   func()
+	conversationViewCacheMu sync.Mutex
+	conversationViewCache   map[string]conversationViewCacheEntry
 }
 
 type adminWSClient struct {
@@ -89,6 +91,12 @@ type pendingNetworkSwitch struct {
 	NewAddr  string
 	HTTPMode string
 	Created  time.Time
+}
+
+type conversationViewCacheEntry struct {
+	Title     string
+	Views     []conversationRecordView
+	ExpiresAt time.Time
 }
 
 type adminAuthContextKey struct{}
@@ -123,6 +131,7 @@ const statsRefreshInterval = 15 * time.Minute
 const adminWSCheckInterval = 1 * time.Second
 const adminWSRealtimeIdleRefresh = 5 * time.Minute
 const quotaPersistDebounce = 250 * time.Millisecond
+const conversationViewCacheTTL = 5 * time.Second
 
 type modelListResponse struct {
 	Data []struct {
@@ -130,13 +139,7 @@ type modelListResponse struct {
 	} `json:"data"`
 }
 
-type conversationRecordView struct {
-	conversations.Record
-	RequestDeltaMarkdown     string `json:"request_delta_markdown,omitempty"`
-	ResponseDeltaMarkdown    string `json:"response_delta_markdown,omitempty"`
-	RequestPreviousMarkdown  string `json:"request_previous_markdown,omitempty"`
-	ResponsePreviousMarkdown string `json:"response_previous_markdown,omitempty"`
-}
+type conversationRecordView = conversations.ConversationRecordView
 
 type persistedQuotaCacheFile struct {
 	SavedAt string                              `json:"saved_at,omitempty"`
@@ -151,19 +154,20 @@ type persistedQuotaCacheEntry struct {
 func NewAdminHandler(store *config.ServerConfigStore, stats *StatsStore, resolver *ProviderResolver, pricingMgr *pricing.Manager, healthChecker *ProviderHealthChecker, instanceID string) *AdminHandler {
 	quotaCachePath := quotaCachePathForStore(store)
 	h := &AdminHandler{
-		store:          store,
-		stats:          stats,
-		resolver:       resolver,
-		pricing:        pricingMgr,
-		healthChecker:  healthChecker,
-		instance:       instanceID,
-		oauthPending:   map[string]*oauthSession{},
-		oauthSrvAddr:   "127.0.0.1:1455",
-		quotaCache:     cache.NewTTLMap[string, quotaCacheValue](),
-		quotaCachePath: quotaCachePath,
-		statsCache:     cache.NewTTLMap[int64, StatsSummary](),
-		wsClients:      map[*adminWSClient]struct{}{},
-		networkSwitch:  map[string]pendingNetworkSwitch{},
+		store:                 store,
+		stats:                 stats,
+		resolver:              resolver,
+		pricing:               pricingMgr,
+		healthChecker:         healthChecker,
+		instance:              instanceID,
+		oauthPending:          map[string]*oauthSession{},
+		oauthSrvAddr:          "127.0.0.1:1455",
+		quotaCache:            cache.NewTTLMap[string, quotaCacheValue](),
+		quotaCachePath:        quotaCachePath,
+		statsCache:            cache.NewTTLMap[int64, StatsSummary](),
+		wsClients:             map[*adminWSClient]struct{}{},
+		networkSwitch:         map[string]pendingNetworkSwitch{},
+		conversationViewCache: map[string]conversationViewCacheEntry{},
 	}
 	h.loadQuotaCacheFromDisk()
 	go h.runWSScheduler()
@@ -308,6 +312,7 @@ func (h *AdminHandler) RecordConversation(in conversations.CaptureInput) bool {
 		return false
 	}
 	log.Info("conversation captured", "conversation_key", rec.ConversationKey, "endpoint", strings.TrimSpace(rec.Endpoint), "provider", strings.TrimSpace(rec.Provider), "model", strings.TrimSpace(rec.Model), "status", rec.StatusCode, "latency_ms", rec.LatencyMS)
+	h.invalidateConversationViewCacheForKey(rec.ConversationKey)
 	h.broadcastAdminEvent(map[string]any{
 		"type":             "conversation_append",
 		"conversation_key": rec.ConversationKey,
@@ -315,6 +320,72 @@ func (h *AdminHandler) RecordConversation(in conversations.CaptureInput) bool {
 		"updated_at":       rec.UpdatedAt.Format(time.RFC3339Nano),
 	})
 	return true
+}
+
+func (h *AdminHandler) conversationViewCacheKey(id string, includeInternal bool) string {
+	return id + "|" + strconv.FormatBool(includeInternal)
+}
+
+func cloneConversationViews(in []conversationRecordView) []conversationRecordView {
+	if len(in) == 0 {
+		return []conversationRecordView{}
+	}
+	out := make([]conversationRecordView, len(in))
+	copy(out, in)
+	return out
+}
+
+func (h *AdminHandler) getConversationViewCache(id string, includeInternal bool) (string, []conversationRecordView, bool) {
+	if h == nil {
+		return "", nil, false
+	}
+	key := h.conversationViewCacheKey(id, includeInternal)
+	now := time.Now().UTC()
+	h.conversationViewCacheMu.Lock()
+	defer h.conversationViewCacheMu.Unlock()
+	entry, ok := h.conversationViewCache[key]
+	if !ok {
+		return "", nil, false
+	}
+	if now.After(entry.ExpiresAt) {
+		delete(h.conversationViewCache, key)
+		return "", nil, false
+	}
+	return entry.Title, cloneConversationViews(entry.Views), true
+}
+
+func (h *AdminHandler) setConversationViewCache(id string, includeInternal bool, title string, views []conversationRecordView) {
+	if h == nil {
+		return
+	}
+	key := h.conversationViewCacheKey(id, includeInternal)
+	h.conversationViewCacheMu.Lock()
+	h.conversationViewCache[key] = conversationViewCacheEntry{
+		Title:     strings.TrimSpace(title),
+		Views:     cloneConversationViews(views),
+		ExpiresAt: time.Now().UTC().Add(conversationViewCacheTTL),
+	}
+	h.conversationViewCacheMu.Unlock()
+}
+
+func (h *AdminHandler) invalidateConversationViewCacheForKey(id string) {
+	if h == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	id = strings.TrimSpace(id)
+	h.conversationViewCacheMu.Lock()
+	delete(h.conversationViewCache, h.conversationViewCacheKey(id, false))
+	delete(h.conversationViewCache, h.conversationViewCacheKey(id, true))
+	h.conversationViewCacheMu.Unlock()
+}
+
+func (h *AdminHandler) invalidateConversationViewCacheAll() {
+	if h == nil {
+		return
+	}
+	h.conversationViewCacheMu.Lock()
+	h.conversationViewCache = map[string]conversationViewCacheEntry{}
+	h.conversationViewCacheMu.Unlock()
 }
 
 func (h *AdminHandler) registerWSClient(c *adminWSClient) {
@@ -658,7 +729,14 @@ func (h *AdminHandler) requireTokenRole(allowedRoles ...string) func(http.Handle
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-			if _, allowedRole := allowed[identity.Role]; !allowedRole {
+			allowedByHierarchy := false
+			for required := range allowed {
+				if config.RoleAtLeast(identity.Role, required) {
+					allowedByHierarchy = true
+					break
+				}
+			}
+			if !allowedByHierarchy {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
@@ -3920,6 +3998,7 @@ func (h *AdminHandler) conversationsSettingsAPI(w http.ResponseWriter, r *http.R
 			MaxItems:   cfg.Conversations.MaxItems,
 			MaxAgeDays: cfg.Conversations.MaxAgeDays,
 		})
+		h.invalidateConversationViewCacheAll()
 		h.notifyAdminChanged("conversations")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	default:
@@ -4022,6 +4101,7 @@ func (h *AdminHandler) conversationsAPI(w http.ResponseWriter, r *http.Request) 
 	}
 	if r.Method == http.MethodDelete {
 		removed := h.conversations.ClearAll()
+		h.invalidateConversationViewCacheAll()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":  "ok",
 			"removed": removed,
@@ -4050,6 +4130,21 @@ func (h *AdminHandler) conversationsAPI(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	threads, nextBefore, total := h.conversations.ListThreads(filter)
+	for i := range threads {
+		key := strings.TrimSpace(threads[i].ConversationKey)
+		if key == "" {
+			continue
+		}
+		records := h.conversations.Conversation(key)
+		threads[i].Title = conversations.ExtractConversationTitle(records)
+		views := buildConversationRecordViews(records, false)
+		threads[i].Count = len(views)
+		var tokenCount int64
+		for j := range records {
+			tokenCount += conversationRecordTotalTokens(records[j])
+		}
+		threads[i].TokenCount = tokenCount
+	}
 	settings := h.conversations.Settings()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"threads":      threads,
@@ -4059,6 +4154,60 @@ func (h *AdminHandler) conversationsAPI(w http.ResponseWriter, r *http.Request) 
 		"max_age_days": settings.MaxAgeDays,
 		"enabled":      settings.Enabled,
 	})
+}
+
+func conversationRecordTotalTokens(rec conversations.Record) int64 {
+	if s := strings.TrimSpace(rec.ResponsePayloadRaw); s != "" {
+		return parseTotalTokensFromRawPayload(s)
+	}
+	if len(rec.ResponsePayload) > 0 {
+		p, c, t := parseUsageTokens(rec.ResponsePayload)
+		if t > 0 {
+			return int64(t)
+		}
+		if p > 0 || c > 0 {
+			return int64(p + c)
+		}
+	}
+	return 0
+}
+
+func parseTotalTokensFromRawPayload(raw string) int64 {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0
+	}
+	if strings.HasPrefix(strings.ToLower(s), "data:") || strings.Contains(s, "\ndata:") {
+		lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+		var total int64
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(strings.ToLower(line), "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(line[5:])
+			if payload == "" || payload == "[DONE]" {
+				continue
+			}
+			p, c, t := parseUsageTokens([]byte(payload))
+			if t > 0 {
+				total = int64(t)
+				continue
+			}
+			if p > 0 || c > 0 {
+				total = int64(p + c)
+			}
+		}
+		return total
+	}
+	p, c, t := parseUsageTokens([]byte(s))
+	if t > 0 {
+		return int64(t)
+	}
+	if p > 0 || c > 0 {
+		return int64(p + c)
+	}
+	return 0
 }
 
 func (h *AdminHandler) conversationByIDAPI(w http.ResponseWriter, r *http.Request) {
@@ -4076,6 +4225,7 @@ func (h *AdminHandler) conversationByIDAPI(w http.ResponseWriter, r *http.Reques
 	}
 	if r.Method == http.MethodDelete {
 		removed := h.conversations.DeleteConversation(id)
+		h.invalidateConversationViewCacheForKey(id)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":  "ok",
 			"id":      id,
@@ -4087,69 +4237,40 @@ func (h *AdminHandler) conversationByIDAPI(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	includeInternal := false
+	if raw := strings.TrimSpace(r.URL.Query().Get("include_internal")); raw != "" {
+		switch strings.ToLower(raw) {
+		case "1", "true", "yes", "on":
+			includeInternal = true
+		}
+	}
+	if title, views, ok := h.getConversationViewCache(id, includeInternal); ok {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":      id,
+			"title":   title,
+			"records": views,
+		})
+		return
+	}
 	records := h.conversations.Conversation(id)
-	views := buildConversationRecordViews(records)
+	title := conversations.ExtractConversationTitle(records)
+	views := buildConversationRecordViews(records, includeInternal)
+	h.setConversationViewCache(id, includeInternal, title, views)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":      id,
+		"title":   title,
 		"records": views,
 	})
 }
 
-func buildConversationRecordViews(records []conversations.Record) []conversationRecordView {
-	if len(records) == 0 {
-		return []conversationRecordView{}
-	}
-	out := make([]conversationRecordView, 0, len(records))
-	prevReq := ""
-	prevResp := ""
-	for _, rec := range records {
-		req := strings.TrimSpace(rec.RequestTextMarkdown)
-		resp := strings.TrimSpace(rec.ResponseTextMarkdown)
-		view := conversationRecordView{
-			Record:                   rec,
-			RequestPreviousMarkdown:  prevReq,
-			ResponsePreviousMarkdown: prevResp,
-			RequestDeltaMarkdown:     extractConversationDelta(req, prevReq),
-			ResponseDeltaMarkdown:    extractConversationDelta(resp, prevResp),
-		}
-		out = append(out, view)
-		prevReq = req
-		prevResp = resp
-	}
-	return out
+func buildConversationRecordViews(records []conversations.Record, includeInternal bool) []conversationRecordView {
+	return conversations.BuildConversationRecordViewsWithOptions(records, conversations.ConversationViewOptions{
+		IncludeInternal: includeInternal,
+	})
 }
 
 func extractConversationDelta(current, previous string) string {
-	cur := strings.ReplaceAll(strings.TrimSpace(current), "\r\n", "\n")
-	prev := strings.ReplaceAll(strings.TrimSpace(previous), "\r\n", "\n")
-	if cur == "" {
-		return ""
-	}
-	if prev == "" {
-		return cur
-	}
-	if cur == prev {
-		return ""
-	}
-	if strings.HasPrefix(cur, prev) {
-		return strings.TrimSpace(cur[len(prev):])
-	}
-	prevTail := prev
-	const tailLimit = 12000
-	if len(prevTail) > tailLimit {
-		prevTail = prevTail[len(prevTail)-tailLimit:]
-	}
-	maxOverlap := len(prevTail)
-	if len(cur) < maxOverlap {
-		maxOverlap = len(cur)
-	}
-	const minOverlap = 40
-	for n := maxOverlap; n >= minOverlap; n-- {
-		if prevTail[len(prevTail)-n:] == cur[:n] {
-			return strings.TrimSpace(cur[n:])
-		}
-	}
-	return cur
+	return conversations.ExtractConversationDelta(current, previous)
 }
 
 func (h *AdminHandler) tlsTestCertificateAPI(w http.ResponseWriter, r *http.Request) {

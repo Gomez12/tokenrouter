@@ -570,7 +570,7 @@ func (s *Server) authAPIMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		if identity.Role != config.TokenRoleAdmin && identity.Role != config.TokenRoleInferrer {
+		if !config.RoleAtLeast(identity.Role, config.TokenRoleInferrer) {
 			http.Error(w, "forbidden: token role cannot use inference api", http.StatusForbidden)
 			return
 		}
@@ -742,16 +742,16 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	clientMeta := extractClientUsageMeta(r, s.store.Snapshot())
 	captureEnabled := isConversationCaptureEndpoint(r.URL.Path)
 	reqConversationID, reqPrevResponseID := parseConversationRequestIDs(body)
-	requestPayload := capJSONBytes(body, 128<<10)
-	requestText := dedupeConversationText(extractPromptTextFromBody(body))
+	requestPayloadRaw := capConversationRawText(body, 128<<10)
 	requestHeaders := sanitizeConversationRequestHeaders(r.Header)
+	requestHeadersRaw := conversationHeadersMapToRaw(requestHeaders)
 
 	start := time.Now()
 	if stream {
 		if hasQuota {
 			applyQuotaHeaders(w.Header(), quotaView)
 		}
-		statusCode, upstreamHeader, usage, initialLatency, err := s.forwardStreamingRequest(r.Context(), provider, r.URL.Path, mutatedBody, w)
+		statusCode, upstreamHeader, usage, initialLatency, err := s.forwardStreamingRequest(r.Context(), provider, r.URL.Path, mutatedBody, r.Header, w)
 		latency := time.Since(start)
 		if err != nil {
 			s.providerHealthChecker.RecordProxyResult(provider.Name, latency, statusCode, err)
@@ -793,27 +793,21 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		s.recordUsageMeasured(provider.Name, model, upstreamModel, statusCode, usageLatency, usage.PromptTokens, usage.PromptCachedTokens, usage.CompletionTokens, usage.TotalTokens, promptTPS, genTPS, clientMeta)
 		if captureEnabled && s.adminHandler != nil {
-			streamPayload, _ := json.Marshal(map[string]any{
-				"id":     strings.TrimSpace(usage.ResponseID),
-				"object": "conversation_stream_capture",
-				"text":   strings.TrimSpace(usage.CapturedOutput),
-			})
+			responseHeaders := sanitizeConversationResponseHeaders(upstreamHeader)
 			s.adminHandler.RecordConversation(conversations.CaptureInput{
-				Timestamp:            time.Now().UTC(),
-				Endpoint:             normalizeConversationEndpoint(r.URL.Path),
-				Provider:             provider.Name,
-				Model:                upstreamModel,
-				RemoteIP:             clientMeta.ClientIP,
-				APIKeyName:           clientMeta.APIKeyName,
-				RequestHeaders:       requestHeaders,
-				ResponseHeaders:      sanitizeConversationResponseHeaders(upstreamHeader),
-				RequestPayload:       requestPayload,
-				ResponsePayload:      capJSONBytes(streamPayload, 128<<10),
-				RequestTextMarkdown:  requestText,
-				ResponseTextMarkdown: dedupeConversationText(strings.TrimSpace(usage.CapturedOutput)),
-				StatusCode:           statusCode,
-				LatencyMS:            latency.Milliseconds(),
-				Stream:               true,
+				Timestamp:          time.Now().UTC(),
+				Endpoint:           normalizeConversationEndpoint(r.URL.Path),
+				Provider:           provider.Name,
+				Model:              upstreamModel,
+				RemoteIP:           clientMeta.ClientIP,
+				APIKeyName:         clientMeta.APIKeyName,
+				RequestHeadersRaw:  requestHeadersRaw,
+				ResponseHeadersRaw: conversationHeadersMapToRaw(responseHeaders),
+				RequestPayloadRaw:  requestPayloadRaw,
+				ResponsePayloadRaw: usage.CapturedStreamRaw,
+				StatusCode:         statusCode,
+				LatencyMS:          latency.Milliseconds(),
+				Stream:             true,
 				ProtocolIDs: conversations.ProtocolIDs{
 					RequestConversationID:   reqConversationID,
 					RequestPreviousResponse: reqPrevResponseID,
@@ -824,7 +818,7 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, statusCode, header, initialLatency, err := s.forwardRequest(r.Context(), provider, r.URL.Path, mutatedBody)
+	respBody, statusCode, header, initialLatency, err := s.forwardRequest(r.Context(), provider, r.URL.Path, mutatedBody, r.Header)
 	latency := time.Since(start)
 	if err != nil {
 		s.providerHealthChecker.RecordProxyResult(provider.Name, latency, 0, err)
@@ -885,23 +879,21 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordUsageMeasured(provider.Name, model, upstreamModel, statusCode, usageLatency, promptTokens, metrics.PromptCachedTokens, completionTokens, totalTokens, promptTPS, genTPS, clientMeta)
 	if captureEnabled && s.adminHandler != nil {
-		responseText := dedupeConversationText(extractCompletionTextFromBody(respBody))
+		responseHeaders := sanitizeConversationResponseHeaders(header)
 		s.adminHandler.RecordConversation(conversations.CaptureInput{
-			Timestamp:            time.Now().UTC(),
-			Endpoint:             normalizeConversationEndpoint(r.URL.Path),
-			Provider:             provider.Name,
-			Model:                upstreamModel,
-			RemoteIP:             clientMeta.ClientIP,
-			APIKeyName:           clientMeta.APIKeyName,
-			RequestHeaders:       requestHeaders,
-			ResponseHeaders:      sanitizeConversationResponseHeaders(header),
-			RequestPayload:       requestPayload,
-			ResponsePayload:      capJSONBytes(respBody, 128<<10),
-			RequestTextMarkdown:  requestText,
-			ResponseTextMarkdown: responseText,
-			StatusCode:           statusCode,
-			LatencyMS:            latency.Milliseconds(),
-			Stream:               false,
+			Timestamp:          time.Now().UTC(),
+			Endpoint:           normalizeConversationEndpoint(r.URL.Path),
+			Provider:           provider.Name,
+			Model:              upstreamModel,
+			RemoteIP:           clientMeta.ClientIP,
+			APIKeyName:         clientMeta.APIKeyName,
+			RequestHeadersRaw:  requestHeadersRaw,
+			ResponseHeadersRaw: conversationHeadersMapToRaw(responseHeaders),
+			RequestPayloadRaw:  requestPayloadRaw,
+			ResponsePayloadRaw: capConversationRawText(respBody, 128<<10),
+			StatusCode:         statusCode,
+			LatencyMS:          latency.Milliseconds(),
+			Stream:             false,
 			ProtocolIDs: conversations.ProtocolIDs{
 				RequestConversationID:   reqConversationID,
 				RequestPreviousResponse: reqPrevResponseID,
@@ -1041,7 +1033,7 @@ func (s *Server) prepareUpstreamRequest(body []byte) (incomingModel string, outB
 	return model, outBody, provider, upstreamModel, stream, nil
 }
 
-func (s *Server) forwardRequest(ctx context.Context, provider config.ProviderConfig, requestPath string, body []byte) ([]byte, int, http.Header, time.Duration, error) {
+func (s *Server) forwardRequest(ctx context.Context, provider config.ProviderConfig, requestPath string, body []byte, clientHeaders http.Header) ([]byte, int, http.Header, time.Duration, error) {
 	provider = s.ensureOAuthTokenFresh(ctx, provider)
 	u, err := url.Parse(strings.TrimRight(provider.BaseURL, "/"))
 	if err != nil {
@@ -1055,7 +1047,7 @@ func (s *Server) forwardRequest(ctx context.Context, provider config.ProviderCon
 	if err != nil {
 		return nil, 0, nil, 0, err
 	}
-	applyUpstreamProviderHeaders(req, provider)
+	applyUpstreamProviderHeaders(req, provider, clientHeaders)
 
 	cli := &http.Client{Timeout: time.Duration(provider.TimeoutSeconds) * time.Second}
 	upstreamStart := time.Now()
@@ -1086,6 +1078,7 @@ type usageTokenCounts struct {
 	ProviderTotalSeconds      float64
 	HasProviderTotalSeconds   bool
 	CapturedOutput            string
+	CapturedStreamRaw         string
 	ResponseID                string
 }
 
@@ -1096,7 +1089,7 @@ type clientUsageMeta struct {
 	APIKeyName string
 }
 
-func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.ProviderConfig, requestPath string, body []byte, w http.ResponseWriter) (int, http.Header, usageTokenCounts, time.Duration, error) {
+func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.ProviderConfig, requestPath string, body []byte, clientHeaders http.Header, w http.ResponseWriter) (int, http.Header, usageTokenCounts, time.Duration, error) {
 	provider = s.ensureOAuthTokenFresh(ctx, provider)
 	u, err := url.Parse(strings.TrimRight(provider.BaseURL, "/"))
 	if err != nil {
@@ -1110,7 +1103,7 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 	if err != nil {
 		return 0, nil, usageTokenCounts{}, 0, err
 	}
-	applyUpstreamProviderHeaders(req, provider)
+	applyUpstreamProviderHeaders(req, provider, clientHeaders)
 
 	cli := &http.Client{Timeout: time.Duration(provider.TimeoutSeconds) * time.Second}
 	upstreamStart := time.Now()
@@ -1139,6 +1132,8 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 	}
 
 	parser := newSSEUsageParser()
+	const maxCapturedStreamRawBytes = 128 << 10
+	rawCapture := make([]byte, 0, 8<<10)
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := resp.Body.Read(buf)
@@ -1147,11 +1142,20 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 				firstChunkLatency = time.Since(upstreamStart)
 			}
 			parser.Consume(buf[:n])
+			if len(rawCapture) < maxCapturedStreamRawBytes {
+				remaining := maxCapturedStreamRawBytes - len(rawCapture)
+				if remaining > n {
+					remaining = n
+				}
+				rawCapture = append(rawCapture, buf[:remaining]...)
+			}
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				if firstChunkLatency > 0 {
 					initialLatency = firstChunkLatency
 				}
-				return resp.StatusCode, upstreamHeader, parser.Usage(), initialLatency, writeErr
+				usage := parser.Usage()
+				usage.CapturedStreamRaw = capConversationRawText(rawCapture, maxCapturedStreamRawBytes)
+				return resp.StatusCode, upstreamHeader, usage, initialLatency, writeErr
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -1161,13 +1165,17 @@ func (s *Server) forwardStreamingRequest(ctx context.Context, provider config.Pr
 			if firstChunkLatency > 0 {
 				initialLatency = firstChunkLatency
 			}
-			return resp.StatusCode, upstreamHeader, parser.Usage(), initialLatency, nil
+			usage := parser.Usage()
+			usage.CapturedStreamRaw = capConversationRawText(rawCapture, maxCapturedStreamRawBytes)
+			return resp.StatusCode, upstreamHeader, usage, initialLatency, nil
 		}
 		if readErr != nil {
 			if firstChunkLatency > 0 {
 				initialLatency = firstChunkLatency
 			}
-			return resp.StatusCode, upstreamHeader, parser.Usage(), initialLatency, readErr
+			usage := parser.Usage()
+			usage.CapturedStreamRaw = capConversationRawText(rawCapture, maxCapturedStreamRawBytes)
+			return resp.StatusCode, upstreamHeader, usage, initialLatency, readErr
 		}
 	}
 }
@@ -1300,7 +1308,8 @@ func isOpenAICodexProvider(provider config.ProviderConfig) bool {
 	return host == "chatgpt.com" || strings.Contains(pathLower, "backend-api")
 }
 
-func applyUpstreamProviderHeaders(req *http.Request, provider config.ProviderConfig) {
+func applyUpstreamProviderHeaders(req *http.Request, provider config.ProviderConfig, clientHeaders http.Header) {
+	copyForwardableRequestHeaders(req.Header, clientHeaders)
 	req.Header.Set("Content-Type", "application/json")
 	if provider.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
@@ -1310,12 +1319,59 @@ func applyUpstreamProviderHeaders(req *http.Request, provider config.ProviderCon
 	if !isOpenAICodexProvider(provider) {
 		return
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("OpenAI-Beta", "responses=experimental")
-	req.Header.Set("originator", openAICodexOriginator())
-	req.Header.Set("User-Agent", "codex-cli/0.104.0")
+	if strings.TrimSpace(req.Header.Get("Accept")) == "" {
+		req.Header.Set("Accept", "application/json")
+	}
+	if strings.TrimSpace(req.Header.Get("OpenAI-Beta")) == "" {
+		req.Header.Set("OpenAI-Beta", "responses=experimental")
+	}
+	if strings.TrimSpace(req.Header.Get("originator")) == "" {
+		req.Header.Set("originator", openAICodexOriginator())
+	}
+	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
+		req.Header.Set("User-Agent", "codex-cli/0.104.0")
+	}
 	if strings.TrimSpace(provider.AccountID) != "" {
 		req.Header.Set("ChatGPT-Account-ID", strings.TrimSpace(provider.AccountID))
+	}
+}
+
+func copyForwardableRequestHeaders(dst http.Header, src http.Header) {
+	if len(src) == 0 {
+		return
+	}
+	for k, vals := range src {
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		if shouldDropForwardedRequestHeader(key) {
+			continue
+		}
+		for _, v := range vals {
+			dst.Add(key, v)
+		}
+	}
+}
+
+func shouldDropForwardedRequestHeader(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "host",
+		"connection",
+		"proxy-connection",
+		"keep-alive",
+		"transfer-encoding",
+		"upgrade",
+		"te",
+		"trailer",
+		"proxy-authenticate",
+		"proxy-authorization",
+		"content-length",
+		"authorization",
+		"x-api-key":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1838,12 +1894,6 @@ func extractPromptText(payload any) string {
 		case map[string]any:
 			for k, vv := range x {
 				lk := strings.ToLower(strings.TrimSpace(k))
-				switch lk {
-				case "prompt", "input", "instructions", "system", "content", "text":
-					if s, ok := vv.(string); ok {
-						parts = append(parts, s)
-					}
-				}
 				walk(vv, lk)
 			}
 		case []any:
@@ -1997,6 +2047,35 @@ func capJSONBytes(in []byte, max int) []byte {
 		copy(trimmed[len(trimmed)-len(ellipsis):], ellipsis)
 	}
 	return normalize(trimmed)
+}
+
+func capConversationRawText(in []byte, max int) string {
+	if len(in) == 0 {
+		return ""
+	}
+	if max <= 0 || len(in) <= max {
+		return strings.ToValidUTF8(string(in), "\uFFFD")
+	}
+	const marker = "\n...(truncated)"
+	trimmed := strings.ToValidUTF8(string(in[:max]), "\uFFFD")
+	return strings.TrimSpace(trimmed) + marker
+}
+
+func conversationHeadersMapToRaw(headers map[string]string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	lines := make([]string, 0, len(keys))
+	for _, k := range keys {
+		val := strings.TrimSpace(headers[k])
+		lines = append(lines, k+": "+val)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func sanitizeConversationRequestHeaders(h http.Header) map[string]string {
