@@ -93,6 +93,19 @@ func main() {
 	statusCmd.Flags().IntVar(&statusPeriodSeconds, "period-seconds", 3600, "Usage/quota lookback period in seconds")
 	root.AddCommand(statusCmd)
 
+	var modelsConfigPath string
+	var modelsAsJSON bool
+	modelsCmd := &cobra.Command{
+		Use:   "models",
+		Short: "List available models from TokenRouter",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runModels(cmd, modelsConfigPath, modelsAsJSON)
+		},
+	}
+	modelsCmd.Flags().StringVar(&modelsConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
+	modelsCmd.Flags().BoolVar(&modelsAsJSON, "json", false, "Output models as JSON")
+	root.AddCommand(modelsCmd)
+
 	var opencodeConfigPath string
 	var opencodeProviderID string
 	var opencodeProviderName string
@@ -479,6 +492,19 @@ type statusReport struct {
 	Stats     statusStats   `json:"stats"`
 }
 
+type modelsModel struct {
+	ID       string `json:"id"`
+	Object   string `json:"object,omitempty"`
+	Provider string `json:"provider,omitempty"`
+}
+
+type modelsReport struct {
+	CheckedAt string        `json:"checked_at"`
+	ServerURL string        `json:"server_url"`
+	Count     int           `json:"count"`
+	Models    []modelsModel `json:"models"`
+}
+
 func runStatus(cmd *cobra.Command, cfgPath string, asJSON bool, periodSeconds int) error {
 	cfg, err := config.LoadClientConfig(cfgPath)
 	if err != nil {
@@ -515,6 +541,80 @@ func runStatus(cmd *cobra.Command, cfgPath string, asJSON bool, periodSeconds in
 	}
 	printStatusReportHuman(cmd.OutOrStdout(), report)
 	return nil
+}
+
+func runModels(cmd *cobra.Command, cfgPath string, asJSON bool) error {
+	cfg, err := config.LoadClientConfig(cfgPath)
+	if err != nil {
+		return fmt.Errorf("load client config (run `toro connect` first): %w", err)
+	}
+	serverBase, err := deriveServerBaseURL(cfg.ServerURL)
+	if err != nil {
+		return err
+	}
+	models, err := fetchModels(serverBase, cfg.APIKey)
+	if err != nil {
+		return err
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].ID < models[j].ID
+	})
+	report := modelsReport{
+		CheckedAt: time.Now().UTC().Format(time.RFC3339),
+		ServerURL: strings.TrimSuffix(serverBase, "/") + "/v1",
+		Count:     len(models),
+		Models:    models,
+	}
+	if asJSON {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(report)
+	}
+	printModelsReportHuman(cmd.OutOrStdout(), report)
+	return nil
+}
+
+func fetchModels(serverBase, apiKey string) ([]modelsModel, error) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(serverBase, "/")+"/v1/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	}
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		msg := strings.TrimSpace(string(b))
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return nil, fmt.Errorf("models endpoint error (%d): %s", resp.StatusCode, msg)
+	}
+	var raw struct {
+		Data []modelsModel `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	return raw.Data, nil
+}
+
+func printModelsReportHuman(w io.Writer, report modelsReport) {
+	fmt.Fprintf(w, "Server: %s\n", report.ServerURL)
+	fmt.Fprintf(w, "Checked: %s\n", report.CheckedAt)
+	fmt.Fprintf(w, "Models: %d\n", report.Count)
+	for _, m := range report.Models {
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		fmt.Fprintf(w, "  - %s\n", id)
+	}
 }
 
 func checkServerHealth(serverBase string) statusHealth {
