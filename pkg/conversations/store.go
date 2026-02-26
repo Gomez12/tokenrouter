@@ -363,6 +363,20 @@ func (s *Store) DeleteConversation(key string) int {
 	return removed
 }
 
+func (s *Store) ClearAll() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := len(s.records)
+	if removed == 0 {
+		return 0
+	}
+	s.records = s.records[:0]
+	s.rebuildIndexesLocked()
+	s.dirty = true
+	s.saveLocked(true)
+	return removed
+}
+
 func (s *Store) resolveConversationKeyLocked(in CaptureInput, now time.Time) string {
 	if id := strings.TrimSpace(in.ProtocolIDs.RequestConversationID); id != "" {
 		return "cid:" + id

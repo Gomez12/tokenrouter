@@ -253,6 +253,7 @@ func (h *AdminHandler) RegisterRoutes(r chi.Router) {
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/logs", h.logsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Delete("/admin/api/logs", h.logsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/conversations", h.conversationsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Delete("/admin/api/conversations", h.conversationsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/conversations/{id}", h.conversationByIDAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Delete("/admin/api/conversations/{id}", h.conversationByIDAPI)
 }
@@ -4011,6 +4012,18 @@ func (h *AdminHandler) logsAPI(w http.ResponseWriter, r *http.Request) {
 func (h *AdminHandler) conversationsAPI(w http.ResponseWriter, r *http.Request) {
 	if h.conversations == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"threads": []any{}, "total": 0, "next_before": ""})
+		return
+	}
+	if r.Method == http.MethodDelete {
+		removed := h.conversations.ClearAll()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "ok",
+			"removed": removed,
+		})
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	filter := conversations.ListFilter{

@@ -388,16 +388,22 @@ function adminApp() {
         curNode.replaceWith(nextNode.cloneNode(true));
         return;
       }
-      const curAttrs = curNode.attributes;
-      for (let i = curAttrs.length - 1; i >= 0; i--) {
-        const name = curAttrs[i].name;
-        if (!nextNode.hasAttribute(name)) curNode.removeAttribute(name);
-      }
-      const nextAttrs = nextNode.attributes;
-      for (let i = 0; i < nextAttrs.length; i++) {
-        const name = nextAttrs[i].name;
-        const value = String(nextAttrs[i].value || '');
-        if (curNode.getAttribute(name) !== value) curNode.setAttribute(name, value);
+      try {
+        const curAttrs = curNode.attributes;
+        for (let i = curAttrs.length - 1; i >= 0; i--) {
+          const name = curAttrs[i].name;
+          if (!nextNode.hasAttribute(name)) curNode.removeAttribute(name);
+        }
+        const nextAttrs = nextNode.attributes;
+        for (let i = 0; i < nextAttrs.length; i++) {
+          const name = nextAttrs[i].name;
+          const value = String(nextAttrs[i].value || '');
+          if (curNode.getAttribute(name) !== value) curNode.setAttribute(name, value);
+        }
+      } catch (_) {
+        // Some attribute names used by template frameworks can fail set/removeAttribute.
+        curNode.replaceWith(nextNode.cloneNode(true));
+        return;
       }
       const curChildren = Array.from(curNode.childNodes);
       const nextChildren = Array.from(nextNode.childNodes);
@@ -3265,6 +3271,31 @@ function adminApp() {
         this.conversationDetailHtml = '<div class=\"small text-body-secondary\">Select a conversation to inspect chat flow.</div>';
       }
       await this.loadConversations(false);
+    },
+    async clearConversations() {
+      this.openConfirmModal({
+        title: 'Clear Conversations',
+        message: 'Delete all persisted conversations and records?',
+        confirmLabel: 'Clear conversations'
+      }, async () => this.clearConversationsConfirmed());
+    },
+    async clearConversationsConfirmed() {
+      const r = await this.apiFetch('/admin/api/conversations', {method:'DELETE', headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) {
+        const txt = await r.text().catch(() => '');
+        this.toastError('Failed to clear conversations: ' + (txt || ('HTTP ' + r.status)));
+        return;
+      }
+      this.conversationThreads = [];
+      this.conversationRecords = [];
+      this.selectedConversationKey = '';
+      this.showConversationDetailModal = false;
+      this.conversationsListHtml = '<div class=\"small text-body-secondary\">No conversations yet.</div>';
+      this.conversationDetailHtml = '<div class=\"small text-body-secondary\">Select a conversation to inspect chat flow.</div>';
+      this.conversationsPagerHtml = '';
+      this.toastSuccess('Conversations cleared.');
+      await this.loadConversations(true);
     },
     renderConversationsList() {
       const allRows = (this.conversationThreads || []).map((t) => {
