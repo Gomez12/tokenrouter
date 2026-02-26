@@ -202,6 +202,34 @@ function adminApp() {
     handleRealtimeRefresh(forceStats) { return window.AdminRealtime.handleRealtimeRefresh.call(this, forceStats); },
     handleRealtimeChange(scope) { return window.AdminRealtime.handleRealtimeChange.call(this, scope); },
     headers() { return {'Content-Type':'application/json'}; },
+    async readAPIError(response, fallbackMessage) {
+      const fallback = String(fallbackMessage || 'Request failed').trim() || 'Request failed';
+      if (!response) {
+        return {body: {}, text: '', message: fallback};
+      }
+      let body = null;
+      let text = '';
+      const ct = String((response.headers && response.headers.get && response.headers.get('content-type')) || '').toLowerCase();
+      if (ct.includes('application/json')) {
+        body = await response.json().catch(() => null);
+      } else {
+        text = await response.text().catch(() => '');
+        const trimmed = String(text || '').trim();
+        if (trimmed && (trimmed.startsWith('{') || trimmed.startsWith('['))) {
+          try { body = JSON.parse(trimmed); } catch (_) {}
+        }
+      }
+      if (!text && body && typeof body === 'object') {
+        const jsonMsg =
+          (typeof body.error === 'string' && body.error) ||
+          (typeof body.message === 'string' && body.message) ||
+          (typeof body.detail === 'string' && body.detail) ||
+          '';
+        text = String(jsonMsg || '').trim();
+      }
+      const msg = String(text || '').trim() || (fallback + ' (HTTP ' + Number(response.status || 0) + ')');
+      return {body: (body && typeof body === 'object') ? body : {}, text: String(text || '').trim(), message: msg};
+    },
     toast(type, message, duration) {
       const msg = String(message || '').trim();
       if (!msg) return;
@@ -2343,7 +2371,8 @@ function adminApp() {
         });
         if (applyResp.status === 401) { window.location = '/admin/login?next=/admin'; return 'redirect'; }
         if (!applyResp.ok) {
-          const body = await applyResp.json().catch(() => ({}));
+          const apiErr = await this.readAPIError(applyResp, 'Failed to apply network settings.');
+          const body = apiErr.body || {};
           const status = String(body.status || '').trim();
           const redirectURL = String(body.https_url || body.http_url || '').trim();
           if (applyResp.status === 409 && status === 'transition_required' && redirectURL) {
@@ -2357,8 +2386,7 @@ function adminApp() {
             });
             return 'failed';
           }
-          const msg = String(body.error || '').trim();
-          this.toastError(msg || 'Failed to apply network settings.');
+          this.toastError(apiErr.message);
           return 'failed';
         }
         const applyBody = await applyResp.json().catch(() => ({}));
@@ -2382,8 +2410,8 @@ function adminApp() {
         });
         if (confirmResp.status === 401) { window.location = '/admin/login?next=/admin'; return 'redirect'; }
         if (!confirmResp.ok) {
-          const txt = await confirmResp.text();
-          this.toastError(txt || 'Failed to confirm network switch.');
+          const apiErr = await this.readAPIError(confirmResp, 'Failed to confirm network switch.');
+          this.toastError(apiErr.message);
           return 'failed';
         }
         const confirmBody = await confirmResp.json().catch(() => ({}));
@@ -2543,7 +2571,8 @@ function adminApp() {
         };
         const r = await this.apiFetch('/admin/api/settings/tls', {method:'PUT', headers:this.headers(), body:JSON.stringify(payload)});
         if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
-        const body = await r.json().catch(() => ({}));
+        const apiErr = r.ok ? null : await this.readAPIError(r, 'Failed to save TLS settings.');
+        const body = (apiErr && apiErr.body) ? apiErr.body : {};
         if (r.ok) this.toastSuccess('TLS settings saved.');
         else if (r.status === 409 && String(body.status || '').trim() === 'transition_required' && String(body.http_url || '').trim()) {
           const target = String(body.http_url || '').trim();
@@ -2557,8 +2586,7 @@ function adminApp() {
           });
           return false;
         } else {
-          const msg = String(body.error || '').trim();
-          this.toastError(msg || 'Failed to save TLS settings.');
+          this.toastError((apiErr && apiErr.message) ? apiErr.message : 'Failed to save TLS settings.');
           return false;
         }
         if (r.ok) {
