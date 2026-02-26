@@ -73,6 +73,8 @@ Pass through `serve` args if needed:
 - Every push/PR commit triggers a `devbuild` workflow run and uploads build artifacts.
 - Every push to `master` also triggers a rolling release workflow.
   - Rolling tag format: `b<commit_count>` (example: `b742`)
+  - Push-triggered rolling releases are rate-limited to one every 6 hours.
+  - A daily scheduled run ensures a rolling release still happens at least once per day when new commits are present.
   - Rolling release assets include:
     - Windows/macOS/Linux binary archives
     - Linux packages: `deb`, `rpm`, `archlinux`

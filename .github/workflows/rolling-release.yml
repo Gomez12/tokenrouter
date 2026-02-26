@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - master
+  schedule:
+    - cron: "17 2 * * *"
   workflow_dispatch:
 
 permissions:
@@ -12,22 +14,73 @@ permissions:
 jobs:
   rolling-release:
     runs-on: ubuntu-latest
+    env:
+      ROLLING_MIN_INTERVAL_SECONDS: "21600" # 6 hours
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Decide whether to publish
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          now="$(date -u +%s)"
+          latest_line="$(git for-each-ref --sort=-creatordate --format='%(refname:short) %(creatordate:unix)' 'refs/tags/b*' | head -n1 || true)"
+          latest_tag=""
+          latest_epoch=0
+          if [ -n "${latest_line}" ]; then
+            latest_tag="$(echo "${latest_line}" | awk '{print $1}')"
+            latest_epoch="$(echo "${latest_line}" | awk '{print $2}')"
+          fi
+
+          head_commit="$(git rev-parse HEAD)"
+          if [ -n "${latest_tag}" ]; then
+            latest_commit="$(git rev-list -n1 "${latest_tag}")"
+          else
+            latest_commit=""
+          fi
+
+          run_release="true"
+          reason="publish"
+
+          if [ -n "${latest_tag}" ] && [ "${latest_commit}" = "${head_commit}" ]; then
+            run_release="false"
+            reason="head-already-tagged"
+          elif [ "${EVENT_NAME}" = "push" ] && [ -n "${latest_tag}" ]; then
+            elapsed=$((now - latest_epoch))
+            if [ "${elapsed}" -lt "${ROLLING_MIN_INTERVAL_SECONDS}" ]; then
+              run_release="false"
+              reason="rate-limited"
+            fi
+          fi
+
+          echo "run_release=${run_release}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+          echo "latest_epoch=${latest_epoch}" >> "$GITHUB_OUTPUT"
+          echo "event=${EVENT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "gate: event=${EVENT_NAME} latest_tag=${latest_tag:-none} reason=${reason} run_release=${run_release}"
+
       - name: Setup Go
+        if: steps.gate.outputs.run_release == 'true'
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
       - name: Run tests
+        if: steps.gate.outputs.run_release == 'true'
         run: |
           go test $(go list ./... | grep -v '^github.com/lkarlslund/tokenrouter/tests$')
 
       - name: Compute rolling tag
+        if: steps.gate.outputs.run_release == 'true'
         id: tag
         run: |
           BUILD_NUMBER="$(git rev-list --count HEAD)"
@@ -36,6 +89,7 @@ jobs:
           echo "Rolling tag: ${TAG}"
 
       - name: Create rolling tag if missing
+        if: steps.gate.outputs.run_release == 'true'
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
@@ -49,6 +103,7 @@ jobs:
           git push origin "refs/tags/${TAG}"
 
       - name: Skip if release already exists
+        if: steps.gate.outputs.run_release == 'true'
         id: release-check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
