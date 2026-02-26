@@ -1,0 +1,20 @@
+[Unit]
+Description=TokenRouter OpenAI-compatible proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/var/lib/tokenrouter
+Environment=XDG_CACHE_HOME=/var/cache/tokenrouter
+WorkingDirectory=/var/lib/tokenrouter
+StateDirectory=tokenrouter
+CacheDirectory=tokenrouter
+ExecStart=/usr/bin/torod serve --config /etc/tokenrouter/torod.toml
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

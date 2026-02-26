@@ -85,6 +85,11 @@ nfpms:
     description: OpenAI API-compatible proxy router in Go.
     section: utils
     priority: optional
+    scripts:
+      postinstall: packaging/nfpm/postinstall.sh
+      postremove: packaging/nfpm/postremove.sh
     contents:
       - src: README.md
         dst: /usr/share/doc/tokenrouter/README.md
+      - src: packaging/systemd/tokenrouter.service
+        dst: /lib/systemd/system/tokenrouter.service
