@@ -118,7 +118,7 @@ jobs:
           fi
 
       - name: Checkout rolling tag
-        if: steps.release-check.outputs.exists != 'true'
+        if: steps.gate.outputs.run_release == 'true' && steps.release-check.outputs.exists != 'true'
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
@@ -126,11 +126,11 @@ jobs:
           git checkout "refs/tags/${TAG}"
 
       - name: Run GoReleaser
-        if: steps.release-check.outputs.exists != 'true'
+        if: steps.gate.outputs.run_release == 'true' && steps.release-check.outputs.exists != 'true'
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --config .goreleaser.rolling.yml
+          args: release --clean --skip=validate --config .goreleaser.rolling.yml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
