@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -76,6 +77,21 @@ func main() {
 	}
 	setKeyCmd.Flags().StringVar(&clientConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	root.AddCommand(setKeyCmd)
+
+	var statusConfigPath string
+	var statusAsJSON bool
+	var statusPeriodSeconds int
+	statusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show TokenRouter server health, version, and provider quotas",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runStatus(cmd, statusConfigPath, statusAsJSON, statusPeriodSeconds)
+		},
+	}
+	statusCmd.Flags().StringVar(&statusConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
+	statusCmd.Flags().BoolVar(&statusAsJSON, "json", false, "Output status as JSON")
+	statusCmd.Flags().IntVar(&statusPeriodSeconds, "period-seconds", 3600, "Usage/quota lookback period in seconds")
+	root.AddCommand(statusCmd)
 
 	var opencodeConfigPath string
 	var opencodeProviderID string
@@ -411,6 +427,297 @@ func runSetKey(cmd *cobra.Command, path, apiKey string) error {
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "Saved key.")
 	return nil
+}
+
+type statusHealth struct {
+	OK         bool   `json:"ok"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Body       string `json:"body,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+type statusVersion struct {
+	Version string `json:"version,omitempty"`
+	Raw     string `json:"raw,omitempty"`
+	Commit  string `json:"commit,omitempty"`
+	Date    string `json:"date,omitempty"`
+	Dirty   bool   `json:"dirty,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+type statusQuotaMetric struct {
+	Key            string  `json:"key,omitempty"`
+	MeteredFeature string  `json:"metered_feature,omitempty"`
+	Window         string  `json:"window,omitempty"`
+	LeftPercent    float64 `json:"left_percent,omitempty"`
+	ResetAt        string  `json:"reset_at,omitempty"`
+	Unit           string  `json:"unit,omitempty"`
+}
+
+type statusProviderQuota struct {
+	Provider    string              `json:"provider"`
+	Status      string              `json:"status,omitempty"`
+	PlanType    string              `json:"plan_type,omitempty"`
+	LeftPercent float64             `json:"left_percent,omitempty"`
+	ResetAt     string              `json:"reset_at,omitempty"`
+	Error       string              `json:"error,omitempty"`
+	Metrics     []statusQuotaMetric `json:"metrics,omitempty"`
+}
+
+type statusStats struct {
+	ProvidersAvailable int                   `json:"providers_available,omitempty"`
+	ProvidersOnline    int                   `json:"providers_online,omitempty"`
+	ProviderQuotas     []statusProviderQuota `json:"provider_quotas,omitempty"`
+	Error              string                `json:"error,omitempty"`
+}
+
+type statusReport struct {
+	CheckedAt string        `json:"checked_at"`
+	ServerURL string        `json:"server_url"`
+	Health    statusHealth  `json:"health"`
+	Version   statusVersion `json:"version"`
+	Stats     statusStats   `json:"stats"`
+}
+
+func runStatus(cmd *cobra.Command, cfgPath string, asJSON bool, periodSeconds int) error {
+	cfg, err := config.LoadClientConfig(cfgPath)
+	if err != nil {
+		return fmt.Errorf("load client config (run `toro connect` first): %w", err)
+	}
+	serverBase, err := deriveServerBaseURL(cfg.ServerURL)
+	if err != nil {
+		return err
+	}
+	if periodSeconds <= 0 {
+		periodSeconds = 3600
+	}
+
+	report := statusReport{
+		CheckedAt: time.Now().UTC().Format(time.RFC3339),
+		ServerURL: strings.TrimSuffix(serverBase, "/") + "/v1",
+	}
+
+	report.Health = checkServerHealth(serverBase)
+
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		report.Version.Error = "api key not configured in toro client config"
+		report.Stats.Error = "api key not configured in toro client config"
+	} else {
+		v, s := readServerStatus(serverBase, cfg.APIKey, periodSeconds)
+		report.Version = v
+		report.Stats = s
+	}
+
+	if asJSON {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(report)
+	}
+	printStatusReportHuman(cmd.OutOrStdout(), report)
+	return nil
+}
+
+func checkServerHealth(serverBase string) statusHealth {
+	u := strings.TrimSuffix(serverBase, "/") + "/healthz"
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return statusHealth{Error: err.Error()}
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return statusHealth{Error: err.Error()}
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	body := strings.TrimSpace(string(b))
+	return statusHealth{
+		OK:         resp.StatusCode == http.StatusOK,
+		StatusCode: resp.StatusCode,
+		Body:       body,
+	}
+}
+
+func readServerStatus(serverBase, apiKey string, periodSeconds int) (statusVersion, statusStats) {
+	path := "/v1/status?period_seconds=" + strconv.Itoa(periodSeconds)
+	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(serverBase, "/")+path, nil)
+	if err != nil {
+		msg := err.Error()
+		return statusVersion{Error: msg}, statusStats{Error: msg}
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		msg := err.Error()
+		return statusVersion{Error: msg}, statusStats{Error: msg}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		msg := fmt.Sprintf("status endpoint error (%d): %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return statusVersion{Error: msg}, statusStats{Error: msg}
+	}
+
+	var raw struct {
+		Version string `json:"version"`
+		Raw     string `json:"raw"`
+		Commit  string `json:"commit"`
+		Date    string `json:"date"`
+		Dirty   bool   `json:"dirty"`
+
+		ProvidersAvailable int `json:"providers_available"`
+		ProvidersOnline    int `json:"providers_online"`
+		ProviderQuotas     map[string]struct {
+			Provider    string  `json:"provider"`
+			Status      string  `json:"status"`
+			PlanType    string  `json:"plan_type"`
+			LeftPercent float64 `json:"left_percent"`
+			ResetAt     string  `json:"reset_at"`
+			Error       string  `json:"error"`
+			Metrics     []struct {
+				Key            string  `json:"key"`
+				MeteredFeature string  `json:"metered_feature"`
+				Window         string  `json:"window"`
+				LeftPercent    float64 `json:"left_percent"`
+				ResetAt        string  `json:"reset_at"`
+				Unit           string  `json:"unit"`
+			} `json:"metrics"`
+		} `json:"provider_quotas"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		msg := err.Error()
+		return statusVersion{Error: msg}, statusStats{Error: msg}
+	}
+
+	version := statusVersion{
+		Version: strings.TrimSpace(raw.Version),
+		Raw:     strings.TrimSpace(raw.Raw),
+		Commit:  strings.TrimSpace(raw.Commit),
+		Date:    strings.TrimSpace(raw.Date),
+		Dirty:   raw.Dirty,
+	}
+	stats := statusStats{
+		ProvidersAvailable: raw.ProvidersAvailable,
+		ProvidersOnline:    raw.ProvidersOnline,
+		ProviderQuotas:     make([]statusProviderQuota, 0, len(raw.ProviderQuotas)),
+	}
+	for providerName, q := range raw.ProviderQuotas {
+		item := statusProviderQuota{
+			Provider:    strings.TrimSpace(providerName),
+			Status:      strings.TrimSpace(q.Status),
+			PlanType:    strings.TrimSpace(q.PlanType),
+			LeftPercent: q.LeftPercent,
+			ResetAt:     strings.TrimSpace(q.ResetAt),
+			Error:       strings.TrimSpace(q.Error),
+			Metrics:     make([]statusQuotaMetric, 0, len(q.Metrics)),
+		}
+		if strings.TrimSpace(q.Provider) != "" {
+			item.Provider = strings.TrimSpace(q.Provider)
+		}
+		for _, m := range q.Metrics {
+			item.Metrics = append(item.Metrics, statusQuotaMetric{
+				Key:            strings.TrimSpace(m.Key),
+				MeteredFeature: strings.TrimSpace(m.MeteredFeature),
+				Window:         strings.TrimSpace(m.Window),
+				LeftPercent:    m.LeftPercent,
+				ResetAt:        strings.TrimSpace(m.ResetAt),
+				Unit:           strings.TrimSpace(m.Unit),
+			})
+		}
+		sort.Slice(item.Metrics, func(i, j int) bool {
+			if item.Metrics[i].MeteredFeature == item.Metrics[j].MeteredFeature {
+				return item.Metrics[i].Window < item.Metrics[j].Window
+			}
+			return item.Metrics[i].MeteredFeature < item.Metrics[j].MeteredFeature
+		})
+		stats.ProviderQuotas = append(stats.ProviderQuotas, item)
+	}
+	sort.Slice(stats.ProviderQuotas, func(i, j int) bool {
+		return stats.ProviderQuotas[i].Provider < stats.ProviderQuotas[j].Provider
+	})
+	return version, stats
+}
+
+func printStatusReportHuman(w io.Writer, report statusReport) {
+	healthText := "down"
+	if report.Health.OK {
+		healthText = "ok"
+	}
+	fmt.Fprintf(w, "Server: %s\n", report.ServerURL)
+	fmt.Fprintf(w, "Checked: %s\n", report.CheckedAt)
+	if strings.TrimSpace(report.Health.Error) != "" {
+		fmt.Fprintf(w, "Health: %s (%s)\n", healthText, report.Health.Error)
+	} else {
+		body := strings.TrimSpace(report.Health.Body)
+		if body != "" {
+			fmt.Fprintf(w, "Health: %s (status=%d, body=%q)\n", healthText, report.Health.StatusCode, body)
+		} else {
+			fmt.Fprintf(w, "Health: %s (status=%d)\n", healthText, report.Health.StatusCode)
+		}
+	}
+
+	if strings.TrimSpace(report.Version.Error) != "" {
+		fmt.Fprintf(w, "Version: unavailable (%s)\n", report.Version.Error)
+	} else {
+		version := strings.TrimSpace(report.Version.Version)
+		if version == "" {
+			version = "unknown"
+		}
+		if strings.TrimSpace(report.Version.Commit) != "" {
+			commit := report.Version.Commit
+			if len(commit) > 12 {
+				commit = commit[:12]
+			}
+			fmt.Fprintf(w, "Version: %s (commit=%s)\n", version, commit)
+		} else {
+			fmt.Fprintf(w, "Version: %s\n", version)
+		}
+	}
+
+	if strings.TrimSpace(report.Stats.Error) != "" {
+		fmt.Fprintf(w, "Providers: unavailable (%s)\n", report.Stats.Error)
+		fmt.Fprintln(w, "Quota: unavailable")
+		return
+	}
+
+	fmt.Fprintf(w, "Providers: %d online / %d available\n", report.Stats.ProvidersOnline, report.Stats.ProvidersAvailable)
+	if len(report.Stats.ProviderQuotas) == 0 {
+		fmt.Fprintln(w, "Quota: no data")
+		return
+	}
+	fmt.Fprintln(w, "Quota:")
+	for _, p := range report.Stats.ProviderQuotas {
+		status := strings.TrimSpace(p.Status)
+		if status == "" {
+			status = "unknown"
+		}
+		line := fmt.Sprintf("  - %s: status=%s", p.Provider, status)
+		if p.LeftPercent > 0 {
+			line += fmt.Sprintf(", left=%.1f%%", p.LeftPercent)
+		}
+		if strings.TrimSpace(p.ResetAt) != "" {
+			line += ", reset=" + p.ResetAt
+		}
+		if strings.TrimSpace(p.Error) != "" {
+			line += ", error=" + p.Error
+		}
+		fmt.Fprintln(w, line)
+		if len(p.Metrics) > 0 {
+			for _, m := range p.Metrics {
+				label := strings.TrimSpace(m.MeteredFeature)
+				if label == "" {
+					label = "quota"
+				}
+				if strings.TrimSpace(m.Window) != "" {
+					label += "/" + m.Window
+				}
+				sub := fmt.Sprintf("      * %s: %.1f%% left", label, m.LeftPercent)
+				if strings.TrimSpace(m.ResetAt) != "" {
+					sub += ", reset=" + m.ResetAt
+				}
+				fmt.Fprintln(w, sub)
+			}
+		}
+	}
 }
 
 func promptLine(reader *bufio.Reader, out io.Writer, prompt string) (string, error) {

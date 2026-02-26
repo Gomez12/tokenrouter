@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,7 @@ import (
 	"github.com/lkarlslund/tokenrouter/pkg/logstore"
 	"github.com/lkarlslund/tokenrouter/pkg/logutil"
 	"github.com/lkarlslund/tokenrouter/pkg/pricing"
+	"github.com/lkarlslund/tokenrouter/pkg/version"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -119,6 +121,7 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 		v1.Post("/embeddings", s.proxyHandler)
 		v1.Post("/responses", s.proxyHandler)
 	})
+	r.With(s.authAnyTokenMiddleware).Get("/v1/status", s.handleStatus)
 
 	instanceID := fmt.Sprintf("%d-%d", time.Now().UTC().UnixNano(), os.Getpid())
 	adminHandler := NewAdminHandler(store, stats, resolver, pricingMgr, s.providerHealthChecker, instanceID)
@@ -569,6 +572,25 @@ func (s *Server) authAPIMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) authAnyTokenMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.store.Snapshot()
+		if cfg.AllowLocalhostNoAuth && requestIsTrustedNoAuth(r, cfg) {
+			identity := tokenAuthIdentity{
+				Role: config.TokenRoleInferrer,
+			}
+			next.ServeHTTP(w, r.WithContext(withAPIAuthIdentity(r.Context(), identity)))
+			return
+		}
+		identity, ok := resolveAuthIdentity(bearerToken(r.Header), cfg)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(withAPIAuthIdentity(r.Context(), identity)))
+	})
+}
+
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	models, err := s.resolver.DiscoverModels(r.Context())
 	if err != nil {
@@ -595,7 +617,58 @@ func (s *Server) handleV1Root(w http.ResponseWriter, _ *http.Request) {
 			"/v1/completions",
 			"/v1/embeddings",
 			"/v1/responses",
+			"/v1/status",
 		},
+	})
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	period := time.Hour
+	if raw := strings.TrimSpace(r.URL.Query().Get("period_seconds")); raw != "" {
+		if sec, err := strconv.Atoi(raw); err == nil && sec > 0 {
+			period = time.Duration(sec) * time.Second
+		}
+	}
+
+	now := time.Now().UTC()
+	summary := s.stats.Summary(period)
+	providers := []config.ProviderConfig{}
+	quotaProviders := []config.ProviderConfig{}
+	quotas := map[string]ProviderQuotaSnapshot{}
+	if s.adminHandler != nil {
+		providers = s.adminHandler.catalogProviders()
+		quotaProviders = s.adminHandler.quotaProviders()
+		quotas = s.adminHandler.readProviderQuotas(r.Context(), quotaProviders)
+	}
+	names := make([]string, 0, len(providers))
+	for _, p := range providers {
+		names = append(names, p.Name)
+	}
+	providersAvailable := len(names)
+	providersOnline := 0
+	if s.providerHealthChecker != nil {
+		providersAvailable, providersOnline = s.providerHealthChecker.AvailabilitySummary(names)
+	}
+
+	v := version.Current()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"checked_at":          now.Format(time.RFC3339),
+		"period_seconds":      int64(period / time.Second),
+		"version":             version.String(),
+		"raw":                 v.Version,
+		"commit":              v.Commit,
+		"date":                v.Date,
+		"dirty":               v.Dirty,
+		"providers_available": providersAvailable,
+		"providers_online":    providersOnline,
+		"provider_quotas":     quotas,
+		"requests":            summary.Requests,
+		"prompt_tokens":       summary.PromptTokens,
+		"completion_tokens":   summary.CompletionTokens,
+		"total_tokens":        summary.TotalTokens,
+		"avg_latency_ms":      summary.AvgLatencyMS,
+		"avg_prompt_tps":      summary.AvgPromptTPS,
+		"avg_generation_tps":  summary.AvgGenerationTPS,
 	})
 }
 
