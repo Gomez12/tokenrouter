@@ -70,7 +70,6 @@ Pass through `serve` args if needed:
 
 ## CI/CD
 
-- Every push/PR commit triggers a `devbuild` workflow run and uploads build artifacts.
 - Every push to `master` also triggers a rolling release workflow.
   - Rolling tag format: `b<commit_count>` (example: `b742`)
   - Push-triggered rolling releases are rate-limited to one every 6 hours.
@@ -78,16 +77,7 @@ Pass through `serve` args if needed:
   - Rolling release assets include:
     - Windows/macOS/Linux binary archives
     - Linux packages: `deb`, `rpm`, `archlinux`
-- Semantic tags trigger releases automatically.
-  - Tag format: `vX.Y.Z` (example: `v0.4.2`)
-  - Release workflow builds cross-platform artifacts and publishes a GitHub Release.
-
-Manual release trigger example:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
+- Rolling release notes include a generated change summary from commits since the previous rolling tag.
 
 ## Config paths
 

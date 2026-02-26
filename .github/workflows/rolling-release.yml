@@ -140,6 +140,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
+          PREV_TAG: ${{ steps.gate.outputs.latest_tag }}
         run: |
           shopt -s nullglob
           files=(dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/*.pkg.tar.zst dist/checksums.txt)
@@ -147,9 +148,25 @@ jobs:
             echo "No artifacts found in dist/"
             exit 1
           fi
+
+          notes_file="$(mktemp)"
+          {
+            echo "Rolling release ${TAG}"
+            echo
+            echo "Commit: $(git rev-parse --short=12 HEAD)"
+            echo "Date (UTC): $(date -u +'%Y-%m-%d %H:%M:%S')"
+            echo
+            echo "## Changes"
+            if [ -n "${PREV_TAG}" ] && git rev-parse -q --verify "refs/tags/${PREV_TAG}" >/dev/null; then
+              git log --no-merges --pretty='- %s (%h)' "${PREV_TAG}..HEAD"
+            else
+              git log --no-merges --pretty='- %s (%h)' -n 25
+            fi
+          } > "${notes_file}"
+
           gh release create "${TAG}" "${files[@]}" \
             --title "${TAG}" \
-            --notes "Rolling release ${TAG}"
+            --notes-file "${notes_file}"
 
       - name: Rollback partial release on failure
         if: failure() && steps.gate.outputs.run_release == 'true' && steps.release-check.outputs.exists != 'true'
