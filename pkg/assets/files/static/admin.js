@@ -115,6 +115,7 @@ function adminApp() {
     logLevelFilterCacheKey: 'opp_log_level_filter_v1',
     accessTokens: [],
     requiresInitialTokenSetup: false,
+    initialSetupDialogDismissed: false,
     showAddAccessTokenModal: false,
     showConfirmModal: false,
     confirmModalTitle: 'Confirm Action',
@@ -122,7 +123,7 @@ function adminApp() {
     confirmModalConfirmLabel: 'Confirm',
     confirmModalBusy: false,
     confirmModalAction: null,
-    accessTokenDraft: {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0'},
+    accessTokenDraft: {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0', disable_localhost_no_auth:false},
     ws: null,
     wsReconnectTimer: null,
     wsBackoffMs: 1000,
@@ -1971,7 +1972,21 @@ function adminApp() {
     },
     openAddAccessTokenModal() {
       this.showAddAccessTokenModal = true;
-      this.accessTokenDraft = {id:'', name:'', key:this.randomTokenKey(), role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0'};
+      const initialSetup = this.requiresInitialTokenSetup && (!Array.isArray(this.accessTokens) || this.accessTokens.length === 0);
+      this.accessTokenDraft = {
+        id:'',
+        name: initialSetup ? 'Admin' : '',
+        key:this.randomTokenKey(),
+        role: initialSetup ? 'admin' : 'inferrer',
+        expiry_preset:'never',
+        expires_at:'',
+        quota_enabled:false,
+        quota_requests_limit:'',
+        quota_requests_interval_seconds:'0',
+        quota_tokens_limit:'',
+        quota_tokens_interval_seconds:'0',
+        disable_localhost_no_auth: initialSetup
+      };
     },
     openEditAccessTokenModal(id) {
       const sid = String(id || '').trim();
@@ -1998,9 +2013,9 @@ function adminApp() {
       };
     },
     closeAddAccessTokenModal() {
-      if (this.requiresInitialTokenSetup) return;
+      if (this.requiresInitialTokenSetup) this.initialSetupDialogDismissed = true;
       this.showAddAccessTokenModal = false;
-      this.accessTokenDraft = {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0'};
+      this.accessTokenDraft = {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0', disable_localhost_no_auth:false};
     },
     buildAccessTokenQuotaPayload() {
       if (!this.accessTokenDraft.quota_enabled) return null;
@@ -2663,10 +2678,12 @@ function adminApp() {
       if (this.requiresInitialTokenSetup) {
         this.activeTab = 'access';
         this.persistActiveTab();
-        if (!this.showAddAccessTokenModal) {
+        if (!this.showAddAccessTokenModal && !this.initialSetupDialogDismissed) {
           this.openAddAccessTokenModal();
-          this.toastWarning('Create your first access token to enable API access.');
+          this.toastWarning('Create your first admin key now, or cancel to continue localhost unauthenticated.');
         }
+      } else {
+        this.initialSetupDialogDismissed = false;
       }
     },
     debouncedLoadConversations() {
@@ -3148,6 +3165,11 @@ function adminApp() {
         this.toastError(txt || 'Failed to add key');
         return;
       }
+      if (this.requiresInitialTokenSetup && this.accessTokenDraft.disable_localhost_no_auth) {
+        this.allowLocalhostNoAuth = false;
+        await this.saveSecuritySettings();
+      }
+      this.initialSetupDialogDismissed = false;
       this.closeAddAccessTokenModal();
       this.toastSuccess('Key added.');
       await this.loadAccessTokens();

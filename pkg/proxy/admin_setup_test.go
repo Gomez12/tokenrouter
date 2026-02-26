@@ -3,67 +3,74 @@ package proxy
 import (
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
-func TestLoginRedirectsToSetupWhenAdminKeyMissing(t *testing.T) {
+func TestLoginRendersWhenAdminKeyMissing(t *testing.T) {
 	cfg := config.NewDefaultServerConfig()
+	cfg.IncomingTokens = nil
 	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
 	h := &AdminHandler{store: store}
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/login?next=/admin", nil)
 	w := httptest.NewRecorder()
 	h.login(w, req)
-	if w.Code != http.StatusFound {
-		t.Fatalf("expected 302 redirect, got %d", w.Code)
-	}
-	if loc := w.Header().Get("Location"); loc != "/admin/setup" {
-		t.Fatalf("expected redirect to /admin/setup, got %q", loc)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected login page 200, got %d body=%s", w.Code, w.Body.String())
 	}
 }
 
-func TestSetupSavesAdminKeyAndRedirectsToAdmin(t *testing.T) {
+func TestLegacySetupPathRedirectsToAdmin(t *testing.T) {
 	cfg := config.NewDefaultServerConfig()
 	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
 	h := &AdminHandler{store: store}
 
-	form := url.Values{}
-	form.Set("key", "super-secret-admin-key")
-	form.Set("confirm_key", "super-secret-admin-key")
-	req := httptest.NewRequest(http.MethodPost, "/admin/setup", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req := httptest.NewRequest(http.MethodGet, "/admin/setup", nil)
 	w := httptest.NewRecorder()
-	h.setup(w, req)
+	h.legacySetupRedirect(w, req)
 	if w.Code != http.StatusFound {
-		t.Fatalf("expected 302 redirect, got %d body=%s", w.Code, w.Body.String())
+		t.Fatalf("expected redirect status, got %d", w.Code)
 	}
 	if loc := w.Header().Get("Location"); loc != "/admin" {
 		t.Fatalf("expected redirect to /admin, got %q", loc)
 	}
-	gotCfg := store.Snapshot()
-	if len(gotCfg.IncomingTokens) != 1 {
-		t.Fatalf("expected one created incoming token, got %d", len(gotCfg.IncomingTokens))
+}
+
+func TestFirstRunLocalhostCanOpenAdminWithoutAuth(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.IncomingTokens = nil
+	cfg.AllowLocalhostNoAuth = true
+	s, err := NewServer(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	if err != nil {
+		t.Fatalf("NewServer returned error: %v", err)
 	}
-	if gotCfg.IncomingTokens[0].Role != config.TokenRoleAdmin {
-		t.Fatalf("expected created token role admin, got %q", gotCfg.IncomingTokens[0].Role)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	s.httpServer.Handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /admin on localhost first run, got %d body=%s", w.Code, w.Body.String())
 	}
-	if gotCfg.IncomingTokens[0].Key != "super-secret-admin-key" {
-		t.Fatalf("expected created token key persisted")
+}
+
+func TestFirstRunLocalhostCanUseAccessTokensAPIWithoutAuth(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.IncomingTokens = nil
+	cfg.AllowLocalhostNoAuth = true
+	s, err := NewServer(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	if err != nil {
+		t.Fatalf("NewServer returned error: %v", err)
 	}
-	cookies := w.Result().Cookies()
-	found := false
-	for _, c := range cookies {
-		if c.Name == adminSessionCookie && c.Value == "super-secret-admin-key" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected %s cookie to be set", adminSessionCookie)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/access-tokens", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	s.httpServer.Handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /admin/api/access-tokens on localhost first run, got %d body=%s", w.Code, w.Body.String())
 	}
 }

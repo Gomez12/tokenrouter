@@ -173,6 +173,7 @@ func NewDefaultServerConfig() *ServerConfig {
 		ListenAddr:                 "127.0.0.1:8080",
 		HTTPMode:                   "enabled",
 		IncomingTokens:             []IncomingAPIToken{},
+		AllowLocalhostNoAuth:       true,
 		DefaultProvider:            "",
 		Providers:                  []ProviderConfig{},
 		AutoEnablePublicFreeModels: true,

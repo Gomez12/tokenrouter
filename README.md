@@ -67,7 +67,7 @@ If config does not exist, `serve` launches first-time setup automatically.
 http://127.0.0.1:8080/admin
 ```
 
-On first run, TokenRouter sends you to `/admin/setup` to create an admin key.
+On first run, TokenRouter opens admin directly and prompts you to create an admin key from a dismissible dialog.
 
 ## Use One Endpoint Everywhere
 

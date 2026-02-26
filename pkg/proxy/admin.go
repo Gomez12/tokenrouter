@@ -151,19 +151,19 @@ type persistedQuotaCacheEntry struct {
 func NewAdminHandler(store *config.ServerConfigStore, stats *StatsStore, resolver *ProviderResolver, pricingMgr *pricing.Manager, healthChecker *ProviderHealthChecker, instanceID string) *AdminHandler {
 	quotaCachePath := quotaCachePathForStore(store)
 	h := &AdminHandler{
-		store:         store,
-		stats:         stats,
-		resolver:      resolver,
-		pricing:       pricingMgr,
-		healthChecker: healthChecker,
-		instance:      instanceID,
-		oauthPending:  map[string]*oauthSession{},
-		oauthSrvAddr:  "127.0.0.1:1455",
-		quotaCache:    cache.NewTTLMap[string, quotaCacheValue](),
+		store:          store,
+		stats:          stats,
+		resolver:       resolver,
+		pricing:        pricingMgr,
+		healthChecker:  healthChecker,
+		instance:       instanceID,
+		oauthPending:   map[string]*oauthSession{},
+		oauthSrvAddr:   "127.0.0.1:1455",
+		quotaCache:     cache.NewTTLMap[string, quotaCacheValue](),
 		quotaCachePath: quotaCachePath,
-		statsCache:    cache.NewTTLMap[int64, StatsSummary](),
-		wsClients:     map[*adminWSClient]struct{}{},
-		networkSwitch: map[string]pendingNetworkSwitch{},
+		statsCache:     cache.NewTTLMap[int64, StatsSummary](),
+		wsClients:      map[*adminWSClient]struct{}{},
+		networkSwitch:  map[string]pendingNetworkSwitch{},
 	}
 	h.loadQuotaCacheFromDisk()
 	go h.runWSScheduler()
@@ -208,8 +208,8 @@ func (h *AdminHandler) RegisterRoutes(r chi.Router) {
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin", h.page)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin/", h.page)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin/ws", h.adminWebsocket)
-	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodGet, "/admin/setup", h.setup)
-	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodPost, "/admin/setup", h.setup)
+	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodGet, "/admin/setup", h.legacySetupRedirect)
+	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodPost, "/admin/setup", h.legacySetupRedirect)
 	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodGet, "/admin/login", h.login)
 	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodPost, "/admin/login", h.login)
 	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodPost, "/admin/logout", h.logout)
@@ -506,10 +506,6 @@ func (h *AdminHandler) withRuntimeInstanceHeader(next http.Handler) http.Handler
 }
 
 func (h *AdminHandler) login(w http.ResponseWriter, r *http.Request) {
-	if h.adminSetupRequired() {
-		http.Redirect(w, r, "/admin/setup", http.StatusFound)
-		return
-	}
 	switch r.Method {
 	case http.MethodGet:
 		if h.isAuthenticated(r) {
@@ -569,107 +565,8 @@ func (h *AdminHandler) login(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *AdminHandler) setup(w http.ResponseWriter, r *http.Request) {
-	if !h.adminSetupRequired() {
-		if h.isAuthenticated(r) {
-			http.Redirect(w, r, "/admin", http.StatusFound)
-			return
-		}
-		http.Redirect(w, r, "/admin/login?next=/admin", http.StatusFound)
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		t, err := getTemplates()
-		if err != nil {
-			http.Error(w, "failed to render setup page", http.StatusInternalServerError)
-			return
-		}
-		_ = t.ExecuteTemplate(w, "setup.html", struct {
-			Error string
-		}{})
-	case http.MethodPost:
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "invalid form", http.StatusBadRequest)
-			return
-		}
-		key := strings.TrimSpace(r.FormValue("key"))
-		confirm := strings.TrimSpace(r.FormValue("confirm_key"))
-		renderSetupWithError := func(msg string) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			t, err := getTemplates()
-			if err != nil {
-				http.Error(w, "failed to render setup page", http.StatusInternalServerError)
-				return
-			}
-			_ = t.ExecuteTemplate(w, "setup.html", struct {
-				Error string
-			}{Error: msg})
-		}
-		if key == "" {
-			renderSetupWithError("Admin key is required")
-			return
-		}
-		if key != confirm {
-			renderSetupWithError("Admin key confirmation does not match")
-			return
-		}
-		if len(key) < 12 {
-			renderSetupWithError("Admin key must be at least 12 characters")
-			return
-		}
-		now := time.Now().UTC().Format(time.RFC3339)
-		if err := h.store.Update(func(c *config.ServerConfig) error {
-			if config.HasAdminToken(c.IncomingTokens) {
-				return fmt.Errorf("admin token already configured")
-			}
-			for i := range c.IncomingTokens {
-				if strings.TrimSpace(c.IncomingTokens[i].Key) != key {
-					continue
-				}
-				c.IncomingTokens[i].Role = config.TokenRoleAdmin
-				if strings.TrimSpace(c.IncomingTokens[i].Name) == "" {
-					c.IncomingTokens[i].Name = "Admin"
-				}
-				if strings.TrimSpace(c.IncomingTokens[i].CreatedAt) == "" {
-					c.IncomingTokens[i].CreatedAt = now
-				}
-				return nil
-			}
-			c.IncomingTokens = append(c.IncomingTokens, config.IncomingAPIToken{
-				Name:      "Admin",
-				Role:      config.TokenRoleAdmin,
-				Key:       key,
-				CreatedAt: now,
-			})
-			return nil
-		}); err != nil {
-			if strings.EqualFold(strings.TrimSpace(err.Error()), "admin token already configured") {
-				http.Redirect(w, r, "/admin/login?next=/admin", http.StatusFound)
-				return
-			}
-			http.Error(w, "failed to save admin token", http.StatusInternalServerError)
-			return
-		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     adminSessionCookie,
-			Value:    key,
-			Path:     "/admin",
-			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
-			Secure:   r.TLS != nil,
-			MaxAge:   86400,
-		})
-		http.Redirect(w, r, "/admin", http.StatusFound)
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func (h *AdminHandler) adminSetupRequired() bool {
-	cfg := h.store.Snapshot()
-	return !config.HasAdminToken(cfg.IncomingTokens)
+func (h *AdminHandler) legacySetupRedirect(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/admin", http.StatusFound)
 }
 
 func (h *AdminHandler) logout(w http.ResponseWriter, r *http.Request) {
@@ -691,8 +588,9 @@ func (h *AdminHandler) logout(w http.ResponseWriter, r *http.Request) {
 
 func (h *AdminHandler) requireAdminPage(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.adminSetupRequired() {
-			http.Redirect(w, r, "/admin/setup", http.StatusFound)
+		cfg := h.store.Snapshot()
+		if cfg.AllowLocalhostNoAuth && requestIsTrustedNoAuth(r, cfg) {
+			next.ServeHTTP(w, r)
 			return
 		}
 		if !h.isAuthenticated(r) {
@@ -705,7 +603,17 @@ func (h *AdminHandler) requireAdminPage(next http.Handler) http.Handler {
 
 func (h *AdminHandler) requireAdminAPI(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.adminSetupRequired() {
+		cfg := h.store.Snapshot()
+		if cfg.AllowLocalhostNoAuth && requestIsTrustedNoAuth(r, cfg) {
+			identity := tokenAuthIdentity{
+				Role:    config.TokenRoleAdmin,
+				IsAdmin: true,
+			}
+			ctx := context.WithValue(r.Context(), adminAuthContextKey{}, identity)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+		if !config.HasAdminToken(cfg.IncomingTokens) {
 			http.Error(w, "admin setup required", http.StatusServiceUnavailable)
 			return
 		}
@@ -730,7 +638,17 @@ func (h *AdminHandler) requireTokenRole(allowedRoles ...string) func(http.Handle
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if h.adminSetupRequired() {
+			cfg := h.store.Snapshot()
+			if cfg.AllowLocalhostNoAuth && requestIsTrustedNoAuth(r, cfg) {
+				identity := tokenAuthIdentity{
+					Role:    config.TokenRoleAdmin,
+					IsAdmin: true,
+				}
+				ctx := context.WithValue(r.Context(), adminAuthContextKey{}, identity)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+			if !config.HasAdminToken(cfg.IncomingTokens) {
 				http.Error(w, "admin setup required", http.StatusServiceUnavailable)
 				return
 			}
