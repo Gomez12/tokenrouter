@@ -1,119 +1,147 @@
-# tokenrouter
+# TokenRouter
 
-OpenAI API-compatible proxy server in Go.
+<p align="center">
+  <strong>One OpenAI-compatible endpoint for all your AI providers.</strong><br/>
+  Route, secure, and observe every request from one control plane.
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/lkarlslund/tokenrouter/actions/workflows/rolling-release.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/lkarlslund/tokenrouter/rolling-release.yml?branch=master&label=build"></a>
+  <a href="https://github.com/lkarlslund/tokenrouter/releases"><img alt="Release" src="https://img.shields.io/github/v/release/lkarlslund/tokenrouter?display_name=tag"></a>
+  <a href="https://github.com/lkarlslund/tokenrouter/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/lkarlslund/tokenrouter/total"></a>
+  <a href="https://goreportcard.com/report/github.com/lkarlslund/tokenrouter"><img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/lkarlslund/tokenrouter"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/lkarlslund/tokenrouter"></a>
+  <a href="https://github.com/lkarlslund/tokenrouter/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/lkarlslund/tokenrouter?style=social"></a>
+</p>
 
-- OpenAI-compatible endpoints:
-  - `GET /v1/models`
-  - `POST /v1/chat/completions`
-  - `POST /v1/completions`
-  - `POST /v1/embeddings`
-  - `POST /v1/responses`
-- Incoming bearer-key authentication.
-- Multiple upstream providers with per-provider API keys.
-- Dynamic model aggregation across providers.
-- Model routing via `provider/model` syntax.
-- Admin interface (`/admin`) with Alpine.js:
-  - Usage stats (tokens, latency, token/s)
-  - Provider CRUD
-  - Model refresh action
-  - Embedded popular-provider presets
-  - Add-provider modal with preset dropdown, `Test`, and `Save`
-  - Provider pricing cache indicators (`Priced`, `Pricing Updated`)
-- Optional automatic Let's Encrypt TLS via ACME.
-- Wizard configuration via Cobra `config` command.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/admin-dashboard-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/admin-dashboard.png">
+  <img src="docs/images/admin-dashboard.png" alt="TokenRouter admin dashboard" width="50%" align="right">
+</picture>
 
-## Layout
+## Why TokenRouter
 
-- CLI commands: `cmd/`
-- All packages: `pkg/`
+TokenRouter helps you stop hardcoding provider-specific endpoints and keys across tools and apps.
 
-## Quick start
+- Use one `/v1` endpoint with OpenAI-compatible clients.
+- Plug in multiple providers and route by `provider/model`.
+- Simplify provider setup with built-in presets and provider connection tests.
+- Control access with admin/keymaster/inferrer roles.
+- Issue temporary subordinate tokens for tools like Codex and Opencode.
+- Set request/token quotas and auto-clean expired or depleted keys.
+- Track usage, quotas, conversations, and logs in a built-in admin UI.
 
-1. Run server wizard:
+## Core Capabilities
+
+- OpenAI-compatible API surface for chat, completions, embeddings, model listing, and responses.
+- Multi-provider aggregation and model discovery.
+- Provider-aware routing with `provider/model` model IDs.
+- Optional auto-enable for public free-model providers.
+- Access token hierarchy (`admin`, `keymaster`, `inferrer`).
+- Token expiry + quota enforcement (requests and tokens).
+- Persistent usage analytics (latency, TPS, per-provider/model/key/IP).
+- Provider quota inspection and alerts.
+- Conversations and request log viewer.
+- TLS modes: Let's Encrypt, self-signed, or PEM.
+
+## Quick Start
+
+### 1) Configure server
 
 ```bash
-go run ./cmd/torod config
+torod config
 ```
 
-2. Start proxy:
+### 2) Start server
 
 ```bash
-go run ./cmd/torod serve
+torod serve
 ```
 
-If the server config does not exist yet, `serve` starts a first-time TUI wizard and asks whether TLS should be enabled (`Let's Encrypt`) or disabled (plain HTTP).
+If config does not exist, `serve` launches first-time setup automatically.
 
-3. Open admin UI:
+### 3) Open admin UI
 
 ```text
 http://127.0.0.1:8080/admin
 ```
 
-You will be redirected to `/admin/login` and can sign in with an `incoming_tokens` entry with role `admin`.
-On first run, if no admin token exists, the server routes you to `/admin/setup` to create one before login is available.
+On first run, TokenRouter sends you to `/admin/setup` to create an admin key.
 
-## Dev auto-restart
+## Use One Endpoint Everywhere
 
-Use the watcher script to rebuild and restart automatically when code changes, only if the build succeeds:
-
-```bash
-./dev-restart.sh
-```
-
-Pass through `serve` args if needed:
+Point any OpenAI-compatible client to TokenRouter:
 
 ```bash
-./dev-restart.sh serve --config ~/.config/tokenrouter/torod.toml
+export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
+export OPENAI_API_KEY="<tokenrouter_incoming_token>"
 ```
 
-## CI/CD
+Route directly to a provider/model:
 
-- Every push to `master` also triggers a rolling release workflow.
-  - Rolling tag format: `b<commit_count>` (example: `b742`)
-  - Push-triggered rolling releases are rate-limited to one every 6 hours.
-  - A daily scheduled run ensures a rolling release still happens at least once per day when new commits are present.
-  - Rolling release assets include:
-    - Windows/macOS/Linux binary archives
-    - Linux packages: `deb`, `rpm`, `archlinux`
-- Rolling release notes include a generated change summary from commits since the previous rolling tag.
+```json
+{
+  "model": "groq/llama-3.3-70b-versatile",
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
 
-## Config paths
+Routing behavior:
 
-- Server config: `~/.config/tokenrouter/torod.toml`
-- Toro client config: `~/.config/tokenrouter/toro.toml`
+- If model is `provider/model`, that provider is used.
+- If model is unprefixed, `default_provider` is used when configured.
+- Otherwise, TokenRouter falls back to the first enabled provider.
 
-## Toro client CLI
+## Temporary Keys for Real Workflows
 
-Configure client-side remote server URL + API key:
+Use `toro` to create short-lived subordinate keys and run tools safely:
 
 ```bash
-go run ./cmd/toro config
+toro connect
+toro --ttl 8h --name "Codex session" codex
+toro --ttl 8h --name "Opencode session" opencode
+toro --ttl 8h --name "My script run" wrap -- my-command
 ```
 
-## Routing behavior
+Why this matters:
 
-- Preferred: set model as `provider_name/upstream_model`.
-- If model has no prefix, proxy uses `default_provider` when set.
-- Otherwise, proxy falls back to the first enabled provider.
+- Keep your long-lived parent key out of day-to-day tool sessions.
+- Give each tool run its own temporary key identity.
+- Attribute usage by token name in the dashboard.
 
-## Embedded assets
+## Admin UI
 
-- Shared embedded asset filesystem lives under `pkg/assets/files/`.
-- HTML templates: `pkg/assets/files/templates/*.html`
-- Popular providers JSON: `pkg/assets/files/popular-providers.json`
-- Admin API endpoint for presets: `GET /admin/api/providers/popular`
-- Admin API endpoint for connection test: `POST /admin/api/providers/test`
-- Admin API endpoints for pricing cache:
-  - `GET /admin/api/pricing`
-  - `POST /admin/api/pricing/refresh`
+The admin panel at `/admin` includes:
 
-## Pricing Cache
+- `Status`: live usage stats, latency, token throughput, provider/model breakdowns.
+- `Quota`: provider quota visibility and alerting.
+- `Providers`: add/edit/test providers and refresh models.
+- `Access`: manage keys, roles, expiry, and quotas.
+- `Network`: listener and TLS controls.
+- `Models`: aggregated model catalog across providers.
+- `Conversations`: inspect stored conversations.
+- `Log`: searchable operational logs.
 
-- Local cache path: `~/.cache/tokenrouter/pricing-cache.json`
-- Pricing data is fetched from provider `/v1/models` metadata when available.
-- Pricing fetch is pluggable (`pkg/pricing`), with provider-specific sources.
-- Current provider-specific source: OpenCode Zen pricing parsed from `https://opencode.ai/docs/zen/`.
-- Refresh runs in the background every 30 minutes once pricing is first requested.
-- Provider-level `last_update` and pricing entries are persisted in the cache file.
+## Install
+
+### From source
+
+```bash
+go install github.com/lkarlslund/tokenrouter/cmd/torod@latest
+go install github.com/lkarlslund/tokenrouter/cmd/toro@latest
+```
+
+### Prebuilt binaries
+
+Download rolling release artifacts from:
+
+- <https://github.com/lkarlslund/tokenrouter/releases>
+
+Releases include `torod` and `toro` for Linux/macOS/Windows, plus Linux packages (`deb`, `rpm`, `archlinux`).
+
+## Author
+
+- **Lars Karlsen**  
+  GitHub: [@lkarlslund](https://github.com/lkarlslund)  
+  Issues/feedback: [GitHub Issues](https://github.com/lkarlslund/tokenrouter/issues)
