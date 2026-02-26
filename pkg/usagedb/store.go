@@ -21,8 +21,8 @@ const (
 	defaultRawRetention      = 7 * 24 * time.Hour
 	defaultRollup5Retention  = 30 * 24 * time.Hour
 	defaultRollup1hRetention = 365 * 24 * time.Hour
-	defaultSegmentMaxBytes   = int64(4 << 20)
-	defaultSegmentMaxAge     = 15 * time.Minute
+	defaultSegmentMaxBytes   = int64(0)
+	defaultSegmentMaxAge     = 6 * time.Hour
 	usageBucketSize          = 5 * time.Minute
 	maxSummaryTPS            = 2000.0
 )
@@ -600,12 +600,9 @@ func (w *segmentWriter) writeLine(line []byte, ts time.Time) error {
 	return nil
 }
 
-func (w *segmentWriter) shouldRotate(maxBytes int64, maxAge time.Duration) bool {
+func (w *segmentWriter) shouldRotate(_ int64, maxAge time.Duration) bool {
 	if w == nil {
 		return false
-	}
-	if maxBytes > 0 && w.bytesIn >= maxBytes {
-		return true
 	}
 	if maxAge > 0 && time.Since(w.openedAt) >= maxAge {
 		return true
