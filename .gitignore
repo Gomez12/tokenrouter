@@ -8,8 +8,8 @@ dist/
 *.dylib
 *.test
 *.out
-toro
-torod
+/toro
+/torod
 coverage.out
 *.coverprofile
 
