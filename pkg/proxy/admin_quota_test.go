@@ -1218,6 +1218,49 @@ func TestReadCerebrasQuotaFallsBackToTinyChatForHeaders(t *testing.T) {
 	}
 }
 
+func TestReadCerebrasQuotaFiltersBrokenOneHourMetrics(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("x-ratelimit-limit-requests-1h", "1000")
+		w.Header().Set("x-ratelimit-remaining-requests-1h", "0")
+		w.Header().Set("x-ratelimit-reset-requests-1h", "30")
+		w.Header().Set("x-ratelimit-limit-requests-hour", "1000")
+		w.Header().Set("x-ratelimit-remaining-requests-hour", "0")
+		w.Header().Set("x-ratelimit-reset-requests-hour", "30")
+		w.Header().Set("x-ratelimit-limit-requests-day", "50000")
+		w.Header().Set("x-ratelimit-remaining-requests-day", "49000")
+		w.Header().Set("x-ratelimit-reset-requests-day", "3600")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"llama-3.3-70b"}]}`))
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:    "cerebras-main",
+		BaseURL: srv.URL + "/v1",
+		APIKey:  "csk-test",
+	}
+	snap := h.readCerebrasQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "cerebras",
+		Reader:       "cerebras_headers",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if len(snap.Metrics) != 1 {
+		t.Fatalf("expected only non-1h metrics, got %d (%+v)", len(snap.Metrics), snap.Metrics)
+	}
+	if snap.Metrics[0].Window != "1d" {
+		t.Fatalf("expected 1d metric to remain, got %+v", snap.Metrics[0])
+	}
+}
+
 func TestRecordQuotaFromResponseUpdatesCacheForHeaderReaders(t *testing.T) {
 	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
 	p := config.ProviderConfig{
@@ -1294,6 +1337,58 @@ func TestComputeProviderQuotaAndStorePreservesLastGoodSnapshotOnRefreshError(t *
 	}
 	if cached.Snapshot.Status != "ok" || cached.Snapshot.LeftPercent != 88 {
 		t.Fatalf("expected preserved cached snapshot, got %+v", cached.Snapshot)
+	}
+}
+
+func TestQuotaCachePersistenceRoundTrip(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "admin-quota-cache.json")
+	now := time.Now().UTC()
+
+	h := &AdminHandler{
+		quotaCache:     cache.NewTTLMap[string, quotaCacheValue](),
+		quotaCachePath: cachePath,
+	}
+	h.quotaCache.SetWithExpiry("groq-main", quotaCacheValue{
+		Snapshot: ProviderQuotaSnapshot{
+			Provider:     "groq-main",
+			ProviderType: "groq",
+			DisplayName:  "Groq",
+			Reader:       "groq_headers",
+			Status:       "ok",
+			CheckedAt:    now.Format(time.RFC3339),
+			LeftPercent:  80,
+		},
+		LastGood: ProviderQuotaSnapshot{
+			Provider:    "groq-main",
+			Status:      "ok",
+			CheckedAt:   now.Format(time.RFC3339),
+			LeftPercent: 80,
+		},
+		Refreshing: true,
+	}, now.Add(10*time.Minute))
+	h.persistQuotaCacheToDisk()
+
+	h2 := &AdminHandler{
+		quotaCache:     cache.NewTTLMap[string, quotaCacheValue](),
+		quotaCachePath: cachePath,
+	}
+	h2.loadQuotaCacheFromDisk()
+
+	got, exp, ok := h2.quotaCache.Get("groq-main")
+	if !ok {
+		t.Fatal("expected persisted quota cache entry after reload")
+	}
+	if got.Refreshing {
+		t.Fatal("expected persisted entry to reload as non-refreshing")
+	}
+	if strings.TrimSpace(got.Snapshot.Status) != "ok" {
+		t.Fatalf("expected snapshot status ok, got %+v", got.Snapshot)
+	}
+	if got.Snapshot.LeftPercent != 80 {
+		t.Fatalf("expected left_percent 80, got %+v", got.Snapshot)
+	}
+	if exp.IsZero() {
+		t.Fatal("expected expiry to be persisted and restored")
 	}
 }
 

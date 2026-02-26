@@ -55,6 +55,7 @@ function adminApp() {
     tlsActionInProgress: false,
     statsSummaryHtml: '',
     quotaSummaryHtml: '',
+    lastGoodQuotaByProvider: {},
     quotaSearch: '',
     statsRangeHours: '8',
     statusUpdateSpeed: 'realtime',
@@ -1217,10 +1218,13 @@ function adminApp() {
           '<div class="col-lg-6"><div class="border rounded p-3 bg-body placeholder-glow"><span class="placeholder col-4"></span><span class="placeholder col-12"></span><span class="placeholder col-10"></span><span class="placeholder col-11"></span></div></div>' +
           '<div class="col-lg-6"><div class="border rounded p-3 bg-body placeholder-glow"><span class="placeholder col-4"></span><span class="placeholder col-12"></span><span class="placeholder col-10"></span><span class="placeholder col-11"></span></div></div>' +
         '</div>';
-      this.quotaSummaryHtml = '<div class="small text-body-secondary">Loading quota...</div>';
+      if (!String(this.quotaSummaryHtml || '').trim()) {
+        this.quotaSummaryHtml = '<div class="small text-body-secondary">Loading quota...</div>';
+      }
+      const quotaMap = this.quotaMapWithFallback(s.provider_quotas || {});
       setTimeout(() => {
         if (renderToken !== this.statsRenderToken) return;
-        this.quotaSummaryHtml = this.renderQuotaPanel(s.provider_quotas || {});
+        this.quotaSummaryHtml = this.renderQuotaPanel(quotaMap);
         this.renderUsageTimelineChart(buckets, groupField);
       }, 0);
       setTimeout(() => {
@@ -1268,6 +1272,24 @@ function adminApp() {
       const chart = this.renderQuotaChart(quotaMap || {});
       if (!chart) return '<div class="small text-body-secondary">No quota data.</div>';
       return chart;
+    },
+    quotaMapWithFallback(quotaMap) {
+      const input = (quotaMap && typeof quotaMap === 'object') ? quotaMap : {};
+      const out = {};
+      Object.entries(input).forEach(([provider, snap]) => {
+        const cur = (snap && typeof snap === 'object') ? snap : {};
+        const status = String(cur.status || '').trim().toLowerCase();
+        const prev = this.lastGoodQuotaByProvider[provider];
+        if (status === 'loading' && prev && String(prev.status || '').trim().toLowerCase() === 'ok') {
+          out[provider] = prev;
+          return;
+        }
+        out[provider] = cur;
+        if (status === 'ok') {
+          this.lastGoodQuotaByProvider[provider] = cur;
+        }
+      });
+      return out;
     },
     quotaValueText(v) {
       const n = Number(v);
@@ -1521,14 +1543,14 @@ function adminApp() {
         if (String(g.status || '').toLowerCase() !== 'ok') {
           const statusNorm = String(g.status || '').trim().toLowerCase();
           const isLoading = statusNorm === 'loading';
-          const rawMsg = String(g.error || g.status || (isLoading ? 'loading' : 'quota unavailable'));
+          const rawMsg = String(g.error || '').trim();
           const msg = this.escapeHtml(rawMsg);
           const statusLabel = isLoading ? 'Loading quota...' : 'Quota unavailable';
           const msgClass = isLoading ? 'small text-body-secondary mt-1' : 'small text-danger mt-1';
           return '<div class="border rounded p-2 bg-body">' +
             '<div class="fw-semibold small mb-2" title="' + this.escapeHtml(g.name || 'quota') + '" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + this.escapeHtml(g.name || 'quota') + '</div>' +
             '<div class="small text-body-secondary">' + this.escapeHtml(statusLabel) + '</div>' +
-            '<div class="' + msgClass + '">' + msg + '</div>' +
+            (msg ? ('<div class="' + msgClass + '">' + msg + '</div>') : '') +
           '</div>';
         }
         const ringColorFromUsed = (used) => (used >= 90 ? '#dc3545' : (used >= 70 ? '#fd7e14' : '#198754'));

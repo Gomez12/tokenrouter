@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"mime"
 	"net"
@@ -60,6 +61,9 @@ type AdminHandler struct {
 	oauthSrvAddr          string
 	quotaMu               sync.Mutex
 	quotaCache            *cache.TTLMap[string, quotaCacheValue]
+	quotaCachePath        string
+	quotaPersistMu        sync.Mutex
+	quotaPersistPending   bool
 	statsCache            *cache.TTLMap[int64, StatsSummary]
 	wsMu                  sync.Mutex
 	wsClients             map[*adminWSClient]struct{}
@@ -118,6 +122,7 @@ const quotaRefreshError = 30 * time.Second
 const statsRefreshInterval = 15 * time.Minute
 const adminWSCheckInterval = 1 * time.Second
 const adminWSRealtimeIdleRefresh = 5 * time.Minute
+const quotaPersistDebounce = 250 * time.Millisecond
 
 type modelListResponse struct {
 	Data []struct {
@@ -133,7 +138,18 @@ type conversationRecordView struct {
 	ResponsePreviousMarkdown string `json:"response_previous_markdown,omitempty"`
 }
 
+type persistedQuotaCacheFile struct {
+	SavedAt string                              `json:"saved_at,omitempty"`
+	Entries map[string]persistedQuotaCacheEntry `json:"entries,omitempty"`
+}
+
+type persistedQuotaCacheEntry struct {
+	Value     quotaCacheValue `json:"value"`
+	ExpiresAt string          `json:"expires_at,omitempty"`
+}
+
 func NewAdminHandler(store *config.ServerConfigStore, stats *StatsStore, resolver *ProviderResolver, pricingMgr *pricing.Manager, healthChecker *ProviderHealthChecker, instanceID string) *AdminHandler {
+	quotaCachePath := quotaCachePathForStore(store)
 	h := &AdminHandler{
 		store:         store,
 		stats:         stats,
@@ -144,12 +160,28 @@ func NewAdminHandler(store *config.ServerConfigStore, stats *StatsStore, resolve
 		oauthPending:  map[string]*oauthSession{},
 		oauthSrvAddr:  "127.0.0.1:1455",
 		quotaCache:    cache.NewTTLMap[string, quotaCacheValue](),
+		quotaCachePath: quotaCachePath,
 		statsCache:    cache.NewTTLMap[int64, StatsSummary](),
 		wsClients:     map[*adminWSClient]struct{}{},
 		networkSwitch: map[string]pendingNetworkSwitch{},
 	}
+	h.loadQuotaCacheFromDisk()
 	go h.runWSScheduler()
 	return h
+}
+
+func quotaCachePathForStore(store *config.ServerConfigStore) string {
+	cacheDir := filepath.Dir(config.DefaultUsageStatsPath())
+	storePath := ""
+	if store != nil {
+		storePath = strings.TrimSpace(store.Path())
+	}
+	if storePath == "" {
+		return filepath.Join(cacheDir, "admin-quota-cache.json")
+	}
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(filepath.Clean(storePath)))
+	return filepath.Join(cacheDir, fmt.Sprintf("admin-quota-cache-%08x.json", hasher.Sum32()))
 }
 
 func (h *AdminHandler) SetNetworkListenerControl(add func(string) error, remove func(string) error, list func() []string) {
@@ -892,6 +924,110 @@ func providerBaseURLOrPreset(p config.ProviderConfig, preset assets.PopularProvi
 	return strings.TrimRight(strings.TrimSpace(preset.BaseURL), "/")
 }
 
+func (h *AdminHandler) loadQuotaCacheFromDisk() {
+	if h == nil || strings.TrimSpace(h.quotaCachePath) == "" || h.quotaCache == nil {
+		return
+	}
+	var persisted persistedQuotaCacheFile
+	if err := cache.LoadJSON(h.quotaCachePath, &persisted); err != nil {
+		if !errors.Is(err, cache.ErrNotFound) {
+			log.Warn("failed to load admin quota cache", "path", h.quotaCachePath, "err", err)
+		}
+		return
+	}
+	now := time.Now().UTC()
+	for provider, entry := range persisted.Entries {
+		name := strings.TrimSpace(provider)
+		if name == "" {
+			continue
+		}
+		val := entry.Value
+		val.Refreshing = false
+		if val.Snapshot.Provider == "" {
+			continue
+		}
+		if val.LastGood.Provider == "" && strings.EqualFold(strings.TrimSpace(val.Snapshot.Status), "ok") {
+			val.LastGood = val.Snapshot
+		}
+		expiresAt := now
+		if ts := strings.TrimSpace(entry.ExpiresAt); ts != "" {
+			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+				expiresAt = parsed.UTC()
+			}
+		}
+		h.quotaCache.SetWithExpiry(name, val, expiresAt)
+	}
+}
+
+func (h *AdminHandler) persistQuotaCacheToDisk() {
+	if h == nil || strings.TrimSpace(h.quotaCachePath) == "" || h.quotaCache == nil {
+		return
+	}
+	entries := h.quotaCache.Entries()
+	out := persistedQuotaCacheFile{
+		SavedAt: time.Now().UTC().Format(time.RFC3339),
+		Entries: make(map[string]persistedQuotaCacheEntry, len(entries)),
+	}
+	for provider, entry := range entries {
+		name := strings.TrimSpace(provider)
+		if name == "" {
+			continue
+		}
+		val := entry.Value
+		val.Refreshing = false
+		if val.Snapshot.Provider == "" {
+			continue
+		}
+		persisted := persistedQuotaCacheEntry{Value: val}
+		if !entry.ExpiresAt.IsZero() {
+			persisted.ExpiresAt = entry.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		out.Entries[name] = persisted
+	}
+	if len(out.Entries) == 0 {
+		return
+	}
+	if err := cache.SaveJSON(h.quotaCachePath, out); err != nil {
+		log.Warn("failed to persist admin quota cache", "path", h.quotaCachePath, "err", err)
+	}
+}
+
+func (h *AdminHandler) scheduleQuotaCachePersist() {
+	if h == nil || strings.TrimSpace(h.quotaCachePath) == "" {
+		return
+	}
+	h.quotaPersistMu.Lock()
+	if h.quotaPersistPending {
+		h.quotaPersistMu.Unlock()
+		return
+	}
+	h.quotaPersistPending = true
+	h.quotaPersistMu.Unlock()
+	go func() {
+		time.Sleep(quotaPersistDebounce)
+		h.persistQuotaCacheToDisk()
+		h.quotaPersistMu.Lock()
+		h.quotaPersistPending = false
+		h.quotaPersistMu.Unlock()
+	}()
+}
+
+func (h *AdminHandler) setQuotaCacheWithExpiry(provider string, val quotaCacheValue, expiresAt time.Time) {
+	if h == nil || h.quotaCache == nil {
+		return
+	}
+	h.quotaCache.SetWithExpiry(provider, val, expiresAt)
+	h.scheduleQuotaCachePersist()
+}
+
+func (h *AdminHandler) setQuotaCacheWithTTL(provider string, val quotaCacheValue, now time.Time, ttl time.Duration) {
+	if h == nil || h.quotaCache == nil {
+		return
+	}
+	h.quotaCache.SetWithTTL(provider, val, now, ttl)
+	h.scheduleQuotaCachePersist()
+}
+
 func quotaProbeModelCandidates(preset assets.PopularProvider, modelsBody []byte, fallbacks ...string) []string {
 	allFallbacks := make([]string, 0, len(preset.QuotaProbeModels)+len(fallbacks))
 	for _, id := range preset.QuotaProbeModels {
@@ -1216,7 +1352,7 @@ func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.Pro
 		// refreshing long after expiry, allow a fresh background refresh.
 		if val.Refreshing && !expiry.IsZero() && !now.Before(expiry.Add(refreshStaleGrace)) {
 			val.Refreshing = false
-			h.quotaCache.SetWithExpiry(p.Name, val, expiry)
+			h.setQuotaCacheWithExpiry(p.Name, val, expiry)
 		}
 		snap := val.Snapshot
 		if snap.Provider == "" {
@@ -1227,7 +1363,7 @@ func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.Pro
 		}
 		if !val.Refreshing && !expiry.IsZero() && !now.Before(expiry) {
 			val.Refreshing = true
-			h.quotaCache.SetWithExpiry(p.Name, val, expiry)
+			h.setQuotaCacheWithExpiry(p.Name, val, expiry)
 			go h.refreshProviderQuota(p, preset)
 		}
 		h.quotaMu.Unlock()
@@ -1236,7 +1372,7 @@ func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.Pro
 	snap := newProviderQuotaSnapshot(now, p, preset, reader)
 	snap.Status = "loading"
 	snap.Error = ""
-	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
+	h.setQuotaCacheWithTTL(p.Name, quotaCacheValue{
 		Snapshot:   snap,
 		LastGood:   ProviderQuotaSnapshot{},
 		Refreshing: true,
@@ -1280,7 +1416,7 @@ func (h *AdminHandler) refreshProviderQuota(p config.ProviderConfig, preset asse
 			if lastGood.Provider != "" {
 				storeSnap = lastGood
 			}
-			h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
+			h.setQuotaCacheWithTTL(p.Name, quotaCacheValue{
 				Snapshot:   storeSnap,
 				LastGood:   lastGood,
 				Refreshing: false,
@@ -1322,7 +1458,7 @@ func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, pre
 		nextDelay = quotaRefreshOK
 	}
 	h.quotaMu.Lock()
-	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
+	h.setQuotaCacheWithTTL(p.Name, quotaCacheValue{
 		Snapshot:   storeSnap,
 		LastGood:   lastGood,
 		Refreshing: false,
@@ -1366,7 +1502,7 @@ func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header h
 		metrics = huggingFaceMetricsFromHeaders(header)
 		snap.PlanType = "huggingface"
 	case "cerebras_headers":
-		metrics = rateLimitMetricsFromHeaders(header, "cerebras", mistralFeatureWindowFromSuffix)
+		metrics = cerebrasMetricsFromHeaders(header)
 		snap.PlanType = "cerebras"
 	default:
 		metrics = autoQuotaMetricsFromHeaders(header)
@@ -1400,7 +1536,7 @@ func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header h
 	snap.LeftPercent = best.LeftPercent
 	snap.ResetAt = best.ResetAt
 	h.quotaMu.Lock()
-	h.quotaCache.SetWithTTL(p.Name, quotaCacheValue{
+	h.setQuotaCacheWithTTL(p.Name, quotaCacheValue{
 		Snapshot:   snap,
 		LastGood:   snap,
 		Refreshing: false,
@@ -2063,7 +2199,7 @@ func (h *AdminHandler) readCerebrasQuota(ctx context.Context, p config.ProviderC
 		return snap
 	}
 
-	metrics := rateLimitMetricsFromHeaders(resp.Header, "cerebras", mistralFeatureWindowFromSuffix)
+	metrics := cerebrasMetricsFromHeaders(resp.Header)
 	if len(metrics) == 0 {
 		chatMetrics, chatErr := h.readCerebrasQuotaFromTinyChat(ctx, p, preset, baseURL, token, body)
 		if chatErr == nil && len(chatMetrics) > 0 {
@@ -2102,7 +2238,7 @@ func (h *AdminHandler) readCerebrasQuotaFromTinyChat(ctx context.Context, p conf
 	}
 	defer resp.Body.Close()
 	_, _ = io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-	return rateLimitMetricsFromHeaders(resp.Header, "cerebras", mistralFeatureWindowFromSuffix), nil
+	return cerebrasMetricsFromHeaders(resp.Header), nil
 }
 
 func (h *AdminHandler) readMistralQuotaFromTinyChat(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider, baseURL string, token string, modelsBody []byte) ([]ProviderQuotaMetric, error) {
@@ -2441,6 +2577,27 @@ func rateLimitMetricsFromHeaders(h http.Header, keyPrefix string, classifySuffix
 		return metrics[i].Window < metrics[j].Window
 	})
 	return metrics
+}
+
+func cerebrasMetricsFromHeaders(h http.Header) []ProviderQuotaMetric {
+	raw := rateLimitMetricsFromHeaders(h, "cerebras", mistralFeatureWindowFromSuffix)
+	if len(raw) == 0 {
+		return raw
+	}
+	// Temporary workaround: Cerebras 1h buckets consistently report depleted quota.
+	filtered := make([]ProviderQuotaMetric, 0, len(raw))
+	for _, m := range raw {
+		window := strings.ToLower(strings.TrimSpace(m.Window))
+		if m.WindowSeconds == 3600 ||
+			window == "1h" ||
+			window == "hour" ||
+			strings.Contains(window, "/1h") ||
+			strings.Contains(window, "/hour") {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	return filtered
 }
 
 func rateLimitStructuredMetricsFromHeaders(h http.Header, keyPrefix string) []ProviderQuotaMetric {

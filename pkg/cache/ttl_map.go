@@ -10,6 +10,11 @@ type item[V any] struct {
 	ExpiresAt time.Time
 }
 
+type Entry[V any] struct {
+	Value     V
+	ExpiresAt time.Time
+}
+
 type TTLMap[K comparable, V any] struct {
 	mu    sync.RWMutex
 	items map[K]item[V]
@@ -69,4 +74,20 @@ func (m *TTLMap[K, V]) Delete(key K) {
 	m.mu.Lock()
 	delete(m.items, key)
 	m.mu.Unlock()
+}
+
+func (m *TTLMap[K, V]) Entries() map[K]Entry[V] {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[K]Entry[V], len(m.items))
+	for k, it := range m.items {
+		out[k] = Entry[V]{
+			Value:     it.Value,
+			ExpiresAt: it.ExpiresAt,
+		}
+	}
+	return out
 }

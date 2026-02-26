@@ -600,6 +600,12 @@ func NewServerConfigStore(path string, cfg *ServerConfig) *ServerConfigStore {
 	return &ServerConfigStore{path: path, cfg: cfg}
 }
 
+func (s *ServerConfigStore) Path() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.path
+}
+
 func (s *ServerConfigStore) Snapshot() ServerConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
