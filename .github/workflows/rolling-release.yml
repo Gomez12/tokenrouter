@@ -131,6 +131,32 @@ jobs:
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --skip=validate --config .goreleaser.rolling.yml
+          args: release --clean --skip=validate --skip=publish --config .goreleaser.rolling.yml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish GitHub release
+        if: steps.gate.outputs.run_release == 'true' && steps.release-check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/*.pkg.tar.zst dist/checksums.txt)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No artifacts found in dist/"
+            exit 1
+          fi
+          gh release create "${TAG}" "${files[@]}" \
+            --title "${TAG}" \
+            --notes "Rolling release ${TAG}"
+
+      - name: Rollback partial release on failure
+        if: failure() && steps.gate.outputs.run_release == 'true' && steps.release-check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release delete "${TAG}" --yes
+          fi
