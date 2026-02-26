@@ -45,6 +45,7 @@ type Store struct {
 	path     string
 	settings Settings
 	entries  []Entry
+	onAppend func()
 
 	dirty    bool
 	lastSave time.Time
@@ -105,7 +106,6 @@ func (s *Store) Add(level, message string, ts time.Time) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.entries = append(s.entries, Entry{
 		ID:        fmt.Sprintf("log-%d-%d", ts.UnixNano(), len(s.entries)+1),
 		Timestamp: ts,
@@ -115,6 +115,11 @@ func (s *Store) Add(level, message string, ts time.Time) {
 	s.pruneLocked()
 	s.dirty = true
 	s.saveLocked(false)
+	onAppend := s.onAppend
+	s.mu.Unlock()
+	if onAppend != nil {
+		onAppend()
+	}
 }
 
 func (s *Store) List(filter ListFilter) []Entry {
@@ -270,6 +275,12 @@ func (s *Store) Clear() {
 
 func (s *Store) Writer() io.Writer {
 	return &Sink{store: s}
+}
+
+func (s *Store) SetOnAppend(fn func()) {
+	s.mu.Lock()
+	s.onAppend = fn
+	s.mu.Unlock()
 }
 
 func (w *Sink) Write(p []byte) (int, error) {

@@ -30,7 +30,7 @@ function adminApp() {
     logPagerHtml: '',
     logEntriesShownCount: 0,
     logEntriesTotalCount: 0,
-    logLevelFilter: 'all',
+    logLevelFilter: 'trace',
     logSearch: '',
     logDebounceTimer: null,
     logMaxLines: 5000,
@@ -689,19 +689,24 @@ function adminApp() {
     restoreLogLevelFilter() {
       try {
         const raw = String(window.localStorage.getItem(this.logLevelFilterCacheKey) || '').trim().toLowerCase();
-        if (raw === 'all' || raw === 'trace' || raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error' || raw === 'fatal') {
+        if (raw === 'all') {
+          this.logLevelFilter = 'trace';
+          this.persistLogLevelFilter();
+          return;
+        }
+        if (raw === 'trace' || raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error' || raw === 'fatal') {
           this.logLevelFilter = raw;
         }
       } catch (_) {}
     },
     persistLogLevelFilter() {
       try {
-        window.localStorage.setItem(this.logLevelFilterCacheKey, String(this.logLevelFilter || 'all'));
+        window.localStorage.setItem(this.logLevelFilterCacheKey, String(this.logLevelFilter || 'trace'));
       } catch (_) {}
     },
     setLogLevelFilter(v) {
       const raw = String(v || '').trim().toLowerCase();
-      if (raw !== 'all' && raw !== 'trace' && raw !== 'debug' && raw !== 'info' && raw !== 'warn' && raw !== 'error' && raw !== 'fatal') return;
+      if (raw !== 'trace' && raw !== 'debug' && raw !== 'info' && raw !== 'warn' && raw !== 'error' && raw !== 'fatal') return;
       this.logLevelFilter = raw;
       this.persistLogLevelFilter();
       this.logsPage = 1;
@@ -3069,9 +3074,9 @@ function adminApp() {
     },
     async loadLogs() {
       const params = new URLSearchParams();
-      const level = String(this.logLevelFilter || 'all').trim().toLowerCase();
+      const level = String(this.logLevelFilter || 'trace').trim().toLowerCase();
       const query = String(this.logSearch || '').trim();
-      if (level && level !== 'all') params.set('level', level);
+      if (level) params.set('level', level);
       if (query) params.set('q', query);
       params.set('page', String(Math.max(1, Number(this.logsPage || 1))));
       params.set('page_size', String(this.logsPageSize === 0 ? 0 : this.parsePageSize(this.logsPageSize)));

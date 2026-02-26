@@ -130,29 +130,61 @@ func TestReadProviderQuotaCachedUsesTTL(t *testing.T) {
 		DisplayName:    "OpenAI",
 		QuotaReader:    "openai_codex",
 	}
-	snap1 := h.readProviderQuotaCached(context.Background(), p, preset)
+	snap1 := h.readProviderQuotaCached(context.Background(), p, preset, false)
 	if snap1.Status != "loading" && snap1.Status != "ok" {
 		t.Fatalf("expected loading/ok snapshot on first read, got %+v", snap1)
 	}
-	snap2 := h.readProviderQuotaCached(context.Background(), p, preset)
+	snap2 := h.readProviderQuotaCached(context.Background(), p, preset, false)
 	if snap2.Status != "loading" && snap2.Status != "ok" {
 		t.Fatalf("expected loading/ok snapshot on second read, got %+v", snap2)
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		snap := h.readProviderQuotaCached(context.Background(), p, preset)
+		snap := h.readProviderQuotaCached(context.Background(), p, preset, false)
 		if snap.Status == "ok" {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	final := h.readProviderQuotaCached(context.Background(), p, preset)
+	final := h.readProviderQuotaCached(context.Background(), p, preset, false)
 	if final.Status != "ok" {
 		t.Fatalf("expected eventual ok snapshot, got %+v", final)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("expected one upstream quota request due to cache, got %d", got)
+	}
+}
+
+func TestReadProviderQuotaCachedForceRefreshBypassesTTLCache(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":300,"reset_at":1735689600}}}`))
+	}))
+	defer srv.Close()
+
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:      "openai-force",
+		BaseURL:   srv.URL,
+		AuthToken: "token-abc",
+	}
+	preset := assets.PopularProvider{
+		ProviderConfig: config.ProviderConfig{Name: "openai"},
+		DisplayName:    "OpenAI",
+		QuotaReader:    "openai_codex",
+	}
+
+	if snap := h.readProviderQuotaCached(context.Background(), p, preset, true); snap.Status != "ok" {
+		t.Fatalf("expected immediate ok snapshot for forced refresh, got %+v", snap)
+	}
+	if snap := h.readProviderQuotaCached(context.Background(), p, preset, true); snap.Status != "ok" {
+		t.Fatalf("expected immediate ok snapshot for second forced refresh, got %+v", snap)
+	}
+	if got := atomic.LoadInt32(&calls); got < 2 {
+		t.Fatalf("expected forced refresh to bypass cache, got calls=%d", got)
 	}
 }
 
@@ -188,20 +220,20 @@ func TestReadProviderQuotaCachedRecoversFromStuckRefreshingLoading(t *testing.T)
 		Refreshing: true,
 	}, now.Add(-2*time.Minute))
 
-	snap := h.readProviderQuotaCached(context.Background(), p, preset)
+	snap := h.readProviderQuotaCached(context.Background(), p, preset, false)
 	if strings.TrimSpace(strings.ToLower(snap.Status)) != "loading" {
 		t.Fatalf("expected initial loading snapshot while retry starts, got %+v", snap)
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		cur := h.readProviderQuotaCached(context.Background(), p, preset)
+		cur := h.readProviderQuotaCached(context.Background(), p, preset, false)
 		if strings.TrimSpace(strings.ToLower(cur.Status)) == "ok" {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	final := h.readProviderQuotaCached(context.Background(), p, preset)
+	final := h.readProviderQuotaCached(context.Background(), p, preset, false)
 	if strings.TrimSpace(strings.ToLower(final.Status)) != "ok" {
 		t.Fatalf("expected quota refresh recovery to reach ok status, got %+v", final)
 	}

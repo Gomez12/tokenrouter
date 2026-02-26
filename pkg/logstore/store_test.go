@@ -2,6 +2,7 @@ package logstore
 
 import (
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -115,5 +116,38 @@ func TestListPageFiltersAndPaginates(t *testing.T) {
 	qRows, qTotal, _, _ := s.ListPage(ListFilter{Level: "all", Query: "gam"}, 1, 25)
 	if qTotal != 1 || len(qRows) != 1 || qRows[0].Message != "gamma" {
 		t.Fatalf("query paging mismatch: total=%d rows=%+v", qTotal, qRows)
+	}
+}
+
+func TestListLevelIncludesSelectedAndHigherSeverity(t *testing.T) {
+	s := NewStore("", Settings{MaxLines: 100})
+	s.Add("trace", "trace-msg", time.Unix(1, 0))
+	s.Add("debug", "debug-msg", time.Unix(2, 0))
+	s.Add("info", "info-msg", time.Unix(3, 0))
+	s.Add("warn", "warn-msg", time.Unix(4, 0))
+	s.Add("error", "error-msg", time.Unix(5, 0))
+	s.Add("fatal", "fatal-msg", time.Unix(6, 0))
+
+	rows, total, _, _ := s.ListPage(ListFilter{Level: "warn"}, 1, 25)
+	if total != 3 {
+		t.Fatalf("expected warn filter to include warn+error+fatal, got total=%d", total)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
+	}
+	if rows[0].Level != "fatal" || rows[1].Level != "error" || rows[2].Level != "warn" {
+		t.Fatalf("unexpected level order: %+v", rows)
+	}
+}
+
+func TestSetOnAppendCalledForAddedEntries(t *testing.T) {
+	s := NewStore("", Settings{MaxLines: 100})
+	var called int32
+	s.SetOnAppend(func() {
+		atomic.AddInt32(&called, 1)
+	})
+	s.Add("info", "hello", time.Now().UTC())
+	if got := atomic.LoadInt32(&called); got != 1 {
+		t.Fatalf("expected onAppend callback to be called once, got %d", got)
 	}
 }

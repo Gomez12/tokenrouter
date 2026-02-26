@@ -133,6 +133,9 @@ func NewServer(configPath string, cfg *config.ServerConfig) (*Server, error) {
 	adminHandler := NewAdminHandler(store, stats, resolver, pricingMgr, s.providerHealthChecker, instanceID)
 	adminHandler.conversations = s.conversations
 	adminHandler.logs = s.logs
+	if s.logs != nil {
+		s.logs.SetOnAppend(adminHandler.NotifyLogChanged)
+	}
 	s.adminHandler = adminHandler
 	adminHandler.SetAccessTokenCleanup(s.runAccessTokenCleanupOnce)
 	adminHandler.SetNetworkListenerControl(s.addHTTPListener, s.removeHTTPListener, s.listHTTPListeners)
@@ -644,7 +647,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.adminHandler != nil {
 		providers = s.adminHandler.catalogProviders()
 		quotaProviders = s.adminHandler.quotaProviders()
-		quotas = s.adminHandler.readProviderQuotas(r.Context(), quotaProviders)
+		quotas = s.adminHandler.readProviderQuotas(r.Context(), quotaProviders, false)
 	}
 	names := make([]string, 0, len(providers))
 	for _, p := range providers {

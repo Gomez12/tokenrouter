@@ -345,8 +345,17 @@
           <h2 class="h5 mb-0">Log</h2>
           <div class="d-flex flex-wrap align-items-center gap-2">
             <button class="icon-btn" title="Log settings" aria-label="Log settings" @click="openLogSettingsModal()">⚙</button>
+            <select class="form-select form-select-sm" style="width:auto;" x-model="statusUpdateSpeed" @change="setStatusUpdateSpeed($event.target.value)">
+              <option value="realtime">realtime</option>
+              <option value="2s">2s</option>
+              <option value="10s">10s</option>
+              <option value="30s">30s</option>
+              <option value="1m">1m</option>
+              <option value="5m">5m</option>
+              <option value="15m">15m</option>
+              <option value="disabled">disabled</option>
+            </select>
             <select class="form-select form-select-sm" style="width:auto;" x-model="logLevelFilter" @change="setLogLevelFilter($event.target.value)">
-              <option value="all">all</option>
               <option value="trace">trace</option>
               <option value="debug">debug</option>
               <option value="info">info</option>

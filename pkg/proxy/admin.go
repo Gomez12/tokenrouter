@@ -68,6 +68,7 @@ type AdminHandler struct {
 	wsMu                    sync.Mutex
 	wsClients               map[*adminWSClient]struct{}
 	statsNotifyAt           time.Time
+	logNotifyAt             time.Time
 	networkMu               sync.Mutex
 	networkSwitch           map[string]pendingNetworkSwitch
 	addListener             func(string) error
@@ -292,6 +293,19 @@ func (h *AdminHandler) broadcastAdminEvent(event map[string]any) {
 				client.lastRefresh = now
 			}
 		default:
+			// Coalesce bursty updates by dropping one stale queued event,
+			// then retry enqueueing the newest event.
+			select {
+			case <-client.ch:
+			default:
+			}
+			select {
+			case client.ch <- b:
+				if isRefresh {
+					client.lastRefresh = now
+				}
+			default:
+			}
 		}
 	}
 }
@@ -552,6 +566,21 @@ func (h *AdminHandler) NotifyStatsChanged() {
 	h.statsNotifyAt = now
 	h.wsMu.Unlock()
 	h.notifyAdminChanged("stats")
+}
+
+func (h *AdminHandler) NotifyLogChanged() {
+	if h == nil {
+		return
+	}
+	now := time.Now().UTC()
+	h.wsMu.Lock()
+	if !h.logNotifyAt.IsZero() && now.Sub(h.logNotifyAt) < 250*time.Millisecond {
+		h.wsMu.Unlock()
+		return
+	}
+	h.logNotifyAt = now
+	h.wsMu.Unlock()
+	h.notifyAdminChanged("log")
 }
 
 func (h *AdminHandler) notifyAdminChanged(scope string) {
@@ -830,7 +859,7 @@ func (h *AdminHandler) statsAPI(w http.ResponseWriter, r *http.Request) {
 			} else {
 				summary.ProvidersAvailable = len(names)
 			}
-			summary.ProviderQuotas = h.readProviderQuotas(r.Context(), quotaProviders)
+			summary.ProviderQuotas = h.readProviderQuotas(r.Context(), quotaProviders, false)
 			writeJSON(w, http.StatusOK, summary)
 			return
 		}
@@ -848,12 +877,12 @@ func (h *AdminHandler) statsAPI(w http.ResponseWriter, r *http.Request) {
 	} else {
 		summary.ProvidersAvailable = len(names)
 	}
-	summary.ProviderQuotas = h.readProviderQuotas(r.Context(), quotaProviders)
+	summary.ProviderQuotas = h.readProviderQuotas(r.Context(), quotaProviders, force)
 	h.statsCache.SetWithTTL(periodKey, summary, now, statsRefreshInterval)
 	writeJSON(w, http.StatusOK, summary)
 }
 
-func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []config.ProviderConfig) map[string]ProviderQuotaSnapshot {
+func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []config.ProviderConfig, forceRefresh bool) map[string]ProviderQuotaSnapshot {
 	byName, err := popularProvidersByName()
 	if err != nil {
 		return nil
@@ -875,7 +904,7 @@ func (h *AdminHandler) readProviderQuotas(ctx context.Context, providers []confi
 			out[p.Name] = snap
 			continue
 		}
-		snap := h.readProviderQuotaCached(ctx, p, preset)
+		snap := h.readProviderQuotaCached(ctx, p, preset, forceRefresh)
 		out[p.Name] = snap
 	}
 	if len(out) == 0 {
@@ -1338,7 +1367,10 @@ func parseOpenRouterResetAt(now time.Time, raw string) string {
 	}
 }
 
-func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider) ProviderQuotaSnapshot {
+func (h *AdminHandler) readProviderQuotaCached(ctx context.Context, p config.ProviderConfig, preset assets.PopularProvider, forceRefresh bool) ProviderQuotaSnapshot {
+	if forceRefresh {
+		return h.computeProviderQuotaAndStore(p, preset)
+	}
 	_ = ctx
 	now := time.Now().UTC()
 	reader := quotaReaderFromPreset(preset)
@@ -1431,6 +1463,10 @@ func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, pre
 	p = h.ensureProviderOAuthTokenFresh(ctx, p, preset)
 	now := time.Now().UTC()
 	reader := quotaReaderFromPreset(preset)
+	shouldLogRefresh := !isInlineQuotaHeaderReader(reader)
+	if shouldLogRefresh {
+		log.Info("refreshing provider quota", "provider", strings.TrimSpace(p.Name), "reader", reader)
+	}
 	snap := newProviderQuotaSnapshot(now, p, preset, reader)
 	snap = h.runQuotaReader(ctx, p, preset, snap)
 
@@ -1461,7 +1497,29 @@ func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, pre
 		Refreshing: false,
 	}, now, nextDelay)
 	h.quotaMu.Unlock()
+	if shouldLogRefresh {
+		log.Info(
+			"provider quota refresh result",
+			"provider", strings.TrimSpace(p.Name),
+			"reader", reader,
+			"status", strings.TrimSpace(snap.Status),
+			"plan", strings.TrimSpace(snap.PlanType),
+			"metrics", len(snap.Metrics),
+			"left_percent", snap.LeftPercent,
+			"reset_at", strings.TrimSpace(snap.ResetAt),
+			"error", strings.TrimSpace(snap.Error),
+		)
+	}
 	return storeSnap
+}
+
+func isInlineQuotaHeaderReader(reader string) bool {
+	switch strings.TrimSpace(strings.ToLower(reader)) {
+	case "header_auto", "groq_headers", "mistral_headers", "huggingface_headers", "cerebras_headers":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *AdminHandler) RecordQuotaFromResponse(p config.ProviderConfig, header http.Header) {
@@ -5833,7 +5891,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 	for _, p := range cfg.Providers {
 		configuredByName[p.Name] = struct{}{}
 	}
-	quotaSnapshots := h.readProviderQuotas(r.Context(), providers)
+	quotaSnapshots := h.readProviderQuotas(r.Context(), providers, false)
 	popularByType := map[string]assets.PopularProvider{}
 	if popular, err := getPopularProviders(); err == nil {
 		for _, p := range popular {
