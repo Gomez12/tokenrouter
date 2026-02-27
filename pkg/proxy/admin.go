@@ -6228,6 +6228,9 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 		ppSum    float64
 		tgSum    float64
 	}
+	usageKey := func(providerName, modelName string) string {
+		return strings.TrimSpace(providerName) + "\x00" + strings.TrimSpace(modelName)
+	}
 	usageByModel := map[string]usageAgg{}
 	if h.stats != nil {
 		summary := h.stats.Summary(period)
@@ -6237,15 +6240,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 			if p == "" || m == "" || b.Requests <= 0 {
 				continue
 			}
-			if mp, stripped, ok := splitModelPrefix(m); ok {
-				if p == "" {
-					p = strings.TrimSpace(mp)
-				}
-				if strings.EqualFold(strings.TrimSpace(mp), p) && strings.TrimSpace(stripped) != "" {
-					m = strings.TrimSpace(stripped)
-				}
-			}
-			key := p + "/" + m
+			key := usageKey(p, m)
 			a := usageByModel[key]
 			a.requests += b.Requests
 			a.failed += b.FailedRequests
@@ -6296,15 +6291,14 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		for _, m := range cards {
-			provider := m.Provider
-			modelID := m.ID
-			if pn, stripped, ok := splitModelPrefix(m.ID); ok {
-				provider = pn
-				modelID = stripped
+			provider := strings.TrimSpace(m.Provider)
+			if provider == "" {
+				provider = strings.TrimSpace(p.Name)
 			}
-			key := provider + "/" + modelID
+			modelID := strings.TrimSpace(m.ID)
+			key := usageKey(provider, modelID)
 			seenModel[key] = struct{}{}
-			entry, ok := cache.Entries[key]
+			entry, ok := cache.Entries[provider+"/"+modelID]
 			item := row{
 				Provider:            provider,
 				ProviderType:        providerTypeByName[provider],
@@ -6340,7 +6334,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 					item.Currency = "USD"
 				}
 			}
-			if agg, ok := usageByModel[provider+"/"+modelID]; ok && agg.requests > 0 {
+			if agg, ok := usageByModel[usageKey(provider, modelID)]; ok && agg.requests > 0 {
 				item.PerfRequests = agg.requests
 				item.PromptTokens = agg.prompt
 				item.CompletionTokens = agg.gen
@@ -6371,11 +6365,11 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	for key, entry := range cache.Entries {
-		if _, ok := seenModel[key]; ok {
-			continue
-		}
 		pn, modelID, ok := splitModelPrefix(key)
 		if !ok {
+			continue
+		}
+		if _, exists := seenModel[usageKey(pn, modelID)]; exists {
 			continue
 		}
 		status := providerStatus[pn]
@@ -6422,8 +6416,10 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 				item.Currency = "USD"
 			}
 		}
-		if agg, ok := usageByModel[pn+"/"+modelID]; ok && agg.requests > 0 {
+		if agg, ok := usageByModel[usageKey(pn, modelID)]; ok && agg.requests > 0 {
 			item.PerfRequests = agg.requests
+			item.PromptTokens = agg.prompt
+			item.CompletionTokens = agg.gen
 			item.FailureRate = float64(agg.failed) * 100.0 / float64(agg.requests)
 			item.AvgPromptTPS = agg.ppSum / float64(agg.requests)
 			item.AvgGenerationTPS = agg.tgSum / float64(agg.requests)
