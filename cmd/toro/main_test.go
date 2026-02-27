@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/llmclient"
 	"github.com/spf13/cobra"
 )
 
@@ -268,10 +269,19 @@ func TestRunPingPongWithProvidedModels(t *testing.T) {
 	if !strings.HasPrefix(first, "toroconv_") {
 		t.Fatalf("expected toroconv_ prefix, got %q", first)
 	}
-	for i := 1; i < len(conversationIDs); i++ {
-		if conversationIDs[i] != first {
-			t.Fatalf("expected stable X-Conversation-ID across run, got %q vs %q", first, conversationIDs[i])
+	seen := map[string]struct{}{}
+	for i := 0; i < len(conversationIDs); i++ {
+		cid := strings.TrimSpace(conversationIDs[i])
+		if cid == "" {
+			t.Fatalf("expected non-empty X-Conversation-ID at request %d", i)
 		}
+		if !strings.HasPrefix(cid, "toroconv_") {
+			t.Fatalf("expected toroconv_ prefix, got %q", cid)
+		}
+		seen[cid] = struct{}{}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("expected exactly 2 conversation IDs (A->B and B->A), got %d: %v", len(seen), conversationIDs)
 	}
 }
 
@@ -374,7 +384,7 @@ func TestStreamChatCompletionErrorsWhenStreamIsEmpty(t *testing.T) {
 	defer srv.Close()
 
 	var out bytes.Buffer
-	got, _, err := newToroClient(srv.URL, "k").withConversationID("test-conv").streamChatCompletion("p/m", []pingPongMessage{{Role: "user", Content: "hi"}}, 0.7, 32, "none", "words", &out, nil)
+	got, _, err := newToroClient(srv.URL, "k", llmclient.WithConversationID("test-conv")).streamChatCompletion("p/m", []pingPongMessage{{Role: "user", Content: "hi"}}, 0.7, 32, "none", "words", &out, nil)
 	if err == nil {
 		t.Fatalf("expected error, got content %q", got)
 	}

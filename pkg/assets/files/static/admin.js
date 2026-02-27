@@ -3804,7 +3804,7 @@ function adminApp() {
         const thinkButton = thinkText
           ? '<button class=\"btn btn-sm ' + thinkBtnClass + ' py-0 px-2\" type=\"button\" data-record-index=\"' + String(idx) + '\" onclick=\"window.__adminToggleConversationThink(this.dataset.recordIndex)\">Think (' + String(thinkTokens) + ' tok)</button>'
           : '';
-        const recvMetaRow = '<div class=\"mb-2 d-flex flex-wrap gap-2 align-items-center\"><span class=\"badge text-bg-secondary\">status ' + status + '</span><span class=\"badge text-bg-light border\">' + latency + '</span>' + thinkButton + '</div>';
+        const recvMetaRow = '<div class=\"mb-2 d-flex flex-wrap gap-2 align-items-center\"><span class=\"badge text-bg-secondary\">Status ' + status + '</span><span class=\"badge text-bg-light border\">Latency ' + latency + '</span>' + thinkButton + '</div>';
         const thinkBlock = (thinkText && thinkVisible)
           ? '<div class=\"mt-2 border rounded p-2 bg-body-tertiary\"><div class=\"small text-body-secondary mb-1\">Reasoning</div><div class=\"small\">' + this.renderMarkdown(thinkText) + '</div></div>'
           : '';

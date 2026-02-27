@@ -24,6 +24,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/lkarlslund/tokenrouter/pkg/config"
+	"github.com/lkarlslund/tokenrouter/pkg/llmclient"
 	"github.com/lkarlslund/tokenrouter/pkg/logutil"
 	"github.com/lkarlslund/tokenrouter/pkg/version"
 	"github.com/pelletier/go-toml/v2"
@@ -42,66 +43,59 @@ func main() {
 	root.SilenceUsage = true
 	root.SilenceErrors = true
 	var logLevel string
+	clientConfigPath := config.DefaultClientConfigPath()
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		return logutil.Configure(logLevel)
 	}
+	root.PersistentFlags().StringVar(&clientConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	root.PersistentFlags().StringVar(&logLevel, "loglevel", "info", "Log level (trace, debug, info, warn, error, fatal)")
 	root.PersistentFlags().StringVar(&wrapperTokenName, "name", "", "Temporary token display name for wrapper commands (codex, opencode, wrap)")
 	root.PersistentFlags().DurationVar(&wrapperTTL, "ttl", 8*time.Hour, "Temporary token expiry duration for wrapper commands (codex, opencode, wrap)")
 
-	var connectConfigPath string
 	var connectServerConfigPath string
 	connectCmd := &cobra.Command{
 		Use:   "connect",
 		Short: "Connect toro to a TokenRouter server",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runConnectTUI(cmd, connectConfigPath, connectServerConfigPath)
+			return runConnectTUI(cmd, clientConfigPath, connectServerConfigPath)
 		},
 	}
-	connectCmd.Flags().StringVar(&connectConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	connectCmd.Flags().StringVar(&connectServerConfigPath, "server-config", "", "Server config TOML path to read defaults from (also checks common paths)")
 	root.AddCommand(connectCmd)
-	var setKeyConfigPath string
 	setKeyCmd := &cobra.Command{
 		Use:   "set-key <api_key>",
 		Short: "Set and save client API key",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSetKey(cmd, setKeyConfigPath, args[0])
+			return runSetKey(cmd, clientConfigPath, args[0])
 		},
 	}
-	setKeyCmd.Flags().StringVar(&setKeyConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	root.AddCommand(setKeyCmd)
 
-	var statusConfigPath string
 	var statusAsJSON bool
 	var statusPeriodSeconds int
 	statusCmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show TokenRouter server health, version, and provider quotas",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runStatus(cmd, statusConfigPath, statusAsJSON, statusPeriodSeconds)
+			return runStatus(cmd, clientConfigPath, statusAsJSON, statusPeriodSeconds)
 		},
 	}
-	statusCmd.Flags().StringVar(&statusConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	statusCmd.Flags().BoolVar(&statusAsJSON, "json", false, "Output status as JSON")
 	statusCmd.Flags().IntVar(&statusPeriodSeconds, "period-seconds", 3600, "Usage/quota lookback period in seconds")
 	root.AddCommand(statusCmd)
 
-	var modelsConfigPath string
 	var modelsAsJSON bool
 	modelsCmd := &cobra.Command{
 		Use:   "models",
 		Short: "List available models from TokenRouter",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runModels(cmd, modelsConfigPath, modelsAsJSON)
+			return runModels(cmd, clientConfigPath, modelsAsJSON)
 		},
 	}
-	modelsCmd.Flags().StringVar(&modelsConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	modelsCmd.Flags().BoolVar(&modelsAsJSON, "json", false, "Output models as JSON")
 	root.AddCommand(modelsCmd)
 
-	var pingPongConfigPath string
 	var pingPongModels string
 	var pingPongTurnPairs int
 	var pingPongStarter string
@@ -114,10 +108,9 @@ func main() {
 		Use:   "pingpong",
 		Short: "Run a ping-pong chat loop between two models",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPingPong(cmd, pingPongConfigPath, pingPongModels, pingPongTurnPairs, pingPongStarter, pingPongReasoning, pingPongMaxTokens, pingPongRuns, pingPongShowTokens, pingPongParallel)
+			return runPingPong(cmd, clientConfigPath, pingPongModels, pingPongTurnPairs, pingPongStarter, pingPongReasoning, pingPongMaxTokens, pingPongRuns, pingPongShowTokens, pingPongParallel)
 		},
 	}
-	pingPongCmd.Flags().StringVar(&pingPongConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	pingPongCmd.Flags().StringVar(&pingPongModels, "models", "", "Model pair as model1,model2 (or one model to use the same on both sides)")
 	pingPongCmd.Flags().IntVar(&pingPongTurnPairs, "turn-pairs", 10, "Number of turn pairs (each pair is one B reply and one A reply)")
 	pingPongCmd.Flags().StringVar(&pingPongStarter, "starter", "", "Starter question text (skips auto-generated question)")
@@ -128,7 +121,6 @@ func main() {
 	pingPongCmd.Flags().IntVar(&pingPongParallel, "parallel", 4, "Number of runs to execute in parallel")
 	root.AddCommand(pingPongCmd)
 
-	var opencodeConfigPath string
 	var opencodeProviderID string
 	var opencodeProviderName string
 	var opencodeModel string
@@ -138,35 +130,31 @@ func main() {
 		Short: "Launch opencode with a temporary subordinate TokenRouter key",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runOpencodeWrap(cmd, opencodeConfigPath, wrapperTokenName, opencodeProviderID, opencodeProviderName, opencodeModel, wrapperTTL, opencodeDisableOtherProviders, args)
+			return runOpencodeWrap(cmd, clientConfigPath, wrapperTokenName, opencodeProviderID, opencodeProviderName, opencodeModel, wrapperTTL, opencodeDisableOtherProviders, args)
 		},
 	}
 	opencodeCmd.FParseErrWhitelist.UnknownFlags = true
 	opencodeCmd.Flags().SetInterspersed(false)
-	opencodeCmd.Flags().StringVar(&opencodeConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	opencodeCmd.Flags().StringVar(&opencodeProviderID, "provider-id", "tokenrouter", "Injected opencode provider id")
 	opencodeCmd.Flags().StringVar(&opencodeProviderName, "provider-name", "TokenRouter", "Injected opencode provider display name")
 	opencodeCmd.Flags().StringVar(&opencodeModel, "model", "", "Optional model to select (bare model id or provider/model)")
 	opencodeCmd.Flags().BoolVar(&opencodeDisableOtherProviders, "disable-other-providers", true, "Disable all other opencode providers while wrapped")
 	root.AddCommand(opencodeCmd)
 
-	var codexConfigPath string
 	var codexModel string
 	codexCmd := &cobra.Command{
 		Use:   "codex [wrapper_flags] [codex_args...]",
 		Short: "Launch codex-cli with a temporary subordinate TokenRouter key",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCodexWrap(cmd, codexConfigPath, wrapperTokenName, codexModel, wrapperTTL, args)
+			return runCodexWrap(cmd, clientConfigPath, wrapperTokenName, codexModel, wrapperTTL, args)
 		},
 	}
 	codexCmd.FParseErrWhitelist.UnknownFlags = true
 	codexCmd.Flags().SetInterspersed(false)
-	codexCmd.Flags().StringVar(&codexConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	codexCmd.Flags().StringVar(&codexModel, "model", "", "Optional model override passed via OPENAI_MODEL")
 	root.AddCommand(codexCmd)
 
-	var wrapConfigPath string
 	var wrapURLEnv string
 	var wrapKeyEnv string
 	wrapCmd := &cobra.Command{
@@ -174,11 +162,10 @@ func main() {
 		Short: "Run any command with a temporary subordinate TokenRouter key",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runGenericWrap(cmd, wrapConfigPath, wrapperTokenName, wrapperTTL, wrapURLEnv, wrapKeyEnv, args)
+			return runGenericWrap(cmd, clientConfigPath, wrapperTokenName, wrapperTTL, wrapURLEnv, wrapKeyEnv, args)
 		},
 	}
 	wrapCmd.Flags().SetInterspersed(false)
-	wrapCmd.Flags().StringVar(&wrapConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	wrapCmd.Flags().StringVar(&wrapURLEnv, "url-env", "OPENAI_BASE_URL", "Environment variable name for TokenRouter /v1 URL")
 	wrapCmd.Flags().StringVar(&wrapKeyEnv, "key-env", "OPENAI_API_KEY", "Environment variable name for API key")
 	root.AddCommand(wrapCmd)
@@ -609,22 +596,17 @@ type pingPongMessage struct {
 type toroClient struct {
 	serverBase      string
 	apiKey          string
-	conversationID  string
+	session         llmclient.Session
 	httpClient      *http.Client
 }
 
-func newToroClient(serverBase, apiKey string) *toroClient {
+func newToroClient(serverBase, apiKey string, opts ...llmclient.Option) *toroClient {
 	return &toroClient{
 		serverBase: strings.TrimSuffix(strings.TrimSpace(serverBase), "/"),
 		apiKey:     strings.TrimSpace(apiKey),
+		session:    llmclient.NewSession(opts...),
 		httpClient: &http.Client{Timeout: 20 * time.Second},
 	}
-}
-
-func (c *toroClient) withConversationID(id string) *toroClient {
-	cp := *c
-	cp.conversationID = strings.TrimSpace(id)
-	return &cp
 }
 
 func runStatus(cmd *cobra.Command, cfgPath string, asJSON bool, periodSeconds int) error {
@@ -854,11 +836,16 @@ func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int,
 func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB string, iterations int, starter, reasoning string, maxTokens int, showTokens string, verbose bool) (pingPongRunStats, error) {
 	started := time.Now()
 	out := cmd.OutOrStdout()
-	conversationID, err := randomConversationID()
+	conversationABID, err := randomConversationID()
 	if err != nil {
-		return pingPongRunStats{}, fmt.Errorf("generate conversation id: %w", err)
+		return pingPongRunStats{}, fmt.Errorf("generate A->B conversation id: %w", err)
 	}
-	runClient := client.withConversationID(conversationID)
+	conversationBAID, err := randomConversationID()
+	if err != nil {
+		return pingPongRunStats{}, fmt.Errorf("generate B->A conversation id: %w", err)
+	}
+	clientAB := newToroClient(client.serverBase, client.apiKey, llmclient.WithConversationID(conversationABID))
+	clientBA := newToroClient(client.serverBase, client.apiKey, llmclient.WithConversationID(conversationBAID))
 	usedTokens := 0
 	promptTokens := 0
 	completionTokens := 0
@@ -871,7 +858,7 @@ func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB stri
 		if verbose {
 			fmt.Fprintf(out, "Seed (%s): ", modelA)
 		}
-		seedQuestion, _, err := runClient.streamChatCompletion(modelA, []pingPongMessage{
+		seedQuestion, _, err := clientAB.streamChatCompletion(modelA, []pingPongMessage{
 			{Role: "system", Content: "You produce concise, random conversation starters. Do not output reasoning. Output only the final question text."},
 			{Role: "user", Content: seedPrompt},
 		}, 0.9, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
@@ -914,7 +901,7 @@ func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB stri
 		if verbose {
 			fmt.Fprintf(out, "B[%d] (%s): ", i, modelB)
 		}
-		replyB, _, err := runClient.streamChatCompletion(modelB, convB, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+		replyB, _, err := clientAB.streamChatCompletion(modelB, convB, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
 		if verbose {
 			fmt.Fprintln(out)
 		}
@@ -941,7 +928,7 @@ func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB stri
 		if verbose {
 			fmt.Fprintf(out, "A[%d] (%s): ", i, modelA)
 		}
-		replyA, _, err := runClient.streamChatCompletion(modelA, convA, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+		replyA, _, err := clientBA.streamChatCompletion(modelA, convA, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
 		if verbose {
 			fmt.Fprintln(out)
 		}
@@ -1056,10 +1043,7 @@ func (c *toroClient) streamChatCompletion(model string, messages []pingPongMessa
 	cfg := openai.DefaultConfig(c.apiKey)
 	cfg.BaseURL = c.serverBase + "/v1"
 	cfg.HTTPClient = &http.Client{
-		Transport: conversationHeaderRoundTripper{
-			Base:           http.DefaultTransport,
-			ConversationID: c.conversationID,
-		},
+		Transport: c.session.WrapRoundTripper(http.DefaultTransport),
 	}
 	client := openai.NewClientWithConfig(cfg)
 	stopSpinner := startWaitingSpinner(spinnerOut)
@@ -1135,24 +1119,6 @@ func (c *toroClient) streamChatCompletion(model string, messages []pingPongMessa
 		return "", 0, fmt.Errorf("chat completion returned empty content (finish_reason=%s)", lastFinish)
 	}
 	return "", 0, fmt.Errorf("chat completion returned empty content")
-}
-
-type conversationHeaderRoundTripper struct {
-	Base           http.RoundTripper
-	ConversationID string
-}
-
-func (rt conversationHeaderRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	base := rt.Base
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	out := req.Clone(req.Context())
-	out.Header = req.Header.Clone()
-	if cid := strings.TrimSpace(rt.ConversationID); cid != "" {
-		out.Header.Set("X-Conversation-ID", cid)
-	}
-	return base.RoundTrip(out)
 }
 
 func estimateTokenCount(messages []pingPongMessage, reply string) int {
