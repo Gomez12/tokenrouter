@@ -1307,48 +1307,47 @@ func runOpencodeWrap(cmd *cobra.Command, cfgPath, tokenName, providerID, provide
 	if providerName == "" {
 		providerName = "TokenRouter"
 	}
-	key := strings.TrimSpace(cfg.APIKey)
-	if key == "" {
+	bearer := strings.TrimSpace(cfg.APIKey)
+	if bearer == "" {
 		if !isLoopbackServerBase(serverBase) {
 			return fmt.Errorf("client api key is required for non-localhost server (set with: toro connect)")
 		}
-		fmt.Fprintln(cmd.ErrOrStderr(), "No client API key configured; using localhost no-auth mode without temporary token isolation.")
-	} else {
-		key, err = randomTemporaryKey()
-		if err != nil {
-			return fmt.Errorf("generate temporary key: %w", err)
-		}
-		if strings.TrimSpace(tokenName) == "" {
-			tokenName = "toro-opencode-" + time.Now().UTC().Format("20060102-150405")
-		}
-		expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
-
-		before, err := fetchAccessTokens(serverBase, cfg.APIKey)
-		if err != nil {
-			return fmt.Errorf("list access tokens before create: %w", err)
-		}
-		beforeIDs := map[string]struct{}{}
-		for _, t := range before {
-			beforeIDs[strings.TrimSpace(t.ID)] = struct{}{}
-		}
-		if err := createAccessToken(serverBase, cfg.APIKey, tokenName, key, "inferrer", expiresAt); err != nil {
-			return fmt.Errorf("create temporary access token: %w", err)
-		}
-		tmpID, err := findCreatedTokenID(serverBase, cfg.APIKey, beforeIDs, tokenName, expiresAt)
-		if err != nil {
-			return fmt.Errorf("locate temporary access token id: %w", err)
-		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "Created temporary token %q (id=%s, expires=%s)\n", tokenName, tmpID, expiresAt)
-
-		cleanup := func() {
-			if err := deleteAccessToken(serverBase, cfg.APIKey, tmpID); err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to delete temporary token %q (id=%s): %v\n", tokenName, tmpID, err)
-				return
-			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "Deleted temporary token %q (id=%s)\n", tokenName, tmpID)
-		}
-		defer cleanup()
+		fmt.Fprintln(cmd.ErrOrStderr(), "No client API key configured; using localhost no-auth admin access to create a temporary token.")
 	}
+	key, err := randomTemporaryKey()
+	if err != nil {
+		return fmt.Errorf("generate temporary key: %w", err)
+	}
+	if strings.TrimSpace(tokenName) == "" {
+		tokenName = "toro-opencode-" + time.Now().UTC().Format("20060102-150405")
+	}
+	expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
+
+	before, err := fetchAccessTokens(serverBase, bearer)
+	if err != nil {
+		return fmt.Errorf("list access tokens before create: %w", err)
+	}
+	beforeIDs := map[string]struct{}{}
+	for _, t := range before {
+		beforeIDs[strings.TrimSpace(t.ID)] = struct{}{}
+	}
+	if err := createAccessToken(serverBase, bearer, tokenName, key, "inferrer", expiresAt); err != nil {
+		return fmt.Errorf("create temporary access token: %w", err)
+	}
+	tmpID, err := findCreatedTokenID(serverBase, bearer, beforeIDs, tokenName, expiresAt)
+	if err != nil {
+		return fmt.Errorf("locate temporary access token id: %w", err)
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "Created temporary token %q (id=%s, expires=%s)\n", tokenName, tmpID, expiresAt)
+
+	cleanup := func() {
+		if err := deleteAccessToken(serverBase, bearer, tmpID); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to delete temporary token %q (id=%s): %v\n", tokenName, tmpID, err)
+			return
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "Deleted temporary token %q (id=%s)\n", tokenName, tmpID)
+	}
+	defer cleanup()
 
 	configContent, err := buildOpencodeConfigContent(serverBase, key, providerID, providerName, model)
 	if err != nil {
@@ -1422,47 +1421,54 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 	if ttl <= 0 {
 		return fmt.Errorf("ttl must be > 0")
 	}
-	key := strings.TrimSpace(cfg.APIKey)
-	if key == "" {
+	bearer := strings.TrimSpace(cfg.APIKey)
+	if bearer == "" {
 		if !isLoopbackServerBase(serverBase) {
 			return fmt.Errorf("client api key is required for non-localhost server (set with: toro connect)")
 		}
-		fmt.Fprintln(cmd.ErrOrStderr(), "No client API key configured; using localhost no-auth mode without temporary token isolation.")
-	} else {
-		key, err = randomTemporaryKey()
-		if err != nil {
-			return fmt.Errorf("generate temporary key: %w", err)
-		}
-		if strings.TrimSpace(tokenName) == "" {
-			tokenName = "toro-codex-" + time.Now().UTC().Format("20060102-150405")
-		}
-		expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
+		fmt.Fprintln(cmd.ErrOrStderr(), "No client API key configured; using localhost no-auth admin access to create a temporary token.")
+	}
+	key, err := randomTemporaryKey()
+	if err != nil {
+		return fmt.Errorf("generate temporary key: %w", err)
+	}
+	if strings.TrimSpace(tokenName) == "" {
+		tokenName = "toro-codex-" + time.Now().UTC().Format("20060102-150405")
+	}
+	expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
 
-		before, err := fetchAccessTokens(serverBase, cfg.APIKey)
-		if err != nil {
-			return fmt.Errorf("list access tokens before create: %w", err)
-		}
-		beforeIDs := map[string]struct{}{}
-		for _, t := range before {
-			beforeIDs[strings.TrimSpace(t.ID)] = struct{}{}
-		}
-		if err := createAccessToken(serverBase, cfg.APIKey, tokenName, key, "inferrer", expiresAt); err != nil {
-			return fmt.Errorf("create temporary access token: %w", err)
-		}
-		tmpID, err := findCreatedTokenID(serverBase, cfg.APIKey, beforeIDs, tokenName, expiresAt)
-		if err != nil {
-			return fmt.Errorf("locate temporary access token id: %w", err)
-		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "Created temporary token %q (id=%s, expires=%s)\n", tokenName, tmpID, expiresAt)
+	before, err := fetchAccessTokens(serverBase, bearer)
+	if err != nil {
+		return fmt.Errorf("list access tokens before create: %w", err)
+	}
+	beforeIDs := map[string]struct{}{}
+	for _, t := range before {
+		beforeIDs[strings.TrimSpace(t.ID)] = struct{}{}
+	}
+	if err := createAccessToken(serverBase, bearer, tokenName, key, "inferrer", expiresAt); err != nil {
+		return fmt.Errorf("create temporary access token: %w", err)
+	}
+	tmpID, err := findCreatedTokenID(serverBase, bearer, beforeIDs, tokenName, expiresAt)
+	if err != nil {
+		return fmt.Errorf("locate temporary access token id: %w", err)
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "Created temporary token %q (id=%s, expires=%s)\n", tokenName, tmpID, expiresAt)
 
-		cleanup := func() {
-			if err := deleteAccessToken(serverBase, cfg.APIKey, tmpID); err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to delete temporary token %q (id=%s): %v\n", tokenName, tmpID, err)
-				return
-			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "Deleted temporary token %q (id=%s)\n", tokenName, tmpID)
+	cleanup := func() {
+		if err := deleteAccessToken(serverBase, bearer, tmpID); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to delete temporary token %q (id=%s): %v\n", tokenName, tmpID, err)
+			return
 		}
-		defer cleanup()
+		fmt.Fprintf(cmd.ErrOrStderr(), "Deleted temporary token %q (id=%s)\n", tokenName, tmpID)
+	}
+	defer cleanup()
+
+	selectedModel, selectedModelMsg, selErr := selectCodexModel(serverBase, cfg.APIKey, model)
+	if selErr != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to auto-select model: %v\n", selErr)
+	}
+	if strings.TrimSpace(selectedModelMsg) != "" {
+		fmt.Fprintln(cmd.ErrOrStderr(), selectedModelMsg)
 	}
 
 	launchArgs := make([]string, 0, len(codexArgs)+8)
@@ -1471,6 +1477,9 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 		"-c", `model_provider="tokenrouter"`,
 		"-c", `model_providers.tokenrouter={name="TokenRouter",base_url=`+strconv.Quote(strings.TrimSuffix(serverBase, "/")+"/v1")+`,env_key="CODEX_API_KEY",wire_api="responses",requires_openai_auth=false}`,
 	)
+	if strings.TrimSpace(selectedModel) != "" {
+		launchArgs = append(launchArgs, "-c", "model="+strconv.Quote(strings.TrimSpace(selectedModel)))
+	}
 	launchArgs = append(launchArgs, codexArgs...)
 	proc := exec.Command("codex", launchArgs...)
 	proc.Stdin = cmd.InOrStdin()
@@ -1488,22 +1497,46 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 	env = append(env, "OPENAI_BASE_URL="+strings.TrimSuffix(serverBase, "/")+"/v1")
 	env = append(env, "OPENAI_API_BASE="+strings.TrimSuffix(serverBase, "/")+"/v1")
 	env = append(env, "CODEX_BASE_URL="+strings.TrimSuffix(serverBase, "/")+"/v1")
-	if strings.TrimSpace(key) != "" {
-		env = append(env, "OPENAI_API_KEY="+key)
-		env = append(env, "CODEX_API_KEY="+key)
-	} else {
-		// Codex CLI requires CODEX_API_KEY to be present even when backend auth is disabled.
-		env = append(env, "CODEX_API_KEY=toro-localhost-noauth")
-		env = append(env, "OPENAI_API_KEY=toro-localhost-noauth")
-	}
-	if strings.TrimSpace(model) != "" {
-		env = append(env, "OPENAI_MODEL="+strings.TrimSpace(model))
+	env = append(env, "OPENAI_API_KEY="+key)
+	env = append(env, "CODEX_API_KEY="+key)
+	if strings.TrimSpace(selectedModel) != "" {
+		env = append(env, "OPENAI_MODEL="+strings.TrimSpace(selectedModel))
 	}
 	proc.Env = env
 	if err := proc.Run(); err != nil {
 		return err
 	}
 	return nil
+}
+
+func selectCodexModel(serverBase, apiKey, requested string) (string, string, error) {
+	requested = strings.TrimSpace(requested)
+	if requested != "" {
+		return requested, "", nil
+	}
+	auto, err := discoverZeroCostModels(serverBase, apiKey)
+	if err == nil && len(auto) > 0 {
+		return auto[0], "Auto-selected model: " + auto[0], nil
+	}
+	models, err := fetchModels(serverBase, apiKey)
+	if err != nil {
+		if len(auto) == 0 {
+			return "", "", err
+		}
+		return "", "", nil
+	}
+	ids := make([]string, 0, len(models))
+	for _, m := range models {
+		id := strings.TrimSpace(m.ID)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return "", "", nil
+	}
+	sort.Strings(ids)
+	return ids[0], "Auto-selected model: " + ids[0], nil
 }
 
 func runGenericWrap(cmd *cobra.Command, cfgPath, tokenName string, ttl time.Duration, urlEnvName, keyEnvName string, args []string) error {
@@ -1532,20 +1565,12 @@ func runGenericWrap(cmd *cobra.Command, cfgPath, tokenName string, ttl time.Dura
 		return fmt.Errorf("command cannot be empty")
 	}
 
-	key := strings.TrimSpace(cfg.APIKey)
-	if key == "" {
+	bearer := strings.TrimSpace(cfg.APIKey)
+	if bearer == "" {
 		if !isLoopbackServerBase(serverBase) {
 			return fmt.Errorf("client api key is required for non-localhost server (set with: toro connect)")
 		}
-		fmt.Fprintln(cmd.ErrOrStderr(), "No client API key configured; using localhost no-auth mode without temporary token isolation.")
-		proc := exec.Command(targetCmd, args[1:]...)
-		proc.Stdin = cmd.InOrStdin()
-		proc.Stdout = cmd.OutOrStdout()
-		proc.Stderr = cmd.ErrOrStderr()
-		env := filteredEnv([]string{urlEnvName, keyEnvName})
-		env = append(env, urlEnvName+"="+strings.TrimSuffix(serverBase, "/")+"/v1")
-		proc.Env = env
-		return proc.Run()
+		fmt.Fprintln(cmd.ErrOrStderr(), "No client API key configured; using localhost no-auth admin access to create a temporary token.")
 	}
 
 	tmpKey, err := randomTemporaryKey()
@@ -1557,7 +1582,7 @@ func runGenericWrap(cmd *cobra.Command, cfgPath, tokenName string, ttl time.Dura
 	}
 	expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
 
-	before, err := fetchAccessTokens(serverBase, key)
+	before, err := fetchAccessTokens(serverBase, bearer)
 	if err != nil {
 		return fmt.Errorf("list access tokens before create: %w", err)
 	}
@@ -1565,17 +1590,17 @@ func runGenericWrap(cmd *cobra.Command, cfgPath, tokenName string, ttl time.Dura
 	for _, t := range before {
 		beforeIDs[strings.TrimSpace(t.ID)] = struct{}{}
 	}
-	if err := createAccessToken(serverBase, key, tokenName, tmpKey, "inferrer", expiresAt); err != nil {
+	if err := createAccessToken(serverBase, bearer, tokenName, tmpKey, "inferrer", expiresAt); err != nil {
 		return fmt.Errorf("create temporary access token: %w", err)
 	}
-	tmpID, err := findCreatedTokenID(serverBase, key, beforeIDs, tokenName, expiresAt)
+	tmpID, err := findCreatedTokenID(serverBase, bearer, beforeIDs, tokenName, expiresAt)
 	if err != nil {
 		return fmt.Errorf("locate temporary access token id: %w", err)
 	}
 	fmt.Fprintf(cmd.ErrOrStderr(), "Created temporary token %q (id=%s, expires=%s)\n", tokenName, tmpID, expiresAt)
 
 	cleanup := func() {
-		if err := deleteAccessToken(serverBase, key, tmpID); err != nil {
+		if err := deleteAccessToken(serverBase, bearer, tmpID); err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to delete temporary token %q (id=%s): %v\n", tokenName, tmpID, err)
 			return
 		}
