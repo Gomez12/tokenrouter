@@ -103,19 +103,27 @@ func main() {
 
 	var pingPongConfigPath string
 	var pingPongModels string
-	var pingPongIterations int
+	var pingPongTurnPairs int
 	var pingPongStarter string
+	var pingPongReasoning string
+	var pingPongMaxTokens int
+	var pingPongRuns int
+	var pingPongShowTokens string
 	pingPongCmd := &cobra.Command{
 		Use:   "pingpong",
 		Short: "Run a ping-pong chat loop between two models",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPingPong(cmd, pingPongConfigPath, pingPongModels, pingPongIterations, pingPongStarter)
+			return runPingPong(cmd, pingPongConfigPath, pingPongModels, pingPongTurnPairs, pingPongStarter, pingPongReasoning, pingPongMaxTokens, pingPongRuns, pingPongShowTokens)
 		},
 	}
 	pingPongCmd.Flags().StringVar(&pingPongConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	pingPongCmd.Flags().StringVar(&pingPongModels, "models", "", "Model pair as model1,model2 (or one model to use the same on both sides)")
-	pingPongCmd.Flags().IntVar(&pingPongIterations, "iterations", 10, "Number of back-and-forth iterations")
+	pingPongCmd.Flags().IntVar(&pingPongTurnPairs, "turn-pairs", 10, "Number of turn pairs (each pair is one B reply and one A reply)")
 	pingPongCmd.Flags().StringVar(&pingPongStarter, "starter", "", "Starter question text (skips auto-generated question)")
+	pingPongCmd.Flags().StringVar(&pingPongReasoning, "reasoning", "none", "Reasoning effort: none, low, medium, high")
+	pingPongCmd.Flags().IntVar(&pingPongMaxTokens, "max-tokens", 10000, "Stop conversation after this many cumulative tokens (0 disables limit)")
+	pingPongCmd.Flags().IntVar(&pingPongRuns, "runs", 1, "Number of complete ping-pong runs to execute")
+	pingPongCmd.Flags().StringVar(&pingPongShowTokens, "show-tokens", "dot", "Streaming display mode: words, dot, none")
 	root.AddCommand(pingPongCmd)
 
 	var opencodeConfigPath string
@@ -596,6 +604,27 @@ type pingPongMessage struct {
 	Content string `json:"content"`
 }
 
+type toroClient struct {
+	serverBase      string
+	apiKey          string
+	conversationID  string
+	httpClient      *http.Client
+}
+
+func newToroClient(serverBase, apiKey string) *toroClient {
+	return &toroClient{
+		serverBase: strings.TrimSuffix(strings.TrimSpace(serverBase), "/"),
+		apiKey:     strings.TrimSpace(apiKey),
+		httpClient: &http.Client{Timeout: 20 * time.Second},
+	}
+}
+
+func (c *toroClient) withConversationID(id string) *toroClient {
+	cp := *c
+	cp.conversationID = strings.TrimSpace(id)
+	return &cp
+}
+
 func runStatus(cmd *cobra.Command, cfgPath string, asJSON bool, periodSeconds int) error {
 	cfg, err := config.LoadClientConfig(cfgPath)
 	if err != nil {
@@ -613,13 +642,14 @@ func runStatus(cmd *cobra.Command, cfgPath string, asJSON bool, periodSeconds in
 		CheckedAt: time.Now().UTC().Format(time.RFC3339),
 		ServerURL: strings.TrimSuffix(serverBase, "/") + "/v1",
 	}
+	client := newToroClient(serverBase, cfg.APIKey)
 
-	report.Health = checkServerHealth(serverBase)
+	report.Health = client.checkServerHealth()
 
-	v, s := readServerStatus(serverBase, cfg.APIKey, periodSeconds)
+	v, s := client.readServerStatus(periodSeconds)
 	report.Version = v
 	report.Stats = s
-	report.Models = readModelsStatus(serverBase, cfg.APIKey)
+	report.Models = client.readModelsStatus()
 
 	if asJSON {
 		enc := json.NewEncoder(cmd.OutOrStdout())
@@ -639,7 +669,8 @@ func runModels(cmd *cobra.Command, cfgPath string, asJSON bool) error {
 	if err != nil {
 		return err
 	}
-	models, err := fetchModels(serverBase, cfg.APIKey)
+	client := newToroClient(serverBase, cfg.APIKey)
+	models, err := client.fetchModels()
 	if err != nil {
 		return err
 	}
@@ -661,15 +692,15 @@ func runModels(cmd *cobra.Command, cfgPath string, asJSON bool) error {
 	return nil
 }
 
-func fetchModels(serverBase, apiKey string) ([]modelsModel, error) {
-	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(serverBase, "/")+"/v1/models", nil)
+func (c *toroClient) fetchModels() ([]modelsModel, error) {
+	req, err := http.NewRequest(http.MethodGet, c.serverBase+"/v1/models", nil)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(apiKey) != "" {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
-	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -704,9 +735,31 @@ func printModelsReportHuman(w io.Writer, report modelsReport) {
 	}
 }
 
-func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int, starter string) error {
+func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int, starter, reasoning string, maxTokens int, runs int, showTokens string) error {
 	if iterations <= 0 {
 		return fmt.Errorf("iterations must be > 0")
+	}
+	if runs <= 0 {
+		return fmt.Errorf("runs must be > 0")
+	}
+	if maxTokens < 0 {
+		return fmt.Errorf("max-tokens must be >= 0")
+	}
+	reasoning = strings.ToLower(strings.TrimSpace(reasoning))
+	switch reasoning {
+	case "", "none":
+		reasoning = "none"
+	case "low", "medium", "high":
+	default:
+		return fmt.Errorf("invalid --reasoning %q (expected one of: none, low, medium, high)", reasoning)
+	}
+	showTokens = strings.ToLower(strings.TrimSpace(showTokens))
+	switch showTokens {
+	case "", "dot":
+		showTokens = "dot"
+	case "words", "none":
+	default:
+		return fmt.Errorf("invalid --show-tokens %q (expected one of: words, dot, none)", showTokens)
 	}
 	cfg, err := config.LoadClientConfig(cfgPath)
 	if err != nil {
@@ -716,7 +769,8 @@ func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int,
 	if err != nil {
 		return err
 	}
-	modelA, modelB, err := selectPingPongModels(serverBase, cfg.APIKey, modelsFlag)
+	client := newToroClient(serverBase, cfg.APIKey)
+	modelA, modelB, err := client.selectPingPongModels(modelsFlag)
 	if err != nil {
 		return err
 	}
@@ -724,67 +778,93 @@ func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int,
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "Server: %s\n", strings.TrimSuffix(serverBase, "/")+"/v1")
 	fmt.Fprintf(out, "Models: A=%s, B=%s\n", modelA, modelB)
-	fmt.Fprintf(out, "Iterations: %d\n", iterations)
-
-	seedQuestion := compactPingPongText(starter)
-	if seedQuestion == "" {
-		seedPrompt := "Give me a short random question. Return only the question."
-		var err error
-		fmt.Fprintf(out, "Seed (%s): ", modelA)
-		seedQuestion, err = streamChatCompletion(serverBase, cfg.APIKey, modelA, []pingPongMessage{
-			{Role: "system", Content: "You produce concise, random conversation starters. Do not output reasoning. Output only the final question text."},
-			{Role: "user", Content: seedPrompt},
-		}, 0.9, 256, out, cmd.ErrOrStderr())
-		fmt.Fprintln(out)
+	fmt.Fprintf(out, "Turn pairs: %d\n", iterations)
+	fmt.Fprintf(out, "Runs: %d\n", runs)
+	if maxTokens > 0 {
+		fmt.Fprintf(out, "Max tokens: %d\n", maxTokens)
+	}
+	for run := 1; run <= runs; run++ {
+		if runs > 1 {
+			fmt.Fprintf(out, "\nRun %d/%d\n", run, runs)
+		}
+		conversationID, err := randomConversationID()
 		if err != nil {
-			return fmt.Errorf("seed question from %s: %w", modelA, err)
+			return fmt.Errorf("generate conversation id: %w", err)
 		}
-		seedQuestion = compactPingPongText(seedQuestion)
-	} else {
-		fmt.Fprintf(out, "Starter: manual\n")
-		fmt.Fprintf(out, "Seed (%s): %s\n", modelA, seedQuestion)
-	}
-	if seedQuestion == "" {
-		return fmt.Errorf("seed question from %s was empty (provider returned no final content)", modelA)
-	}
+		runClient := client.withConversationID(conversationID)
+		usedTokens := 0
 
-	convA := []pingPongMessage{
-		{Role: "system", Content: "You are participant A in a ping-pong conversation. Reply with one or two short sentences."},
-	}
-	convB := []pingPongMessage{
-		{Role: "system", Content: "You are participant B in a ping-pong conversation. Reply with one or two short sentences."},
-	}
+		seedQuestion := compactPingPongText(starter)
+		if seedQuestion == "" {
+			seedPrompt := "Give me a short random question. Return only the question."
+			var err error
+			fmt.Fprintf(out, "Seed (%s): ", modelA)
+			seedQuestion, lastTokens, err := runClient.streamChatCompletion(modelA, []pingPongMessage{
+				{Role: "system", Content: "You produce concise, random conversation starters. Do not output reasoning. Output only the final question text."},
+				{Role: "user", Content: seedPrompt},
+			}, 0.9, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+			fmt.Fprintln(out)
+			if err != nil {
+				return fmt.Errorf("seed question from %s: %w", modelA, err)
+			}
+			usedTokens += lastTokens
+			seedQuestion = compactPingPongText(seedQuestion)
+		} else {
+			fmt.Fprintf(out, "Starter: manual\n")
+			fmt.Fprintf(out, "Seed (%s): %s\n", modelA, seedQuestion)
+		}
+		if seedQuestion == "" {
+			return fmt.Errorf("seed question from %s was empty (provider returned no final content)", modelA)
+		}
 
-	current := seedQuestion
-	for i := 1; i <= iterations; i++ {
-		convB = append(convB, pingPongMessage{Role: "user", Content: current})
-		fmt.Fprintf(out, "B[%d] (%s): ", i, modelB)
-		replyB, err := streamChatCompletion(serverBase, cfg.APIKey, modelB, convB, 0.7, 256, out, cmd.ErrOrStderr())
-		fmt.Fprintln(out)
-		if err != nil {
-			return fmt.Errorf("iteration %d model %s: %w", i, modelB, err)
+		convA := []pingPongMessage{
+			{Role: "system", Content: "You are participant A in a ping-pong conversation. Reply with one or two short sentences."},
 		}
-		replyB = compactPingPongText(replyB)
-		if replyB == "" {
-			return fmt.Errorf("iteration %d model %s returned empty content", i, modelB)
+		convB := []pingPongMessage{
+			{Role: "system", Content: "You are participant B in a ping-pong conversation. Reply with one or two short sentences."},
 		}
-		convB = append(convB, pingPongMessage{Role: "assistant", Content: replyB})
-		convB = trimPingPongConversation(convB, 14)
 
-		convA = append(convA, pingPongMessage{Role: "user", Content: replyB})
-		fmt.Fprintf(out, "A[%d] (%s): ", i, modelA)
-		replyA, err := streamChatCompletion(serverBase, cfg.APIKey, modelA, convA, 0.7, 256, out, cmd.ErrOrStderr())
-		fmt.Fprintln(out)
-		if err != nil {
-			return fmt.Errorf("iteration %d model %s: %w", i, modelA, err)
+		current := seedQuestion
+		for i := 1; i <= iterations; i++ {
+			if maxTokens > 0 && usedTokens >= maxTokens {
+				fmt.Fprintf(out, "Stopped early: reached max token budget (%d/%d)\n", usedTokens, maxTokens)
+				break
+			}
+			convB = append(convB, pingPongMessage{Role: "user", Content: current})
+			fmt.Fprintf(out, "B[%d] (%s): ", i, modelB)
+			replyB, lastTokens, err := runClient.streamChatCompletion(modelB, convB, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+			fmt.Fprintln(out)
+			if err != nil {
+				return fmt.Errorf("iteration %d model %s: %w", i, modelB, err)
+			}
+			usedTokens += lastTokens
+			replyB = compactPingPongText(replyB)
+			if replyB == "" {
+				return fmt.Errorf("iteration %d model %s returned empty content", i, modelB)
+			}
+			convB = append(convB, pingPongMessage{Role: "assistant", Content: replyB})
+			convB = trimPingPongConversation(convB, 14)
+
+			if maxTokens > 0 && usedTokens >= maxTokens {
+				fmt.Fprintf(out, "Stopped early: reached max token budget (%d/%d)\n", usedTokens, maxTokens)
+				break
+			}
+			convA = append(convA, pingPongMessage{Role: "user", Content: replyB})
+			fmt.Fprintf(out, "A[%d] (%s): ", i, modelA)
+			replyA, lastTokens, err := runClient.streamChatCompletion(modelA, convA, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+			fmt.Fprintln(out)
+			if err != nil {
+				return fmt.Errorf("iteration %d model %s: %w", i, modelA, err)
+			}
+			usedTokens += lastTokens
+			replyA = compactPingPongText(replyA)
+			if replyA == "" {
+				return fmt.Errorf("iteration %d model %s returned empty content", i, modelA)
+			}
+			convA = append(convA, pingPongMessage{Role: "assistant", Content: replyA})
+			convA = trimPingPongConversation(convA, 14)
+			current = replyA
 		}
-		replyA = compactPingPongText(replyA)
-		if replyA == "" {
-			return fmt.Errorf("iteration %d model %s returned empty content", i, modelA)
-		}
-		convA = append(convA, pingPongMessage{Role: "assistant", Content: replyA})
-		convA = trimPingPongConversation(convA, 14)
-		current = replyA
 	}
 	return nil
 }
@@ -815,7 +895,7 @@ func parsePingPongModelsFlag(raw string) (string, string, error) {
 	return items[0], items[1], nil
 }
 
-func selectPingPongModels(serverBase, apiKey, modelsFlag string) (string, string, error) {
+func (c *toroClient) selectPingPongModels(modelsFlag string) (string, string, error) {
 	a, b, err := parsePingPongModelsFlag(modelsFlag)
 	if err != nil {
 		return "", "", err
@@ -823,7 +903,7 @@ func selectPingPongModels(serverBase, apiKey, modelsFlag string) (string, string
 	if a != "" {
 		return a, b, nil
 	}
-	auto, err := discoverZeroCostModels(serverBase, apiKey)
+	auto, err := c.discoverZeroCostModels()
 	if err != nil {
 		return "", "", err
 	}
@@ -836,8 +916,8 @@ func selectPingPongModels(serverBase, apiKey, modelsFlag string) (string, string
 	return auto[0], auto[1], nil
 }
 
-func discoverZeroCostModels(serverBase, apiKey string) ([]string, error) {
-	models, err := fetchModels(serverBase, apiKey)
+func (c *toroClient) discoverZeroCostModels() ([]string, error) {
+	models, err := c.fetchModels()
 	if err != nil {
 		return nil, err
 	}
@@ -866,9 +946,15 @@ func looksLikeFreeModel(modelID string) bool {
 	return strings.Contains(id, ":free") || strings.Contains(id, "/free") || strings.Contains(id, "-free") || strings.Contains(id, ".free")
 }
 
-func streamChatCompletion(serverBase, apiKey, model string, messages []pingPongMessage, temperature float64, maxTokens int, tokenOut, spinnerOut io.Writer) (string, error) {
-	cfg := openai.DefaultConfig(strings.TrimSpace(apiKey))
-	cfg.BaseURL = strings.TrimSuffix(serverBase, "/") + "/v1"
+func (c *toroClient) streamChatCompletion(model string, messages []pingPongMessage, temperature float64, maxTokens int, reasoning, showTokens string, tokenOut, spinnerOut io.Writer) (string, int, error) {
+	cfg := openai.DefaultConfig(c.apiKey)
+	cfg.BaseURL = c.serverBase + "/v1"
+	cfg.HTTPClient = &http.Client{
+		Transport: conversationHeaderRoundTripper{
+			Base:           http.DefaultTransport,
+			ConversationID: c.conversationID,
+		},
+	}
 	client := openai.NewClientWithConfig(cfg)
 	stopSpinner := startWaitingSpinner(spinnerOut)
 	defer stopSpinner()
@@ -885,8 +971,9 @@ func streamChatCompletion(serverBase, apiKey, model string, messages []pingPongM
 		Messages:    reqMessages,
 		Stream:      true,
 		Temperature: float32(temperature),
-		// Prefer minimal reasoning so output tokens are used for final content.
-		ReasoningEffort: "low",
+	}
+	if strings.TrimSpace(reasoning) != "" && strings.TrimSpace(reasoning) != "none" {
+		req.ReasoningEffort = strings.TrimSpace(reasoning)
 	}
 	if maxTokens > 0 {
 		req.MaxCompletionTokens = maxTokens
@@ -895,7 +982,7 @@ func streamChatCompletion(serverBase, apiKey, model string, messages []pingPongM
 	defer cancel()
 	stream, err := client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer stream.Close()
 
@@ -907,7 +994,7 @@ func streamChatCompletion(serverBase, apiKey, model string, messages []pingPongM
 			break
 		}
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -922,18 +1009,56 @@ func streamChatCompletion(serverBase, apiKey, model string, messages []pingPongM
 		stopSpinner()
 		b.WriteString(delta)
 		if tokenOut != nil {
-			_, _ = io.WriteString(tokenOut, delta)
+			switch showTokens {
+			case "words":
+				_, _ = io.WriteString(tokenOut, delta)
+			case "dot":
+				_, _ = io.WriteString(tokenOut, ".")
+			case "none":
+			default:
+				_, _ = io.WriteString(tokenOut, ".")
+			}
 		}
 	}
 	out := strings.TrimSpace(b.String())
 	if out != "" {
-		return out, nil
+		return out, estimateTokenCount(messages, out), nil
 	}
 
 	if lastFinish != "" {
-		return "", fmt.Errorf("chat completion returned empty content (finish_reason=%s)", lastFinish)
+		return "", 0, fmt.Errorf("chat completion returned empty content (finish_reason=%s)", lastFinish)
 	}
-	return "", fmt.Errorf("chat completion returned empty content")
+	return "", 0, fmt.Errorf("chat completion returned empty content")
+}
+
+type conversationHeaderRoundTripper struct {
+	Base           http.RoundTripper
+	ConversationID string
+}
+
+func (rt conversationHeaderRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := rt.Base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	out := req.Clone(req.Context())
+	out.Header = req.Header.Clone()
+	if cid := strings.TrimSpace(rt.ConversationID); cid != "" {
+		out.Header.Set("X-Conversation-ID", cid)
+	}
+	return base.RoundTrip(out)
+}
+
+func estimateTokenCount(messages []pingPongMessage, reply string) int {
+	totalChars := len(strings.TrimSpace(reply))
+	for _, m := range messages {
+		totalChars += len(strings.TrimSpace(m.Content))
+	}
+	if totalChars <= 0 {
+		return 0
+	}
+	// Rough heuristic used only for pingpong budget control.
+	return (totalChars + 3) / 4
 }
 
 func startWaitingSpinner(w io.Writer) func() {
@@ -1040,13 +1165,17 @@ func compactPingPongText(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-func checkServerHealth(serverBase string) statusHealth {
-	u := strings.TrimSuffix(serverBase, "/") + "/healthz"
+func (c *toroClient) checkServerHealth() statusHealth {
+	u := c.serverBase + "/healthz"
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
 		return statusHealth{Error: err.Error()}
 	}
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	client := c.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 20 * time.Second}
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return statusHealth{Error: err.Error()}
 	}
@@ -1060,17 +1189,17 @@ func checkServerHealth(serverBase string) statusHealth {
 	}
 }
 
-func readServerStatus(serverBase, apiKey string, periodSeconds int) (statusVersion, statusStats) {
+func (c *toroClient) readServerStatus(periodSeconds int) (statusVersion, statusStats) {
 	path := "/v1/status?period_seconds=" + strconv.Itoa(periodSeconds)
-	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(serverBase, "/")+path, nil)
+	req, err := http.NewRequest(http.MethodGet, c.serverBase+path, nil)
 	if err != nil {
 		msg := err.Error()
 		return statusVersion{Error: msg}, statusStats{Error: msg}
 	}
-	if strings.TrimSpace(apiKey) != "" {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
-	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		msg := err.Error()
 		return statusVersion{Error: msg}, statusStats{Error: msg}
@@ -1254,8 +1383,8 @@ func printStatusReportHuman(w io.Writer, report statusReport) {
 	}
 }
 
-func readModelsStatus(serverBase, apiKey string) statusModels {
-	models, err := fetchModels(serverBase, apiKey)
+func (c *toroClient) readModelsStatus() statusModels {
+	models, err := c.fetchModels()
 	if err != nil {
 		return statusModels{
 			Status: "unavailable",
@@ -1463,7 +1592,7 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 	}
 	defer cleanup()
 
-	selectedModel, selectedModelMsg, selErr := selectCodexModel(serverBase, cfg.APIKey, model)
+	selectedModel, selectedModelMsg, selErr := newToroClient(serverBase, cfg.APIKey).selectCodexModel(model)
 	if selErr != nil {
 		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to auto-select model: %v\n", selErr)
 	}
@@ -1509,16 +1638,16 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 	return nil
 }
 
-func selectCodexModel(serverBase, apiKey, requested string) (string, string, error) {
+func (c *toroClient) selectCodexModel(requested string) (string, string, error) {
 	requested = strings.TrimSpace(requested)
 	if requested != "" {
 		return requested, "", nil
 	}
-	auto, err := discoverZeroCostModels(serverBase, apiKey)
+	auto, err := c.discoverZeroCostModels()
 	if err == nil && len(auto) > 0 {
 		return auto[0], "Auto-selected model: " + auto[0], nil
 	}
-	models, err := fetchModels(serverBase, apiKey)
+	models, err := c.fetchModels()
 	if err != nil {
 		if len(auto) == 0 {
 			return "", "", err
@@ -1733,7 +1862,15 @@ func randomTemporaryKey() (string, error) {
 	return "tor_tmp_" + enc, nil
 }
 
-func adminAPIRequest(serverBase, bearer, method, path string, body any) (*http.Response, error) {
+func randomConversationID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "toroconv_" + base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+func (c *toroClient) adminAPIRequest(bearer, method, path string, body any) (*http.Response, error) {
 	var buf io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -1742,7 +1879,7 @@ func adminAPIRequest(serverBase, bearer, method, path string, body any) (*http.R
 		}
 		buf = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, strings.TrimSuffix(serverBase, "/")+path, buf)
+	req, err := http.NewRequest(method, c.serverBase+path, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -1750,12 +1887,11 @@ func adminAPIRequest(serverBase, bearer, method, path string, body any) (*http.R
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
-	return client.Do(req)
+	return c.httpClient.Do(req)
 }
 
 func fetchAccessTokens(serverBase, bearer string) ([]accessTokenItem, error) {
-	r, err := adminAPIRequest(serverBase, bearer, http.MethodGet, "/admin/api/access-tokens", nil)
+	r, err := newToroClient(serverBase, "").adminAPIRequest(bearer, http.MethodGet, "/admin/api/access-tokens", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1778,7 +1914,7 @@ func createAccessToken(serverBase, bearer, name, key, role, expiresAt string) er
 		"role":       strings.TrimSpace(role),
 		"expires_at": strings.TrimSpace(expiresAt),
 	}
-	r, err := adminAPIRequest(serverBase, bearer, http.MethodPost, "/admin/api/access-tokens", payload)
+	r, err := newToroClient(serverBase, "").adminAPIRequest(bearer, http.MethodPost, "/admin/api/access-tokens", payload)
 	if err != nil {
 		return err
 	}
@@ -1825,7 +1961,7 @@ func deleteAccessToken(serverBase, bearer, id string) error {
 	if id == "" {
 		return fmt.Errorf("missing token id")
 	}
-	r, err := adminAPIRequest(serverBase, bearer, http.MethodDelete, "/admin/api/access-tokens/"+neturl.PathEscape(id), nil)
+	r, err := newToroClient(serverBase, "").adminAPIRequest(bearer, http.MethodDelete, "/admin/api/access-tokens/"+neturl.PathEscape(id), nil)
 	if err != nil {
 		return err
 	}

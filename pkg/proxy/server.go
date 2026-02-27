@@ -762,7 +762,7 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	clientMeta := extractClientUsageMeta(r, s.store.Snapshot())
 	captureEnabled := isConversationCaptureEndpoint(r.URL.Path)
-	reqConversationID, reqPrevResponseID := parseConversationRequestIDs(body)
+	reqConversationID, reqPrevResponseID := parseConversationRequestIDs(r.Header, body)
 	requestPayloadRaw := capConversationRawText(body, 128<<10)
 	requestHeaders := sanitizeConversationRequestHeaders(r.Header)
 	requestHeadersRaw := conversationHeadersMapToRaw(requestHeaders)
@@ -2003,16 +2003,46 @@ func normalizeConversationEndpoint(path string) string {
 	}
 }
 
-func parseConversationRequestIDs(body []byte) (conversationID string, previousResponseID string) {
+func parseConversationRequestIDs(headers http.Header, body []byte) (conversationID string, previousResponseID string) {
+	conversationID = strings.TrimSpace(firstHeaderValue(headers,
+		"X-Conversation-ID",
+		"Conversation-ID",
+		"X-Session-ID",
+	))
+	previousResponseID = strings.TrimSpace(firstHeaderValue(headers,
+		"X-Previous-Response-ID",
+		"Previous-Response-ID",
+	))
 	if len(body) == 0 {
-		return "", ""
+		return conversationID, previousResponseID
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", ""
+		return conversationID, previousResponseID
 	}
-	conversationID = strings.TrimSpace(asStringAny(firstMapValueAny(payload, "conversation_id", "conversationId")))
-	previousResponseID = strings.TrimSpace(asStringAny(firstMapValueAny(payload, "previous_response_id", "previousResponseId")))
+	if conversationID == "" {
+		conversationID = strings.TrimSpace(asStringAny(firstMapValueAny(
+			payload,
+			"conversation_id",
+			"conversationId",
+			"thread_id",
+			"threadId",
+		)))
+		if conversationID == "" {
+			if metadata, ok := payload["metadata"].(map[string]any); ok {
+				conversationID = strings.TrimSpace(asStringAny(firstMapValueAny(
+					metadata,
+					"conversation_id",
+					"conversationId",
+					"thread_id",
+					"threadId",
+				)))
+			}
+		}
+	}
+	if previousResponseID == "" {
+		previousResponseID = strings.TrimSpace(asStringAny(firstMapValueAny(payload, "previous_response_id", "previousResponseId")))
+	}
 	return conversationID, previousResponseID
 }
 
@@ -2175,6 +2205,15 @@ func firstMapValueAny(m map[string]any, keys ...string) any {
 		}
 	}
 	return nil
+}
+
+func firstHeaderValue(h http.Header, keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(h.Get(k)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func asStringAny(v any) string {

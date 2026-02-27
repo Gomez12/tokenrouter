@@ -74,6 +74,7 @@ function adminApp() {
     accessTokensTableHtml: '',
     accessTokensPagerHtml: '',
     modelsTableHtml: '',
+    benchmarkHtml: '<div class="small text-body-secondary">No benchmark running.</div>',
     modelsFreshnessHtml: '',
     modalStatusHtml: '',
     deviceCodeFetchInProgress: false,
@@ -106,6 +107,10 @@ function adminApp() {
     modelsRefreshInProgress: false,
     modelsInitialized: false,
     modelsInitialLoadInProgress: false,
+    showBenchmarkModal: false,
+    benchmarkRunning: false,
+    benchmarkRun: null,
+    benchmarkDraft: {chats_per_model: 3, messages_per_chat: 3, stop_after_tokens: 0},
     quotaRefreshInProgress: false,
     statsLoading: false,
     statsRenderToken: 0,
@@ -202,6 +207,7 @@ function adminApp() {
       this.loadSecuritySettings();
       this.refreshNetworkTabFromConfig();
       this.loadVersion();
+      this.loadBenchmarkStatus();
       this.startRealtimeUpdates();
       if (window.matchMedia) {
         const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -619,6 +625,8 @@ function adminApp() {
       this.persistActiveTab();
       if (tab === 'models' && !this.modelsInitialized) {
         this.loadModelsCatalog(true);
+      } else if (tab === 'benchmark') {
+        this.loadBenchmarkStatus();
       } else if (tab === 'quota') {
         this.loadStats(false);
       } else if (tab === 'providers') {
@@ -640,7 +648,7 @@ function adminApp() {
     restoreActiveTab() {
       try {
         const tab = window.localStorage.getItem(this.activeTabCacheKey);
-        if (tab === 'status' || tab === 'conversations' || tab === 'log' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'network' || tab === 'models') {
+        if (tab === 'status' || tab === 'conversations' || tab === 'log' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'network' || tab === 'models' || tab === 'benchmark') {
           this.activeTab = tab;
         }
       } catch (_) {}
@@ -662,6 +670,81 @@ function adminApp() {
       try {
         window.localStorage.setItem(this.activeTabCacheKey, this.activeTab);
       } catch (_) {}
+    },
+    openBenchmarkModal() {
+      this.showBenchmarkModal = true;
+    },
+    closeBenchmarkModal() {
+      this.showBenchmarkModal = false;
+    },
+    renderBenchmark() {
+      const r = this.benchmarkRun;
+      if (!r || !Array.isArray(r.models) || r.models.length === 0) {
+        this.benchmarkHtml = '<div class="small text-body-secondary">No benchmark running.</div>';
+        return;
+      }
+      const status = this.escapeHtml(String(r.status || 'unknown'));
+      const totals = 'Total tokens: ' + Number(r.total_tokens || 0) + ' (prompt ' + Number(r.total_prompt_tokens || 0) + ', completion ' + Number(r.total_completion_tokens || 0) + ')';
+      const rows = r.models.map((m) => {
+        const chats = Number(m.chats_done || 0) + '/' + Number(m.chats_total || 0);
+        const msgs = Number(m.messages_done || 0) + '/' + Number(m.messages_total || 0);
+        const toks = Number(m.total_tokens || 0);
+        const st = this.escapeHtml(String(m.status || 'unknown'));
+        const err = String(m.last_error || '').trim();
+        return '<tr>' +
+          '<td>' + this.escapeHtml(String(m.model || '')) + '</td>' +
+          '<td>' + st + '</td>' +
+          '<td class="text-end">' + chats + '</td>' +
+          '<td class="text-end">' + msgs + '</td>' +
+          '<td class="text-end">' + toks + '</td>' +
+          '<td class="small text-danger">' + this.escapeHtml(err) + '</td>' +
+        '</tr>';
+      }).join('');
+      this.benchmarkHtml =
+        '<div class="small mb-2">Status: <strong>' + status + '</strong> · ' + this.escapeHtml(totals) + '</div>' +
+        '<div class="table-responsive"><table class="table table-sm align-middle mb-0">' +
+        '<thead><tr><th>Model</th><th>Status</th><th class="text-end">Chats</th><th class="text-end">Messages</th><th class="text-end">Tokens</th><th>Error</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table></div>';
+    },
+    async loadBenchmarkStatus() {
+      const r = await this.apiFetch('/admin/api/benchmark', {headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) return;
+      const body = await r.json();
+      this.benchmarkRunning = !!body.running;
+      this.benchmarkRun = body.run || null;
+      this.renderBenchmark();
+    },
+    async startBenchmark() {
+      const models = (this.modelsCatalog || [])
+        .map((m) => ({p: String(m.provider || '').trim(), id: String(m.model || '').trim()}))
+        .filter((x) => x.p && x.id && x.id !== '-')
+        .map((x) => x.p + '/' + x.id);
+      if (!models.length) {
+        this.toastError('No models to benchmark.');
+        return;
+      }
+      const payload = {
+        chats_per_model: Math.max(1, Number(this.benchmarkDraft.chats_per_model || 1)),
+        messages_per_chat: Math.max(1, Number(this.benchmarkDraft.messages_per_chat || 1)),
+        stop_after_tokens: Math.max(0, Number(this.benchmarkDraft.stop_after_tokens || 0)),
+        models
+      };
+      const r = await this.apiFetch('/admin/api/benchmark/start', {method:'POST', headers:this.headers(), body:JSON.stringify(payload)});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) {
+        this.toastError('Failed to start benchmark.');
+        return;
+      }
+      this.closeBenchmarkModal();
+      this.activeTab = 'benchmark';
+      this.persistActiveTab();
+      await this.loadBenchmarkStatus();
+    },
+    async cancelBenchmark() {
+      const r = await this.apiFetch('/admin/api/benchmark/cancel', {method:'POST', headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      await this.loadBenchmarkStatus();
     },
     restoreThemeMode() {
       try {

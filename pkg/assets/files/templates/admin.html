@@ -191,6 +191,9 @@
     <li class="nav-item">
       <button class="nav-link rounded-top" :class="activeTab==='models' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('models')">Models/Pricing</button>
     </li>
+    <li class="nav-item" x-show="benchmarkRunning || (benchmarkRun && benchmarkRun.id)" style="display:none;">
+      <button class="nav-link rounded-top" :class="activeTab==='benchmark' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('benchmark')">Benchmark</button>
+    </li>
     <li class="nav-item">
       <button class="nav-link rounded-top" :class="activeTab==='access' ? 'active fw-semibold' : 'text-body-secondary border border-secondary'" @click="selectTab('access')">
         <span>Access</span>
@@ -685,6 +688,9 @@
         <div class="row g-2 mb-3">
           <div class="col-md-5"><input class="form-control" placeholder="Search provider or model" x-model="modelsSearch" @input="renderModelsCatalog()" /></div>
           <div class="col-md-7 d-flex justify-content-md-end gap-2">
+            <button class="btn btn-outline-secondary" @click="openBenchmarkModal()">
+              Benchmark
+            </button>
             <button :class="modelsFreeOnly ? 'btn btn-primary' : 'btn btn-outline-secondary'" @click="toggleFreeOnly()">
               Only free
             </button>
@@ -693,6 +699,49 @@
         </div>
         <div class="small text-body-secondary mb-2" x-html="modelsFreshnessHtml"></div>
         <div class="table-responsive" x-html="modelsTableHtml"></div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="activeTab==='benchmark'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h2 class="h5 mb-0">Benchmark</h2>
+          <button class="btn btn-outline-danger btn-sm" x-show="benchmarkRunning" style="display:none;" @click="cancelBenchmark()">Cancel</button>
+        </div>
+        <div x-html="benchmarkHtml"></div>
+      </div>
+    </div>
+  </div>
+
+  <div x-show="showBenchmarkModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeBenchmarkModal()">
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeBenchmarkModal()"></div>
+    <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
+      <div class="card shadow" style="width:100%;max-width:560px;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="h5 mb-0">Run Benchmark</h3>
+          <button class="icon-btn" @click="closeBenchmarkModal()" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="card-body">
+          <div class="mb-3">
+            <label class="form-label">Number of chats per model</label>
+            <input class="form-control" type="number" min="1" max="200" x-model.number="benchmarkDraft.chats_per_model" />
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Number of messages per chat</label>
+            <input class="form-control" type="number" min="1" max="20" x-model.number="benchmarkDraft.messages_per_chat" />
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Stop after X tokens (optional)</label>
+            <input class="form-control" type="number" min="0" x-model.number="benchmarkDraft.stop_after_tokens" />
+          </div>
+          <div class="small text-body-secondary mb-3">Uses currently listed models from Models/Pricing.</div>
+          <div class="d-flex justify-content-end gap-2">
+            <button class="btn btn-outline-secondary" @click="closeBenchmarkModal()">Cancel</button>
+            <button class="btn btn-primary" :disabled="benchmarkRunning" @click="startBenchmark()">Start</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>

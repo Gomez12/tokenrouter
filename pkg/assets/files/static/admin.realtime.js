@@ -149,6 +149,8 @@
       this.loadTLSSettings();
     } else if (this.activeTab === 'models') {
       this.loadModelsCatalog(false);
+    } else if (this.activeTab === 'benchmark' || this.benchmarkRunning) {
+      this.loadBenchmarkStatus();
     } else if (this.activeTab === 'conversations') {
       this.loadConversations(false);
     } else if (this.activeTab === 'log') {
@@ -184,6 +186,10 @@
     }
     if (s === 'models') {
       if (this.activeTab === 'models') this.loadModelsCatalog(false);
+      return;
+    }
+    if (s === 'benchmark') {
+      if (this.activeTab === 'benchmark' || this.benchmarkRunning) this.loadBenchmarkStatus();
       return;
     }
     if (s === 'conversations') {

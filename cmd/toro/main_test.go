@@ -185,7 +185,7 @@ func TestDiscoverZeroCostModelsFromV1Models(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	models, err := discoverZeroCostModels(srv.URL, "")
+	models, err := newToroClient(srv.URL, "").discoverZeroCostModels()
 	if err != nil {
 		t.Fatalf("discoverZeroCostModels: %v", err)
 	}
@@ -197,37 +197,41 @@ func TestDiscoverZeroCostModelsFromV1Models(t *testing.T) {
 func TestRunPingPongWithProvidedModels(t *testing.T) {
 	var mu sync.Mutex
 	callCount := 0
+	conversationIDs := []string{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-			case "/v1/chat/completions":
-				var req struct {
-					Model    string `json:"model"`
-					Stream   bool   `json:"stream"`
-					Messages []struct {
-						Role    string `json:"role"`
-						Content string `json:"content"`
-					} `json:"messages"`
-				}
-				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-					t.Fatalf("decode request: %v", err)
-				}
-				if !req.Stream {
-					t.Fatal("expected stream=true request")
-				}
-				content := ""
-				if len(req.Messages) >= 2 && strings.Contains(strings.ToLower(req.Messages[len(req.Messages)-1].Content), "short random question") {
-					content = "What is your favorite season?"
+		case "/v1/chat/completions":
+			mu.Lock()
+			conversationIDs = append(conversationIDs, strings.TrimSpace(r.Header.Get("X-Conversation-ID")))
+			mu.Unlock()
+			var req struct {
+				Model    string `json:"model"`
+				Stream   bool   `json:"stream"`
+				Messages []struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if !req.Stream {
+				t.Fatal("expected stream=true request")
+			}
+			content := ""
+			if len(req.Messages) >= 2 && strings.Contains(strings.ToLower(req.Messages[len(req.Messages)-1].Content), "short random question") {
+				content = "What is your favorite season?"
 			} else {
 				mu.Lock()
 				callCount++
-					n := callCount
-					mu.Unlock()
-					content = req.Model + " reply " + strconv.Itoa(n)
-				}
-				writeChatStreamChunk(w, content)
-			default:
-				http.NotFound(w, r)
+				n := callCount
+				mu.Unlock()
+				content = req.Model + " reply " + strconv.Itoa(n)
 			}
+			writeChatStreamChunk(w, content)
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	defer srv.Close()
 
@@ -242,15 +246,32 @@ func TestRunPingPongWithProvidedModels(t *testing.T) {
 	var out bytes.Buffer
 	cmd := &cobra.Command{}
 	cmd.SetOut(&out)
-	if err := runPingPong(cmd, cfgPath, "provider-a/m1,provider-b/m2", 2, ""); err != nil {
+	if err := runPingPong(cmd, cfgPath, "provider-a/m1,provider-b/m2", 2, "Manual starter?", "none", 10000, 1, "words"); err != nil {
 		t.Fatalf("runPingPong: %v", err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "Seed (provider-a/m1): What is your favorite season?") {
+	if !strings.Contains(got, "Seed (provider-a/m1): Manual starter?") {
 		t.Fatalf("missing seed output:\n%s", got)
 	}
 	if !strings.Contains(got, "B[2] (provider-b/m2):") || !strings.Contains(got, "A[2] (provider-a/m1):") {
 		t.Fatalf("missing iteration output:\n%s", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(conversationIDs) == 0 {
+		t.Fatal("expected at least one chat request")
+	}
+	first := conversationIDs[0]
+	if first == "" {
+		t.Fatal("expected non-empty X-Conversation-ID header")
+	}
+	if !strings.HasPrefix(first, "toroconv_") {
+		t.Fatalf("expected toroconv_ prefix, got %q", first)
+	}
+	for i := 1; i < len(conversationIDs); i++ {
+		if conversationIDs[i] != first {
+			t.Fatalf("expected stable X-Conversation-ID across run, got %q vs %q", first, conversationIDs[i])
+		}
 	}
 }
 
@@ -285,7 +306,7 @@ func TestRunPingPongWithManualStarter(t *testing.T) {
 	var out bytes.Buffer
 	cmd := &cobra.Command{}
 	cmd.SetOut(&out)
-	if err := runPingPong(cmd, cfgPath, "a/m,b/m", 1, "What is one tiny win today?"); err != nil {
+	if err := runPingPong(cmd, cfgPath, "a/m,b/m", 1, "What is one tiny win today?", "none", 10000, 1, "words"); err != nil {
 		t.Fatalf("runPingPong: %v", err)
 	}
 	got := out.String()
@@ -305,10 +326,13 @@ func writeChatStreamChunk(w http.ResponseWriter, content string) {
 	_, _ = fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{
 		"id":     "chatcmpl-test",
 		"object": "chat.completion.chunk",
+		"created": 1,
+		"model":  "test-model",
 		"choices": []map[string]any{
 			{
 				"index": 0,
 				"delta": map[string]any{
+					"role":    "assistant",
 					"content": content,
 				},
 			},
@@ -350,7 +374,7 @@ func TestStreamChatCompletionErrorsWhenStreamIsEmpty(t *testing.T) {
 	defer srv.Close()
 
 	var out bytes.Buffer
-	got, err := streamChatCompletion(srv.URL, "k", "p/m", []pingPongMessage{{Role: "user", Content: "hi"}}, 0.7, 32, &out, nil)
+	got, _, err := newToroClient(srv.URL, "k").withConversationID("test-conv").streamChatCompletion("p/m", []pingPongMessage{{Role: "user", Content: "hi"}}, 0.7, 32, "none", "words", &out, nil)
 	if err == nil {
 		t.Fatalf("expected error, got content %q", got)
 	}

@@ -134,6 +134,97 @@ func TestProxyHandlerCapturesConversation(t *testing.T) {
 	}
 }
 
+func TestProxyHandlerCapturesSeparateConversationsByHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"resp_conv_h","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.NewDefaultServerConfig()
+	cfg.Providers = []config.ProviderConfig{
+		{
+			Name:           "test-provider",
+			BaseURL:        upstream.URL + "/v1",
+			APIKey:         "test-key",
+			Enabled:        true,
+			TimeoutSeconds: 10,
+		},
+	}
+	store := config.NewServerConfigStore(filepath.Join(t.TempDir(), "config.toml"), cfg)
+	resolver := NewProviderResolver(store)
+	s := &Server{
+		store:                 store,
+		resolver:              resolver,
+		stats:                 NewStatsStore(100),
+		providerHealthChecker: NewProviderHealthChecker(resolver, providerHealthCheckInterval),
+		adminHandler: &AdminHandler{
+			conversations: conversations.NewStore("", conversations.Settings{Enabled: true, MaxItems: 1000, MaxAgeDays: 30}),
+			wsClients:     map[*adminWSClient]struct{}{},
+		},
+	}
+
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-provider/test-model","messages":[{"role":"user","content":"hi"}]}`))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("X-Conversation-ID", "conv-A")
+	w1 := httptest.NewRecorder()
+	s.proxyHandler(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected first request 200, got %d body=%s", w1.Code, w1.Body.String())
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-provider/test-model","messages":[{"role":"user","content":"hello"}]}`))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Conversation-ID", "conv-B")
+	w2 := httptest.NewRecorder()
+	s.proxyHandler(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected second request 200, got %d body=%s", w2.Code, w2.Body.String())
+	}
+
+	threads, _, total := s.adminHandler.conversations.ListThreads(conversations.ListFilter{Limit: 100})
+	if total != 2 || len(threads) != 2 {
+		t.Fatalf("expected exactly 2 conversation threads, got total=%d len=%d", total, len(threads))
+	}
+	keys := map[string]bool{}
+	for _, th := range threads {
+		keys[th.ConversationKey] = true
+	}
+	if !keys["cid:conv-A"] || !keys["cid:conv-B"] {
+		t.Fatalf("expected cid:conv-A and cid:conv-B, got %#v", keys)
+	}
+}
+
+func TestParseConversationRequestIDsPrefersHeaderAndReadsMetadata(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Conversation-ID", "header-conv")
+	h.Set("X-Previous-Response-ID", "prev-header")
+	body := []byte(`{
+		"conversation_id":"payload-conv",
+		"previous_response_id":"prev-payload",
+		"metadata":{"conversation_id":"meta-conv"}
+	}`)
+	cid, prev := parseConversationRequestIDs(h, body)
+	if cid != "header-conv" {
+		t.Fatalf("expected header conversation id, got %q", cid)
+	}
+	if prev != "prev-header" {
+		t.Fatalf("expected header previous response id, got %q", prev)
+	}
+
+	cid2, prev2 := parseConversationRequestIDs(nil, []byte(`{
+		"metadata":{"conversation_id":"meta-only"},
+		"previous_response_id":"prev-only"
+	}`))
+	if cid2 != "meta-only" {
+		t.Fatalf("expected metadata conversation id, got %q", cid2)
+	}
+	if prev2 != "prev-only" {
+		t.Fatalf("expected payload previous response id, got %q", prev2)
+	}
+}
+
 func TestProxyHandlerStreamingRecordsUsageRequest(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

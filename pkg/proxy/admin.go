@@ -77,6 +77,8 @@ type AdminHandler struct {
 	runAccessTokenCleanup   func()
 	conversationViewCacheMu sync.Mutex
 	conversationViewCache   map[string]conversationViewCacheEntry
+	benchmarkMu             sync.Mutex
+	benchmarkRun            *benchmarkRun
 }
 
 type adminWSClient struct {
@@ -118,6 +120,38 @@ type oauthSession struct {
 	ExpiresAt    string
 	AccountID    string
 	BaseURL      string
+}
+
+type benchmarkRun struct {
+	ID               string                  `json:"id"`
+	StartedAt        string                  `json:"started_at"`
+	Status           string                  `json:"status"`
+	Strategy         benchmarkStrategy       `json:"strategy"`
+	Models           []benchmarkModelProgress `json:"models"`
+	TotalPrompt      int                     `json:"total_prompt_tokens"`
+	TotalCompletion  int                     `json:"total_completion_tokens"`
+	TotalTokens      int                     `json:"total_tokens"`
+	Error            string                  `json:"error,omitempty"`
+	cancel           context.CancelFunc
+}
+
+type benchmarkStrategy struct {
+	ChatsPerModel   int `json:"chats_per_model"`
+	MessagesPerChat int `json:"messages_per_chat"`
+	StopAfterTokens int `json:"stop_after_tokens"`
+}
+
+type benchmarkModelProgress struct {
+	Model            string `json:"model"`
+	Status           string `json:"status"`
+	ChatsTotal       int    `json:"chats_total"`
+	ChatsDone        int    `json:"chats_done"`
+	MessagesTotal    int    `json:"messages_total"`
+	MessagesDone     int    `json:"messages_done"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	TotalTokens      int    `json:"total_tokens"`
+	LastError        string `json:"last_error,omitempty"`
 }
 
 type quotaCacheValue struct {
@@ -251,6 +285,9 @@ func (h *AdminHandler) RegisterRoutes(r chi.Router) {
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/models/refresh", h.refreshModelsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/models", h.modelsCatalogAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/models/catalog", h.modelsCatalogAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/benchmark", h.benchmarkStatusAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/benchmark/start", h.benchmarkStartAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/benchmark/cancel", h.benchmarkCancelAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/settings/conversations", h.conversationsSettingsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/settings/conversations", h.conversationsSettingsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/settings/logs", h.logsSettingsAPI)
@@ -5882,6 +5919,223 @@ func (h *AdminHandler) refreshModelsAPI(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": models})
+}
+
+func (h *AdminHandler) benchmarkStatusAPI(w http.ResponseWriter, r *http.Request) {
+	h.benchmarkMu.Lock()
+	defer h.benchmarkMu.Unlock()
+	if h.benchmarkRun == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"running": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"running": h.benchmarkRun.Status == "running", "run": h.benchmarkRun})
+}
+
+func (h *AdminHandler) benchmarkStartAPI(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ChatsPerModel   int      `json:"chats_per_model"`
+		MessagesPerChat int      `json:"messages_per_chat"`
+		StopAfterTokens int      `json:"stop_after_tokens"`
+		Models          []string `json:"models"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.ChatsPerModel <= 0 {
+		req.ChatsPerModel = 1
+	}
+	if req.MessagesPerChat <= 0 {
+		req.MessagesPerChat = 1
+	}
+	if req.MessagesPerChat > 20 {
+		req.MessagesPerChat = 20
+	}
+	if req.ChatsPerModel > 200 {
+		req.ChatsPerModel = 200
+	}
+	models := make([]string, 0, len(req.Models))
+	seen := map[string]struct{}{}
+	for _, m := range req.Models {
+		x := strings.TrimSpace(m)
+		if x == "" {
+			continue
+		}
+		if _, ok := seen[x]; ok {
+			continue
+		}
+		seen[x] = struct{}{}
+		models = append(models, x)
+	}
+	if len(models) == 0 {
+		http.Error(w, "at least one model is required", http.StatusBadRequest)
+		return
+	}
+
+	h.benchmarkMu.Lock()
+	if h.benchmarkRun != nil && h.benchmarkRun.Status == "running" {
+		h.benchmarkMu.Unlock()
+		http.Error(w, "benchmark already running", http.StatusConflict)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &benchmarkRun{
+		ID:        fmt.Sprintf("bench-%d", time.Now().UTC().UnixNano()),
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		Status:    "running",
+		Strategy: benchmarkStrategy{
+			ChatsPerModel:   req.ChatsPerModel,
+			MessagesPerChat: req.MessagesPerChat,
+			StopAfterTokens: req.StopAfterTokens,
+		},
+		Models: make([]benchmarkModelProgress, 0, len(models)),
+		cancel: cancel,
+	}
+	for _, m := range models {
+		run.Models = append(run.Models, benchmarkModelProgress{
+			Model:         m,
+			Status:        "queued",
+			ChatsTotal:    req.ChatsPerModel,
+			MessagesTotal: req.ChatsPerModel * req.MessagesPerChat,
+		})
+	}
+	h.benchmarkRun = run
+	h.benchmarkMu.Unlock()
+
+	go h.runBenchmark(ctx, run)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "run": run})
+}
+
+func (h *AdminHandler) benchmarkCancelAPI(w http.ResponseWriter, r *http.Request) {
+	h.benchmarkMu.Lock()
+	defer h.benchmarkMu.Unlock()
+	if h.benchmarkRun == nil || h.benchmarkRun.Status != "running" {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "idle"})
+		return
+	}
+	h.benchmarkRun.Status = "cancelling"
+	if h.benchmarkRun.cancel != nil {
+		h.benchmarkRun.cancel()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (h *AdminHandler) runBenchmark(ctx context.Context, run *benchmarkRun) {
+	stopAfter := run.Strategy.StopAfterTokens
+	for i := range run.Models {
+		select {
+		case <-ctx.Done():
+			h.finishBenchmark("cancelled", "")
+			return
+		default:
+		}
+		h.benchmarkMu.Lock()
+		run.Models[i].Status = "running"
+		h.benchmarkMu.Unlock()
+
+		for c := 0; c < run.Strategy.ChatsPerModel; c++ {
+			for m := 0; m < run.Strategy.MessagesPerChat; m++ {
+				select {
+				case <-ctx.Done():
+					h.finishBenchmark("cancelled", "")
+					return
+				default:
+				}
+				p, ct, tt, err := h.runBenchmarkMessage(ctx, run.Models[i].Model, c, m)
+				h.benchmarkMu.Lock()
+				run.Models[i].MessagesDone++
+				if (m + 1) == run.Strategy.MessagesPerChat {
+					run.Models[i].ChatsDone++
+				}
+				run.Models[i].PromptTokens += p
+				run.Models[i].CompletionTokens += ct
+				run.Models[i].TotalTokens += tt
+				run.TotalPrompt += p
+				run.TotalCompletion += ct
+				run.TotalTokens += tt
+				if err != nil {
+					run.Models[i].Status = "error"
+					run.Models[i].LastError = err.Error()
+				}
+				h.benchmarkMu.Unlock()
+				h.notifyAdminChanged("benchmark")
+				if stopAfter > 0 {
+					h.benchmarkMu.Lock()
+					stop := run.TotalTokens >= stopAfter
+					h.benchmarkMu.Unlock()
+					if stop {
+						h.finishBenchmark("completed", "")
+						return
+					}
+				}
+			}
+		}
+		h.benchmarkMu.Lock()
+		if run.Models[i].Status == "running" {
+			run.Models[i].Status = "done"
+		}
+		h.benchmarkMu.Unlock()
+		h.notifyAdminChanged("benchmark")
+	}
+	h.finishBenchmark("completed", "")
+}
+
+func (h *AdminHandler) finishBenchmark(status, errMsg string) {
+	h.benchmarkMu.Lock()
+	defer h.benchmarkMu.Unlock()
+	if h.benchmarkRun == nil {
+		return
+	}
+	h.benchmarkRun.Status = strings.TrimSpace(status)
+	h.benchmarkRun.Error = strings.TrimSpace(errMsg)
+	if h.benchmarkRun.cancel != nil {
+		h.benchmarkRun.cancel()
+		h.benchmarkRun.cancel = nil
+	}
+	h.notifyAdminChanged("benchmark")
+}
+
+func (h *AdminHandler) runBenchmarkMessage(ctx context.Context, model string, chatIdx, msgIdx int) (int, int, int, error) {
+	provider, upstreamModel, err := h.resolver.Resolve(model)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	provider = refreshOAuthTokenForProvider(ctx, h.store, provider)
+	payload := map[string]any{
+		"model":       upstreamModel,
+		"temperature": 0.2,
+		"messages": []map[string]string{
+			{"role": "system", "content": "Be concise."},
+			{"role": "user", "content": fmt.Sprintf("Benchmark chat %d message %d. Reply with one short sentence.", chatIdx+1, msgIdx+1)},
+		},
+	}
+	body, _ := json.Marshal(payload)
+	u, err := url.Parse(strings.TrimRight(provider.BaseURL, "/"))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	u.Path = joinProviderPath(u.Path, "/v1/chat/completions")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	applyUpstreamProviderHeaders(req, provider, http.Header{})
+	cli := &http.Client{Timeout: time.Duration(max(10, provider.TimeoutSeconds)) * time.Second}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		msg := strings.TrimSpace(string(respBody))
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return 0, 0, 0, fmt.Errorf("status %d: %s", resp.StatusCode, msg)
+	}
+	p, c, t := parseUsageTokens(respBody)
+	return p, c, t, nil
 }
 
 func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) {
