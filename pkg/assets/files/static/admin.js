@@ -133,6 +133,7 @@ function adminApp() {
     accessTokens: [],
     requiresInitialTokenSetup: false,
     initialSetupDialogDismissed: false,
+    initialSetupDialogDismissCacheKey: 'opp_initial_setup_dialog_dismissed_v1',
     showAddAccessTokenModal: false,
     showConfirmModal: false,
     confirmModalTitle: 'Confirm Action',
@@ -193,6 +194,7 @@ function adminApp() {
       this.restoreStatusUpdateSpeed();
       this.restoreLogLevelFilter();
       this.restoreActiveTab();
+      this.restoreInitialSetupDialogDismissed();
       this.loadStats(false);
       this.loadProviders();
       this.loadAccessTokens();
@@ -2342,6 +2344,24 @@ function adminApp() {
       this.showAddAccessTokenModal = false;
       this.accessTokenDraft = {id:'', name:'', key:'', role:'inferrer', expiry_preset:'never', expires_at:'', quota_enabled:false, quota_requests_limit:'', quota_requests_interval_seconds:'0', quota_tokens_limit:'', quota_tokens_interval_seconds:'0', disable_localhost_no_auth:false};
     },
+    persistInitialSetupDialogDismissed() {
+      try {
+        if (this.initialSetupDialogDismissed) window.localStorage.setItem(this.initialSetupDialogDismissCacheKey, '1');
+        else window.localStorage.removeItem(this.initialSetupDialogDismissCacheKey);
+      } catch (_) {}
+    },
+    restoreInitialSetupDialogDismissed() {
+      try {
+        this.initialSetupDialogDismissed = window.localStorage.getItem(this.initialSetupDialogDismissCacheKey) === '1';
+      } catch (_) {
+        this.initialSetupDialogDismissed = false;
+      }
+    },
+    dismissInitialSetupDialogForever() {
+      this.initialSetupDialogDismissed = true;
+      this.persistInitialSetupDialogDismissed();
+      this.closeAddAccessTokenModal();
+    },
     buildAccessTokenQuotaPayload() {
       if (!this.accessTokenDraft.quota_enabled) return null;
       const reqLimit = Math.max(0, Number(this.accessTokenDraft.quota_requests_limit || 0));
@@ -3012,6 +3032,7 @@ function adminApp() {
         }
       } else {
         this.initialSetupDialogDismissed = false;
+        this.persistInitialSetupDialogDismissed();
       }
     },
     debouncedLoadConversations() {
