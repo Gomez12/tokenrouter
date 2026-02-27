@@ -1491,6 +1491,10 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 	if strings.TrimSpace(key) != "" {
 		env = append(env, "OPENAI_API_KEY="+key)
 		env = append(env, "CODEX_API_KEY="+key)
+	} else {
+		// Codex CLI requires CODEX_API_KEY to be present even when backend auth is disabled.
+		env = append(env, "CODEX_API_KEY=toro-localhost-noauth")
+		env = append(env, "OPENAI_API_KEY=toro-localhost-noauth")
 	}
 	if strings.TrimSpace(model) != "" {
 		env = append(env, "OPENAI_MODEL="+strings.TrimSpace(model))
