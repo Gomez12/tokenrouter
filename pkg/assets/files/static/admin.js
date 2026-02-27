@@ -3044,8 +3044,10 @@ function adminApp() {
       this.renderAccessTokens();
       this.requiresInitialTokenSetup = !Array.isArray(this.accessTokens) || this.accessTokens.length === 0;
       if (this.requiresInitialTokenSetup) {
-        this.activeTab = 'access';
-        this.persistActiveTab();
+        if (!this.initialSetupDialogDismissed) {
+          this.activeTab = 'access';
+          this.persistActiveTab();
+        }
         if (!this.showAddAccessTokenModal && !this.initialSetupDialogDismissed) {
           this.openAddAccessTokenModal();
           this.toastWarning('Create your first admin key now, or cancel to continue localhost unauthenticated.');
