@@ -26,8 +26,8 @@ import (
 	"github.com/lkarlslund/tokenrouter/pkg/config"
 	"github.com/lkarlslund/tokenrouter/pkg/logutil"
 	"github.com/lkarlslund/tokenrouter/pkg/version"
-	openai "github.com/sashabaranov/go-openai"
 	"github.com/pelletier/go-toml/v2"
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/spf13/cobra"
 )
 
@@ -49,17 +49,6 @@ func main() {
 	root.PersistentFlags().StringVar(&wrapperTokenName, "name", "", "Temporary token display name for wrapper commands (codex, opencode, wrap)")
 	root.PersistentFlags().DurationVar(&wrapperTTL, "ttl", 8*time.Hour, "Temporary token expiry duration for wrapper commands (codex, opencode, wrap)")
 
-	var clientConfigPath string
-	configCmd := &cobra.Command{
-		Use:   "config",
-		Short: "Configure remote TokenRouter server URL and API key",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runConnectTUI(cmd, clientConfigPath, "")
-		},
-	}
-	configCmd.Flags().StringVar(&clientConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
-	root.AddCommand(configCmd)
-
 	var connectConfigPath string
 	var connectServerConfigPath string
 	connectCmd := &cobra.Command{
@@ -72,15 +61,16 @@ func main() {
 	connectCmd.Flags().StringVar(&connectConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	connectCmd.Flags().StringVar(&connectServerConfigPath, "server-config", "", "Server config TOML path to read defaults from (also checks common paths)")
 	root.AddCommand(connectCmd)
+	var setKeyConfigPath string
 	setKeyCmd := &cobra.Command{
 		Use:   "set-key <api_key>",
 		Short: "Set and save client API key",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSetKey(cmd, clientConfigPath, args[0])
+			return runSetKey(cmd, setKeyConfigPath, args[0])
 		},
 	}
-	setKeyCmd.Flags().StringVar(&clientConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
+	setKeyCmd.Flags().StringVar(&setKeyConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
 	root.AddCommand(setKeyCmd)
 
 	var statusConfigPath string
@@ -197,10 +187,6 @@ func main() {
 	}
 }
 
-func runConfigTUI(cmd *cobra.Command, path string) error {
-	return runConnectTUI(cmd, path, "")
-}
-
 func runConnectTUI(cmd *cobra.Command, path, explicitServerConfigPath string) error {
 	cfg, err := config.LoadOrCreateClientConfig(path)
 	if err != nil {
@@ -273,6 +259,49 @@ func runConnectTUI(cmd *cobra.Command, path, explicitServerConfigPath string) er
 		return fmt.Errorf("save client config: %w", err)
 	}
 	fmt.Fprintln(out, "Saved.")
+	if err := checkToroConnection(cfg); err != nil {
+		fmt.Fprintf(out, "Connect check: failed (%v)\n", err)
+	} else {
+		fmt.Fprintln(out, "Connect check: OK")
+	}
+	return nil
+}
+
+func checkToroConnection(cfg *config.ClientConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("empty config")
+	}
+	base := strings.TrimRight(strings.TrimSpace(cfg.ServerURL), "/")
+	if base == "" {
+		return fmt.Errorf("missing server URL")
+	}
+	u, err := neturl.Parse(base)
+	if err != nil {
+		return fmt.Errorf("invalid server URL: %w", err)
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/v1/models"
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.APIKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(cfg.APIKey))
+	}
+	req.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		msg := strings.TrimSpace(string(b))
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, msg)
+	}
 	return nil
 }
 
@@ -540,6 +569,13 @@ type statusReport struct {
 	Health    statusHealth  `json:"health"`
 	Version   statusVersion `json:"version"`
 	Stats     statusStats   `json:"stats"`
+	Models    statusModels  `json:"models"`
+}
+
+type statusModels struct {
+	Status string `json:"status"`
+	Count  int    `json:"count,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 type modelsModel struct {
@@ -580,14 +616,10 @@ func runStatus(cmd *cobra.Command, cfgPath string, asJSON bool, periodSeconds in
 
 	report.Health = checkServerHealth(serverBase)
 
-	if strings.TrimSpace(cfg.APIKey) == "" {
-		report.Version.Error = "api key not configured in toro client config"
-		report.Stats.Error = "api key not configured in toro client config"
-	} else {
-		v, s := readServerStatus(serverBase, cfg.APIKey, periodSeconds)
-		report.Version = v
-		report.Stats = s
-	}
+	v, s := readServerStatus(serverBase, cfg.APIKey, periodSeconds)
+	report.Version = v
+	report.Stats = s
+	report.Models = readModelsStatus(serverBase, cfg.APIKey)
 
 	if asJSON {
 		enc := json.NewEncoder(cmd.OutOrStdout())
@@ -1008,7 +1040,6 @@ func compactPingPongText(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-
 func checkServerHealth(serverBase string) statusHealth {
 	u := strings.TrimSuffix(serverBase, "/") + "/healthz"
 	req, err := http.NewRequest(http.MethodGet, u, nil)
@@ -1036,7 +1067,9 @@ func readServerStatus(serverBase, apiKey string, periodSeconds int) (statusVersi
 		msg := err.Error()
 		return statusVersion{Error: msg}, statusStats{Error: msg}
 	}
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	if strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	}
 	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 	if err != nil {
 		msg := err.Error()
@@ -1167,48 +1200,71 @@ func printStatusReportHuman(w io.Writer, report statusReport) {
 
 	if strings.TrimSpace(report.Stats.Error) != "" {
 		fmt.Fprintf(w, "Providers: unavailable (%s)\n", report.Stats.Error)
+		if strings.TrimSpace(report.Models.Error) != "" {
+			fmt.Fprintf(w, "Models: unavailable (%s)\n", report.Models.Error)
+		} else {
+			fmt.Fprintf(w, "Models: %d online / %d available\n", report.Models.Count, report.Models.Count)
+		}
 		fmt.Fprintln(w, "Quota: unavailable")
-		return
-	}
-
-	fmt.Fprintf(w, "Providers: %d online / %d available\n", report.Stats.ProvidersOnline, report.Stats.ProvidersAvailable)
-	if len(report.Stats.ProviderQuotas) == 0 {
-		fmt.Fprintln(w, "Quota: no data")
-		return
-	}
-	fmt.Fprintln(w, "Quota:")
-	for _, p := range report.Stats.ProviderQuotas {
-		status := strings.TrimSpace(p.Status)
-		if status == "" {
-			status = "unknown"
+	} else {
+		fmt.Fprintf(w, "Providers: %d online / %d available\n", report.Stats.ProvidersOnline, report.Stats.ProvidersAvailable)
+		if strings.TrimSpace(report.Models.Error) != "" {
+			fmt.Fprintf(w, "Models: unavailable (%s)\n", report.Models.Error)
+		} else {
+			fmt.Fprintf(w, "Models: %d online / %d available\n", report.Models.Count, report.Models.Count)
 		}
-		line := fmt.Sprintf("  - %s: status=%s", p.Provider, status)
-		if p.LeftPercent > 0 {
-			line += fmt.Sprintf(", left=%.1f%%", p.LeftPercent)
-		}
-		if strings.TrimSpace(p.ResetAt) != "" {
-			line += ", reset=" + p.ResetAt
-		}
-		if strings.TrimSpace(p.Error) != "" {
-			line += ", error=" + p.Error
-		}
-		fmt.Fprintln(w, line)
-		if len(p.Metrics) > 0 {
-			for _, m := range p.Metrics {
-				label := strings.TrimSpace(m.MeteredFeature)
-				if label == "" {
-					label = "quota"
+		if len(report.Stats.ProviderQuotas) == 0 {
+			fmt.Fprintln(w, "Quota: no data")
+		} else {
+			fmt.Fprintln(w, "Quota:")
+			for _, p := range report.Stats.ProviderQuotas {
+				status := strings.TrimSpace(p.Status)
+				if status == "" {
+					status = "unknown"
 				}
-				if strings.TrimSpace(m.Window) != "" {
-					label += "/" + m.Window
+				line := fmt.Sprintf("  - %s: status=%s", p.Provider, status)
+				if p.LeftPercent > 0 {
+					line += fmt.Sprintf(", left=%.1f%%", p.LeftPercent)
 				}
-				sub := fmt.Sprintf("      * %s: %.1f%% left", label, m.LeftPercent)
-				if strings.TrimSpace(m.ResetAt) != "" {
-					sub += ", reset=" + m.ResetAt
+				if strings.TrimSpace(p.ResetAt) != "" {
+					line += ", reset=" + p.ResetAt
 				}
-				fmt.Fprintln(w, sub)
+				if strings.TrimSpace(p.Error) != "" {
+					line += ", error=" + p.Error
+				}
+				fmt.Fprintln(w, line)
+				if len(p.Metrics) > 0 {
+					for _, m := range p.Metrics {
+						label := strings.TrimSpace(m.MeteredFeature)
+						if label == "" {
+							label = "quota"
+						}
+						if strings.TrimSpace(m.Window) != "" {
+							label += "/" + m.Window
+						}
+						sub := fmt.Sprintf("      * %s: %.1f%% left", label, m.LeftPercent)
+						if strings.TrimSpace(m.ResetAt) != "" {
+							sub += ", reset=" + m.ResetAt
+						}
+						fmt.Fprintln(w, sub)
+					}
+				}
 			}
 		}
+	}
+}
+
+func readModelsStatus(serverBase, apiKey string) statusModels {
+	models, err := fetchModels(serverBase, apiKey)
+	if err != nil {
+		return statusModels{
+			Status: "unavailable",
+			Error:  err.Error(),
+		}
+	}
+	return statusModels{
+		Status: "ok",
+		Count:  len(models),
 	}
 }
 
@@ -1234,10 +1290,10 @@ type accessTokenItem struct {
 func runOpencodeWrap(cmd *cobra.Command, cfgPath, tokenName, providerID, providerName, model string, ttl time.Duration, disableOtherProviders bool, opencodeArgs []string) error {
 	cfg, err := config.LoadClientConfig(cfgPath)
 	if err != nil {
-		return fmt.Errorf("load client config (run `toro config` first): %w", err)
+		return fmt.Errorf("load client config (run `toro connect` first): %w", err)
 	}
 	if strings.TrimSpace(cfg.APIKey) == "" {
-		return fmt.Errorf("client api key is required (set with: toro config)")
+		return fmt.Errorf("client api key is required (set with: toro connect)")
 	}
 	serverBase, err := deriveServerBaseURL(cfg.ServerURL)
 	if err != nil {
@@ -1352,10 +1408,10 @@ func runOpencodeWrap(cmd *cobra.Command, cfgPath, tokenName, providerID, provide
 func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time.Duration, codexArgs []string) error {
 	cfg, err := config.LoadClientConfig(cfgPath)
 	if err != nil {
-		return fmt.Errorf("load client config (run `toro config` first): %w", err)
+		return fmt.Errorf("load client config (run `toro connect` first): %w", err)
 	}
 	if strings.TrimSpace(cfg.APIKey) == "" {
-		return fmt.Errorf("client api key is required (set with: toro config)")
+		return fmt.Errorf("client api key is required (set with: toro connect)")
 	}
 	serverBase, err := deriveServerBaseURL(cfg.ServerURL)
 	if err != nil {
@@ -1437,11 +1493,11 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 func runGenericWrap(cmd *cobra.Command, cfgPath, tokenName string, ttl time.Duration, urlEnvName, keyEnvName string, args []string) error {
 	cfg, err := config.LoadClientConfig(cfgPath)
 	if err != nil {
-		return fmt.Errorf("load client config (run `toro config` first): %w", err)
+		return fmt.Errorf("load client config (run `toro connect` first): %w", err)
 	}
 	key := strings.TrimSpace(cfg.APIKey)
 	if key == "" {
-		return fmt.Errorf("client api key is required (set with: toro config)")
+		return fmt.Errorf("client api key is required (set with: toro connect)")
 	}
 	serverBase, err := deriveServerBaseURL(cfg.ServerURL)
 	if err != nil {
@@ -1721,7 +1777,7 @@ func formatAdminTokenAPIError(status int, body []byte) error {
 		if msg == "" {
 			msg = "unauthorized"
 		}
-		return fmt.Errorf("status %d: %s (toro wrappers require an admin or keymaster token in toro config)", status, msg)
+		return fmt.Errorf("status %d: %s (toro wrappers require an admin or keymaster token in toro connect)", status, msg)
 	}
 	if msg == "" {
 		msg = http.StatusText(status)
