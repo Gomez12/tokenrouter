@@ -326,6 +326,31 @@ func TestQuotaProvidersExcludesDisabledConfiguredProviders(t *testing.T) {
 	}
 }
 
+func TestReadAutoHeaderQuotaTreatsLocalOllamaAsPublicNoAuthWhenTypeIsCloud(t *testing.T) {
+	h := &AdminHandler{quotaCache: cache.NewTTLMap[string, quotaCacheValue]()}
+	p := config.ProviderConfig{
+		Name:         "ollama",
+		ProviderType: "ollama-cloud",
+		BaseURL:      "http://127.0.0.1:11434/v1",
+	}
+	snap := h.readAutoHeaderQuota(context.Background(), p, ProviderQuotaSnapshot{
+		Provider:     p.Name,
+		ProviderType: "ollama-cloud",
+		Reader:       "header_auto",
+		Status:       "error",
+		CheckedAt:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if snap.Status != "ok" {
+		t.Fatalf("expected ok status, got %+v", snap)
+	}
+	if snap.Error != "" {
+		t.Fatalf("expected empty error, got %q", snap.Error)
+	}
+	if snap.PlanType != "public" {
+		t.Fatalf("expected public plan type, got %q", snap.PlanType)
+	}
+}
+
 func TestReadGoogleAntigravityQuotaParsesMetrics(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1internal:loadCodeAssist" {

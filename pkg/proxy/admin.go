@@ -6292,7 +6292,7 @@ func (h *AdminHandler) refreshPricingAPI(w http.ResponseWriter, r *http.Request)
 	h.pricing.SetProviders(h.catalogProviders())
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
-	if err := h.pricing.Refresh(ctx); err != nil {
+	if err := h.pricing.ForceRefresh(ctx); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}

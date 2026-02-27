@@ -74,6 +74,7 @@ func NewManager(path string) (*Manager, error) {
 		return nil, err
 	}
 	m.sources = []ProviderPricingSource{
+		&AllFreePricingSource{},
 		&OpenCodeZenPricingSource{},
 		&GoogleGeminiDocsPricingSource{},
 		&NvidiaNIMPricingSource{},
@@ -103,6 +104,14 @@ func (m *Manager) EnsureFreshAsync() {
 }
 
 func (m *Manager) Refresh(ctx context.Context) error {
+	return m.refreshInternal(ctx, false)
+}
+
+func (m *Manager) ForceRefresh(ctx context.Context) error {
+	return m.refreshInternal(ctx, true)
+}
+
+func (m *Manager) refreshInternal(ctx context.Context, force bool) error {
 	m.mu.Lock()
 	if m.refreshing {
 		m.mu.Unlock()
@@ -137,7 +146,7 @@ func (m *Manager) Refresh(ctx context.Context) error {
 		if !p.Enabled {
 			continue
 		}
-		if !m.providerNeedsRefreshLocked(p.Name, now) {
+		if !force && !m.providerNeedsRefreshLocked(p.Name, now) {
 			continue
 		}
 		entries, source, err := m.fetchProviderPricing(ctx, p)
@@ -270,6 +279,12 @@ func (m *Manager) fetchProviderPricing(ctx context.Context, p config.ProviderCon
 }
 
 func providerTypeOrName(p config.ProviderConfig) string {
+	// Backward compatibility: older presets tagged local "ollama" as
+	// provider_type "ollama-cloud". Keep local ollama behavior separated from
+	// cloud even when stale config still carries that type.
+	if strings.EqualFold(strings.TrimSpace(p.Name), "ollama") {
+		return "ollama"
+	}
 	if v := strings.TrimSpace(p.ProviderType); v != "" {
 		return strings.ToLower(v)
 	}
@@ -324,10 +339,58 @@ func pricingModelsURLFor(p config.ProviderConfig, fallback string) string {
 	return fallback
 }
 
+func pricingGathererFor(p config.ProviderConfig) string {
+	if preset, ok := popularProviderFor(p); ok {
+		return strings.ToLower(strings.TrimSpace(preset.PricingGatherer))
+	}
+	return ""
+}
+
 type ProviderPricingSource interface {
 	Name() string
 	Match(config.ProviderConfig) bool
 	Fetch(context.Context, config.ProviderConfig) ([]ModelPricing, string, error)
+}
+
+type AllFreePricingSource struct{}
+
+func (s *AllFreePricingSource) Name() string { return "allfree" }
+
+func (s *AllFreePricingSource) Match(p config.ProviderConfig) bool {
+	if pricingGathererFor(p) == "allfree" {
+		return true
+	}
+	switch providerTypeOrName(p) {
+	case "ollama", "lmstudio":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *AllFreePricingSource) Fetch(ctx context.Context, p config.ProviderConfig) ([]ModelPricing, string, error) {
+	timeout := p.TimeoutSeconds
+	if timeout <= 0 {
+		timeout = 60
+	}
+	cli := &http.Client{Timeout: time.Duration(timeout) * time.Second}
+	modelIDs, err := fetchModelIDs(ctx, cli, p)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(modelIDs) == 0 {
+		return nil, "", fmt.Errorf("no models returned")
+	}
+	out := make([]ModelPricing, 0, len(modelIDs))
+	for _, id := range modelIDs {
+		out = append(out, ModelPricing{
+			Model:       id,
+			Currency:    "USD",
+			InputPer1M:  0,
+			OutputPer1M: 0,
+		})
+	}
+	return out, "allfree", nil
 }
 
 type ModelsEndpointPricingSource struct{}

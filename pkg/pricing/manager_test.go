@@ -2,8 +2,10 @@ package pricing
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -80,6 +82,55 @@ func TestProviderNeedsRefreshUsesLastAttemptWindow(t *testing.T) {
 	}
 }
 
+func TestForceRefreshBypassesRefreshInterval(t *testing.T) {
+	now := time.Now()
+	cachePath := filepath.Join(t.TempDir(), "pricing-cache.json")
+	m, err := NewManager(cachePath)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	m.cache = Cache{
+		UpdatedAt: now,
+		ProviderStates: map[string]ProviderState{
+			"ollama": {LastAttempt: now, LastUpdate: now},
+		},
+		Entries: map[string]ModelPricing{},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{"id": "llama3.1:8b"},
+			},
+		})
+	}))
+	defer srv.Close()
+	m.SetProviders([]config.ProviderConfig{
+		{Name: "ollama", ProviderType: "ollama", BaseURL: srv.URL + "/v1", Enabled: true, TimeoutSeconds: 5},
+	})
+
+	if err := m.ForceRefresh(context.Background()); err != nil {
+		t.Fatalf("force refresh: %v", err)
+	}
+	snap := m.Snapshot()
+	if _, ok := snap.Entries["ollama/llama3.1:8b"]; !ok {
+		t.Fatalf("expected forced refresh to populate ollama pricing entry, got %+v", snap.Entries)
+	}
+}
+
+func TestProviderTypeOrNameTreatsLocalOllamaAsLocal(t *testing.T) {
+	p := config.ProviderConfig{
+		Name:         "ollama",
+		ProviderType: "ollama-cloud",
+	}
+	if got := providerTypeOrName(p); got != "ollama" {
+		t.Fatalf("expected local ollama provider type, got %q", got)
+	}
+}
+
 func TestNvidiaNIMPricingSourceFetch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
@@ -131,6 +182,51 @@ func TestNvidiaNIMPricingSourceFetch(t *testing.T) {
 	got := strings.Join(models, ",")
 	if !strings.Contains(got, "meta/llama-3.1-70b-instruct") || !strings.Contains(got, "nvidia/llama-3.1-nemotron-ultra-253b-v1") {
 		t.Fatalf("unexpected models: %s", got)
+	}
+}
+
+func TestAllFreePricingSourceFetch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"llama3.2"},{"id":"qwen2.5"}]}`))
+	}))
+	defer srv.Close()
+
+	src := &AllFreePricingSource{}
+	provider := config.ProviderConfig{
+		Name:         "ollama",
+		ProviderType: "ollama",
+		BaseURL:      srv.URL + "/v1",
+	}
+	entries, source, err := src.Fetch(context.Background(), provider)
+	if err != nil {
+		t.Fatalf("fetch pricing: %v", err)
+	}
+	if source != "allfree" {
+		t.Fatalf("unexpected source: %q", source)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	for _, e := range entries {
+		if e.Currency != "USD" {
+			t.Fatalf("unexpected currency for %s: %s", e.Model, e.Currency)
+		}
+		if e.InputPer1M != 0 || e.OutputPer1M != 0 {
+			t.Fatalf("expected zero pricing for %s, got in=%f out=%f", e.Model, e.InputPer1M, e.OutputPer1M)
+		}
+	}
+	if !src.Match(provider) {
+		t.Fatal("expected allfree source to match local ollama")
+	}
+	if !src.Match(config.ProviderConfig{Name: "lmstudio", ProviderType: "lmstudio", BaseURL: "http://127.0.0.1:1234/v1"}) {
+		t.Fatal("expected allfree source to match lmstudio")
+	}
+	if src.Match(config.ProviderConfig{Name: "openai", ProviderType: "openai", BaseURL: "https://api.openai.com/v1"}) {
+		t.Fatal("did not expect allfree source to match non-local provider")
 	}
 }
 

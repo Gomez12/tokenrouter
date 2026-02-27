@@ -630,6 +630,12 @@ func resolveProviderWithDefaults(p config.ProviderConfig, preset config.Provider
 }
 
 func providerTypeOrName(p config.ProviderConfig) string {
+	// Backward compatibility: older presets tagged local "ollama" as
+	// provider_type "ollama-cloud". Keep local ollama behavior separated from
+	// cloud even when stale config still carries that type.
+	if strings.EqualFold(strings.TrimSpace(p.Name), "ollama") {
+		return "ollama"
+	}
 	if strings.TrimSpace(p.ProviderType) != "" {
 		return strings.TrimSpace(p.ProviderType)
 	}
