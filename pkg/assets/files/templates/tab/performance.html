@@ -1,0 +1,22 @@
+{{define "admin_tab_performance"}}
+  <div x-show="activeTab==='performance'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="row g-2 mb-3">
+          <div class="col-md-5"><input class="form-control" placeholder="Search provider or model" x-model="performanceSearch" @input="renderPerformanceCatalog()" /></div>
+          <div class="col-md-7 d-flex justify-content-md-end gap-2">
+            <select class="form-select form-select-sm" style="width:auto;" x-model="performanceRangeHours" @change="setPerformanceRangeHours($event.target.value)">
+              <option value="1">1h</option>
+              <option value="4">4h</option>
+              <option value="8">8h</option>
+              <option value="24">24h</option>
+              <option value="72">72h</option>
+            </select>
+            <button class="icon-btn" :disabled="modelsRefreshInProgress" @click="refreshPricingAndModels()" :title="modelsRefreshInProgress ? 'Refreshing' : 'Refresh'" aria-label="Refresh">↻</button>
+          </div>
+        </div>
+        <div class="table-responsive" x-html="performanceTableHtml"></div>
+      </div>
+    </div>
+  </div>
+{{end}}

@@ -1,0 +1,40 @@
+{{define "admin_tab_log"}}
+  <div x-show="activeTab==='log'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+          <h2 class="h5 mb-0">Log</h2>
+          <div class="d-flex flex-wrap align-items-center gap-2">
+            <button class="icon-btn" title="Log settings" aria-label="Log settings" @click="openLogSettingsModal()">⚙</button>
+            <select class="form-select form-select-sm" style="width:auto;" x-model="statusUpdateSpeed" @change="setStatusUpdateSpeed($event.target.value)">
+              <option value="realtime">realtime</option>
+              <option value="2s">2s</option>
+              <option value="10s">10s</option>
+              <option value="30s">30s</option>
+              <option value="1m">1m</option>
+              <option value="5m">5m</option>
+              <option value="15m">15m</option>
+              <option value="disabled">disabled</option>
+            </select>
+            <select class="form-select form-select-sm" style="width:auto;" x-model="logLevelFilter" @change="setLogLevelFilter($event.target.value)">
+              <option value="trace">trace</option>
+              <option value="debug">debug</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+              <option value="fatal">fatal</option>
+            </select>
+            <input class="form-control form-control-sm" style="width:320px;" placeholder="Filter log entries..." x-model.trim="logSearch" @input="debouncedLoadLogs()" />
+            <button class="icon-btn icon-btn-danger" @click="clearLogs()" :disabled="!logEntries || logEntries.length === 0" title="Clear log" aria-label="Clear log">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z"/></svg>
+            </button>
+            <button class="icon-btn" @click="loadLogs()" title="Refresh" aria-label="Refresh">↻</button>
+          </div>
+        </div>
+        <div class="small text-body-secondary mb-2">Entries shown: <span x-text="logEntriesShownCount"></span> of <span x-text="logEntriesTotalCount"></span></div>
+        <div class="border rounded p-2 table-responsive" style="max-height:70vh; overflow:auto;" x-html="logEntriesHtml"></div>
+        <div x-html="logPagerHtml"></div>
+      </div>
+    </div>
+  </div>
+{{end}}

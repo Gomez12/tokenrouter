@@ -11,7 +11,7 @@ import (
 	"github.com/lkarlslund/tokenrouter/pkg/config"
 )
 
-//go:embed files/templates/*.html files/popular-providers.json files/static/*
+//go:embed files/templates/*.html files/templates/tab/*.html files/popular-providers.json files/static/*
 var FS embed.FS
 
 type PopularProvider struct {
@@ -76,7 +76,7 @@ func (p PopularProvider) AsProviderConfig() config.ProviderConfig {
 }
 
 func ParseTemplates() (*template.Template, error) {
-	t, err := template.ParseFS(FS, "files/templates/*.html")
+	t, err := template.ParseFS(FS, "files/templates/*.html", "files/templates/tab/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse embedded templates: %w", err)
 	}

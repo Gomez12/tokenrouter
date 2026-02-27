@@ -1,0 +1,22 @@
+{{define "admin_tab_models"}}
+  <div x-show="activeTab==='models'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="row g-2 mb-3">
+          <div class="col-md-5"><input class="form-control" placeholder="Search provider or model" x-model="modelsSearch" @input="renderModelsCatalog()" /></div>
+          <div class="col-md-7 d-flex justify-content-md-end gap-2">
+            <button class="btn btn-outline-secondary" @click="openBenchmarkModal()">
+              Benchmark
+            </button>
+            <button :class="modelsFreeOnly ? 'btn btn-primary' : 'btn btn-outline-secondary'" @click="toggleFreeOnly()">
+              Only free
+            </button>
+            <button class="icon-btn" :disabled="modelsRefreshInProgress" @click="refreshPricingAndModels()" :title="modelsRefreshInProgress ? 'Refreshing' : 'Refresh'" aria-label="Refresh">↻</button>
+          </div>
+        </div>
+        <div class="small text-body-secondary mb-2" x-html="modelsFreshnessHtml"></div>
+        <div class="table-responsive" x-html="modelsTableHtml"></div>
+      </div>
+    </div>
+  </div>
+{{end}}

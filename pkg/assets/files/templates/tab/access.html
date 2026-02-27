@@ -1,0 +1,25 @@
+{{define "admin_tab_access"}}
+  <div x-show="activeTab==='access'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex align-items-center justify-content-between mb-2">
+          <h2 class="h5 mb-0">Access Tokens</h2>
+          <div class="d-flex align-items-center gap-2">
+            <span
+              x-show="allowLocalhostNoAuthEffective || allowHostDockerInternalNoAuthEffective"
+              style="display:none;"
+              class="badge text-bg-warning text-dark"
+              title="Unauthenticated API access is enabled for localhost and/or host.docker.internal."
+            >
+              Warning: unauth access enabled &rarr;
+            </span>
+            <button class="icon-btn" title="Access settings" aria-label="Access settings" @click="openAccessSettingsModal()">⚙</button>
+            <button class="btn btn-sm btn-primary" @click="openAddAccessTokenModal()">Add Key</button>
+          </div>
+        </div>
+        <div class="table-responsive" x-html="accessTokensTableHtml"></div>
+        <div x-html="accessTokensPagerHtml"></div>
+      </div>
+    </div>
+  </div>
+{{end}}

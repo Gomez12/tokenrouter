@@ -246,6 +246,7 @@ func (h *AdminHandler) SetAccessTokenCleanup(run func()) {
 func (h *AdminHandler) RegisterRoutes(r chi.Router) {
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin", h.page)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin/", h.page)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin/tab/{tab}", h.tabPage)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminPage).Get("/admin/ws", h.adminWebsocket)
 	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodGet, "/admin/setup", h.legacySetupRedirect)
 	r.With(h.withRuntimeInstanceHeader).MethodFunc(http.MethodPost, "/admin/setup", h.legacySetupRedirect)
@@ -870,6 +871,40 @@ func (h *AdminHandler) page(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := t.ExecuteTemplate(w, "admin.html", struct{}{}); err != nil {
 		http.Error(w, "failed to render admin page", http.StatusInternalServerError)
+	}
+}
+
+func (h *AdminHandler) tabPage(w http.ResponseWriter, r *http.Request) {
+	tab := strings.TrimSpace(chi.URLParam(r, "tab"))
+	if tab == "" {
+		http.NotFound(w, r)
+		return
+	}
+	tabTemplates := map[string]string{
+		"status":        "admin_tab_status",
+		"conversations": "admin_tab_conversations",
+		"log":           "admin_tab_log",
+		"quota":         "admin_tab_quota",
+		"providers":     "admin_tab_providers",
+		"access":        "admin_tab_access",
+		"network":       "admin_tab_network",
+		"models":        "admin_tab_models",
+		"performance":   "admin_tab_performance",
+		"benchmark":     "admin_tab_benchmark",
+	}
+	name, ok := tabTemplates[tab]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	t, err := getTemplates()
+	if err != nil {
+		http.Error(w, "failed to load admin template", http.StatusInternalServerError)
+		return
+	}
+	if err := t.ExecuteTemplate(w, name, struct{}{}); err != nil {
+		http.Error(w, "failed to render admin tab", http.StatusInternalServerError)
 	}
 }
 

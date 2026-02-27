@@ -1,0 +1,12 @@
+{{define "admin_tab_benchmark"}}
+  <div x-show="activeTab==='benchmark'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h2 class="h5 mb-0">Benchmark</h2>
+          <button class="btn btn-outline-danger btn-sm" x-show="benchmarkRunning" style="display:none;" @click="cancelBenchmark()">Cancel</button>
+        </div>
+        <div x-html="benchmarkHtml"></div>
+      </div>
+    </div>
+{{end}}

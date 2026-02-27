@@ -1,0 +1,16 @@
+{{define "admin_tab_providers"}}
+  <div x-show="activeTab==='providers'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex align-items-center justify-content-between mb-2">
+          <h2 class="h5 mb-0">Providers</h2>
+          <div class="d-flex gap-2">
+            <button class="icon-btn" title="Provider settings" aria-label="Provider settings" @click="openProvidersSettingsModal()">⚙</button>
+            <button class="btn btn-sm btn-primary" @click="openAddProviderModal()">Add Provider</button>
+          </div>
+        </div>
+        <div class="table-responsive" x-html="providersTableHtml"></div>
+      </div>
+    </div>
+  </div>
+{{end}}

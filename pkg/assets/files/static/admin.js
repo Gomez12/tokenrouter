@@ -134,6 +134,8 @@ function adminApp() {
     runtimeScriptFingerprints: null,
     wsFailureCount: 0,
     themeMode: 'auto',
+    tabContentLoaded: {},
+    tabContentLoading: {},
     activeTabCacheKey: 'opp_admin_active_tab_v1',
     modelsCacheKey: 'opp_models_catalog_cache_v1',
     modelsFreeOnlyCacheKey: 'opp_models_free_only_v1',
@@ -636,10 +638,42 @@ function adminApp() {
     async apiFetch(url, opts) { return window.AdminApi.apiFetch.call(this, url, opts); },
     observeRuntimeInstance(response) { return window.AdminApi.observeRuntimeInstance.call(this, response); },
     reloadForRuntimeUpdate() { return window.AdminApi.reloadForRuntimeUpdate.call(this); },
-    selectTab(tab) {
-      this.activeTab = tab;
-      this.persistActiveTab();
-      if (tab === 'models' && !this.modelsInitialized) {
+    tabMountElement(tab) {
+      return document.getElementById('admin-tab-' + String(tab || '').trim());
+    },
+    async ensureTabContentLoaded(tab, forceRefresh) {
+      const t = String(tab || '').trim();
+      if (!t) return;
+      if (!forceRefresh && this.tabContentLoaded[t]) return;
+      if (this.tabContentLoading[t]) return;
+      const mount = this.tabMountElement(t);
+      if (!mount) return;
+      this.tabContentLoading[t] = true;
+      mount.innerHTML = '<div class="card shadow-sm mb-3"><div class="card-body small text-body-secondary">Loading...</div></div>';
+      try {
+        const r = await this.apiFetch('/admin/tab/' + encodeURIComponent(t), {headers:this.headers()});
+        if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+        if (!r.ok) {
+          mount.innerHTML = '<div class="card shadow-sm mb-3"><div class="card-body small text-danger">Failed to load tab content.</div></div>';
+          return;
+        }
+        const html = await r.text();
+        mount.innerHTML = html || '';
+        if (window.Alpine && typeof window.Alpine.initTree === 'function') {
+          window.Alpine.initTree(mount);
+        }
+        this.tabContentLoaded[t] = true;
+      } catch (_) {
+        mount.innerHTML = '<div class="card shadow-sm mb-3"><div class="card-body small text-danger">Failed to load tab content.</div></div>';
+      } finally {
+        this.tabContentLoading[t] = false;
+      }
+    },
+    activateTabData(tab) {
+      if (tab === 'status') {
+        this.renderStats();
+        this.loadStats(false);
+      } else if (tab === 'models' && !this.modelsInitialized) {
         this.loadModelsCatalog(true);
       } else if (tab === 'performance') {
         if (!this.modelsInitialized) this.loadModelsCatalog(true);
@@ -664,29 +698,21 @@ function adminApp() {
         this.loadLogs();
       }
     },
-    restoreActiveTab() {
+    async selectTab(tab) {
+      this.activeTab = tab;
+      this.persistActiveTab();
+      await this.ensureTabContentLoaded(tab, false);
+      this.activateTabData(tab);
+    },
+    async restoreActiveTab() {
       try {
         const tab = window.localStorage.getItem(this.activeTabCacheKey);
         if (tab === 'status' || tab === 'conversations' || tab === 'log' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'network' || tab === 'models' || tab === 'performance' || tab === 'benchmark') {
           this.activeTab = tab;
         }
       } catch (_) {}
-      if (this.activeTab === 'models' && !this.modelsInitialized) {
-        this.loadModelsCatalog(true);
-      } else if (this.activeTab === 'performance') {
-        if (!this.modelsInitialized) this.loadModelsCatalog(true);
-        else this.renderPerformanceCatalog();
-      } else if (this.activeTab === 'quota') {
-        this.loadStats(false);
-      } else if (this.activeTab === 'conversations') {
-        this.loadConversationsSettings();
-        this.loadConversations(true);
-      } else if (this.activeTab === 'log') {
-        this.loadLogSettings();
-        this.loadLogs();
-      } else if (this.activeTab === 'network') {
-        this.refreshNetworkTabFromConfig();
-      }
+      await this.ensureTabContentLoaded(this.activeTab, false);
+      this.activateTabData(this.activeTab);
     },
     persistActiveTab() {
       try {

@@ -1,0 +1,22 @@
+{{define "admin_tab_quota"}}
+  <div x-show="activeTab==='quota'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex align-items-center justify-content-between mb-2">
+          <h2 class="h5 mb-0">Available Quotas</h2>
+          <div class="d-flex align-items-center gap-2">
+            <input
+              class="form-control form-control-sm"
+              style="width:280px;"
+              placeholder="Filter quotas..."
+              x-model.trim="quotaSearch"
+              @input="quotaSummaryHtml = renderQuotaPanel((stats && stats.provider_quotas) || {})"
+            />
+            <button class="icon-btn" :disabled="quotaRefreshInProgress" @click="refreshQuota()" :title="quotaRefreshInProgress ? 'Refreshing' : 'Refresh'" aria-label="Refresh">↻</button>
+          </div>
+        </div>
+        <div x-html="quotaSummaryHtml"></div>
+      </div>
+    </div>
+  </div>
+{{end}}

@@ -1,0 +1,32 @@
+{{define "admin_tab_status"}}
+  <div x-show="activeTab==='status'" style="display:none;">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex align-items-center justify-content-between mb-2">
+          <h2 class="h5 mb-0">Usage Stats</h2>
+          <div class="d-flex align-items-center gap-2">
+            <select class="form-select form-select-sm" style="width:auto;" x-model="statusUpdateSpeed" @change="setStatusUpdateSpeed($event.target.value)">
+              <option value="realtime">realtime</option>
+              <option value="2s">2s</option>
+              <option value="10s">10s</option>
+              <option value="30s">30s</option>
+              <option value="1m">1m</option>
+              <option value="5m">5m</option>
+              <option value="15m">15m</option>
+              <option value="disabled">disabled</option>
+            </select>
+            <select class="form-select form-select-sm" style="width:auto;" x-model="statsRangeHours" @change="setStatsRangeHours($event.target.value)">
+              <option value="1">1h</option>
+              <option value="4">4h</option>
+              <option value="8">8h</option>
+              <option value="24">24h</option>
+              <option value="72">72h</option>
+            </select>
+            <button class="icon-btn" @click="loadStats(true)" title="Refresh" aria-label="Refresh">↻</button>
+          </div>
+        </div>
+        <div x-html="statsSummaryHtml"></div>
+      </div>
+    </div>
+  </div>
+{{end}}
