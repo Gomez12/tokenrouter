@@ -1292,9 +1292,6 @@ func runOpencodeWrap(cmd *cobra.Command, cfgPath, tokenName, providerID, provide
 	if err != nil {
 		return fmt.Errorf("load client config (run `toro connect` first): %w", err)
 	}
-	if strings.TrimSpace(cfg.APIKey) == "" {
-		return fmt.Errorf("client api key is required (set with: toro connect)")
-	}
 	serverBase, err := deriveServerBaseURL(cfg.ServerURL)
 	if err != nil {
 		return err
@@ -1310,40 +1307,48 @@ func runOpencodeWrap(cmd *cobra.Command, cfgPath, tokenName, providerID, provide
 	if providerName == "" {
 		providerName = "TokenRouter"
 	}
-	key, err := randomTemporaryKey()
-	if err != nil {
-		return fmt.Errorf("generate temporary key: %w", err)
-	}
-	if strings.TrimSpace(tokenName) == "" {
-		tokenName = "toro-opencode-" + time.Now().UTC().Format("20060102-150405")
-	}
-	expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
-
-	before, err := fetchAccessTokens(serverBase, cfg.APIKey)
-	if err != nil {
-		return fmt.Errorf("list access tokens before create: %w", err)
-	}
-	beforeIDs := map[string]struct{}{}
-	for _, t := range before {
-		beforeIDs[strings.TrimSpace(t.ID)] = struct{}{}
-	}
-	if err := createAccessToken(serverBase, cfg.APIKey, tokenName, key, "inferrer", expiresAt); err != nil {
-		return fmt.Errorf("create temporary access token: %w", err)
-	}
-	tmpID, err := findCreatedTokenID(serverBase, cfg.APIKey, beforeIDs, tokenName, expiresAt)
-	if err != nil {
-		return fmt.Errorf("locate temporary access token id: %w", err)
-	}
-	fmt.Fprintf(cmd.ErrOrStderr(), "Created temporary token %q (id=%s, expires=%s)\n", tokenName, tmpID, expiresAt)
-
-	cleanup := func() {
-		if err := deleteAccessToken(serverBase, cfg.APIKey, tmpID); err != nil {
-			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to delete temporary token %q (id=%s): %v\n", tokenName, tmpID, err)
-			return
+	key := strings.TrimSpace(cfg.APIKey)
+	if key == "" {
+		if !isLoopbackServerBase(serverBase) {
+			return fmt.Errorf("client api key is required for non-localhost server (set with: toro connect)")
 		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "Deleted temporary token %q (id=%s)\n", tokenName, tmpID)
+		fmt.Fprintln(cmd.ErrOrStderr(), "No client API key configured; using localhost no-auth mode without temporary token isolation.")
+	} else {
+		key, err = randomTemporaryKey()
+		if err != nil {
+			return fmt.Errorf("generate temporary key: %w", err)
+		}
+		if strings.TrimSpace(tokenName) == "" {
+			tokenName = "toro-opencode-" + time.Now().UTC().Format("20060102-150405")
+		}
+		expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
+
+		before, err := fetchAccessTokens(serverBase, cfg.APIKey)
+		if err != nil {
+			return fmt.Errorf("list access tokens before create: %w", err)
+		}
+		beforeIDs := map[string]struct{}{}
+		for _, t := range before {
+			beforeIDs[strings.TrimSpace(t.ID)] = struct{}{}
+		}
+		if err := createAccessToken(serverBase, cfg.APIKey, tokenName, key, "inferrer", expiresAt); err != nil {
+			return fmt.Errorf("create temporary access token: %w", err)
+		}
+		tmpID, err := findCreatedTokenID(serverBase, cfg.APIKey, beforeIDs, tokenName, expiresAt)
+		if err != nil {
+			return fmt.Errorf("locate temporary access token id: %w", err)
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "Created temporary token %q (id=%s, expires=%s)\n", tokenName, tmpID, expiresAt)
+
+		cleanup := func() {
+			if err := deleteAccessToken(serverBase, cfg.APIKey, tmpID); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to delete temporary token %q (id=%s): %v\n", tokenName, tmpID, err)
+				return
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "Deleted temporary token %q (id=%s)\n", tokenName, tmpID)
+		}
+		defer cleanup()
 	}
-	defer cleanup()
 
 	configContent, err := buildOpencodeConfigContent(serverBase, key, providerID, providerName, model)
 	if err != nil {
@@ -1410,9 +1415,6 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 	if err != nil {
 		return fmt.Errorf("load client config (run `toro connect` first): %w", err)
 	}
-	if strings.TrimSpace(cfg.APIKey) == "" {
-		return fmt.Errorf("client api key is required (set with: toro connect)")
-	}
 	serverBase, err := deriveServerBaseURL(cfg.ServerURL)
 	if err != nil {
 		return err
@@ -1420,40 +1422,48 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 	if ttl <= 0 {
 		return fmt.Errorf("ttl must be > 0")
 	}
-	key, err := randomTemporaryKey()
-	if err != nil {
-		return fmt.Errorf("generate temporary key: %w", err)
-	}
-	if strings.TrimSpace(tokenName) == "" {
-		tokenName = "toro-codex-" + time.Now().UTC().Format("20060102-150405")
-	}
-	expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
-
-	before, err := fetchAccessTokens(serverBase, cfg.APIKey)
-	if err != nil {
-		return fmt.Errorf("list access tokens before create: %w", err)
-	}
-	beforeIDs := map[string]struct{}{}
-	for _, t := range before {
-		beforeIDs[strings.TrimSpace(t.ID)] = struct{}{}
-	}
-	if err := createAccessToken(serverBase, cfg.APIKey, tokenName, key, "inferrer", expiresAt); err != nil {
-		return fmt.Errorf("create temporary access token: %w", err)
-	}
-	tmpID, err := findCreatedTokenID(serverBase, cfg.APIKey, beforeIDs, tokenName, expiresAt)
-	if err != nil {
-		return fmt.Errorf("locate temporary access token id: %w", err)
-	}
-	fmt.Fprintf(cmd.ErrOrStderr(), "Created temporary token %q (id=%s, expires=%s)\n", tokenName, tmpID, expiresAt)
-
-	cleanup := func() {
-		if err := deleteAccessToken(serverBase, cfg.APIKey, tmpID); err != nil {
-			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to delete temporary token %q (id=%s): %v\n", tokenName, tmpID, err)
-			return
+	key := strings.TrimSpace(cfg.APIKey)
+	if key == "" {
+		if !isLoopbackServerBase(serverBase) {
+			return fmt.Errorf("client api key is required for non-localhost server (set with: toro connect)")
 		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "Deleted temporary token %q (id=%s)\n", tokenName, tmpID)
+		fmt.Fprintln(cmd.ErrOrStderr(), "No client API key configured; using localhost no-auth mode without temporary token isolation.")
+	} else {
+		key, err = randomTemporaryKey()
+		if err != nil {
+			return fmt.Errorf("generate temporary key: %w", err)
+		}
+		if strings.TrimSpace(tokenName) == "" {
+			tokenName = "toro-codex-" + time.Now().UTC().Format("20060102-150405")
+		}
+		expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)
+
+		before, err := fetchAccessTokens(serverBase, cfg.APIKey)
+		if err != nil {
+			return fmt.Errorf("list access tokens before create: %w", err)
+		}
+		beforeIDs := map[string]struct{}{}
+		for _, t := range before {
+			beforeIDs[strings.TrimSpace(t.ID)] = struct{}{}
+		}
+		if err := createAccessToken(serverBase, cfg.APIKey, tokenName, key, "inferrer", expiresAt); err != nil {
+			return fmt.Errorf("create temporary access token: %w", err)
+		}
+		tmpID, err := findCreatedTokenID(serverBase, cfg.APIKey, beforeIDs, tokenName, expiresAt)
+		if err != nil {
+			return fmt.Errorf("locate temporary access token id: %w", err)
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "Created temporary token %q (id=%s, expires=%s)\n", tokenName, tmpID, expiresAt)
+
+		cleanup := func() {
+			if err := deleteAccessToken(serverBase, cfg.APIKey, tmpID); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to delete temporary token %q (id=%s): %v\n", tokenName, tmpID, err)
+				return
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "Deleted temporary token %q (id=%s)\n", tokenName, tmpID)
+		}
+		defer cleanup()
 	}
-	defer cleanup()
 
 	launchArgs := make([]string, 0, len(codexArgs)+8)
 	launchArgs = append(launchArgs,
@@ -1477,9 +1487,11 @@ func runCodexWrap(cmd *cobra.Command, cfgPath, tokenName, model string, ttl time
 	})
 	env = append(env, "OPENAI_BASE_URL="+strings.TrimSuffix(serverBase, "/")+"/v1")
 	env = append(env, "OPENAI_API_BASE="+strings.TrimSuffix(serverBase, "/")+"/v1")
-	env = append(env, "OPENAI_API_KEY="+key)
-	env = append(env, "CODEX_API_KEY="+key)
 	env = append(env, "CODEX_BASE_URL="+strings.TrimSuffix(serverBase, "/")+"/v1")
+	if strings.TrimSpace(key) != "" {
+		env = append(env, "OPENAI_API_KEY="+key)
+		env = append(env, "CODEX_API_KEY="+key)
+	}
 	if strings.TrimSpace(model) != "" {
 		env = append(env, "OPENAI_MODEL="+strings.TrimSpace(model))
 	}
@@ -1494,10 +1506,6 @@ func runGenericWrap(cmd *cobra.Command, cfgPath, tokenName string, ttl time.Dura
 	cfg, err := config.LoadClientConfig(cfgPath)
 	if err != nil {
 		return fmt.Errorf("load client config (run `toro connect` first): %w", err)
-	}
-	key := strings.TrimSpace(cfg.APIKey)
-	if key == "" {
-		return fmt.Errorf("client api key is required (set with: toro connect)")
 	}
 	serverBase, err := deriveServerBaseURL(cfg.ServerURL)
 	if err != nil {
@@ -1518,6 +1526,22 @@ func runGenericWrap(cmd *cobra.Command, cfgPath, tokenName string, ttl time.Dura
 	targetCmd := strings.TrimSpace(args[0])
 	if targetCmd == "" {
 		return fmt.Errorf("command cannot be empty")
+	}
+
+	key := strings.TrimSpace(cfg.APIKey)
+	if key == "" {
+		if !isLoopbackServerBase(serverBase) {
+			return fmt.Errorf("client api key is required for non-localhost server (set with: toro connect)")
+		}
+		fmt.Fprintln(cmd.ErrOrStderr(), "No client API key configured; using localhost no-auth mode without temporary token isolation.")
+		proc := exec.Command(targetCmd, args[1:]...)
+		proc.Stdin = cmd.InOrStdin()
+		proc.Stdout = cmd.OutOrStdout()
+		proc.Stderr = cmd.ErrOrStderr()
+		env := filteredEnv([]string{urlEnvName, keyEnvName})
+		env = append(env, urlEnvName+"="+strings.TrimSuffix(serverBase, "/")+"/v1")
+		proc.Env = env
+		return proc.Run()
 	}
 
 	tmpKey, err := randomTemporaryKey()
@@ -1656,6 +1680,19 @@ func deriveServerBaseURL(serverURL string) (string, error) {
 	u.Fragment = ""
 	base := strings.TrimSuffix(u.String(), "/")
 	return base, nil
+}
+
+func isLoopbackServerBase(serverBase string) bool {
+	u, err := neturl.Parse(strings.TrimSpace(serverBase))
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSpace(strings.Trim(u.Hostname(), "[]"))
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func randomTemporaryKey() (string, error) {
