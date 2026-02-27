@@ -3732,24 +3732,16 @@ function adminApp() {
         const key = String(t.conversation_key || '').trim();
         const selected = key && key === this.selectedConversationKey;
         const rowClass = selected ? 'table-primary' : '';
-        const model = this.escapeHtml(this.conversationModelDisplayName(t.provider || '', t.model || ''));
-        const keyName = this.escapeHtml(t.api_key_name || '-');
-        const remote = this.escapeHtml(t.remote_ip || '-');
         const updated = this.escapeHtml(this.formatRelativeAge(t.last_at || ''));
         const count = Math.max(0, Number(t.count || 0));
         const tokenCount = Math.max(0, Number(t.token_count || 0));
         const title = this.escapeHtml(String(t.title || '').trim());
         return '' +
-          '<tr class="' + rowClass + '">' +
-            '<td>' +
-              '<button type="button" class="btn btn-sm text-start p-0 border-0 bg-transparent w-100" data-conversation-key="' + this.escapeHtml(key) + '" onclick="window.__adminOpenConversation(this.getAttribute(\'data-conversation-key\'))">' + keyName + '</button>' +
-            '</td>' +
-            '<td>' + model + '</td>' +
+          '<tr class="' + rowClass + '" style="cursor:pointer;" data-conversation-key="' + this.escapeHtml(key) + '" onclick="window.__adminConversationRowClick(event,this.getAttribute(\'data-conversation-key\'))">' +
+            '<td>' + title + '</td>' +
             '<td class="text-nowrap">' + updated + '</td>' +
-            '<td class="text-nowrap">' + remote + '</td>' +
             '<td class="text-end text-nowrap">' + count + '</td>' +
             '<td class="text-end text-nowrap">' + tokenCount + '</td>' +
-            '<td>' + title + '</td>' +
             '<td class="text-end">' +
               '<button class=\"icon-btn icon-btn-danger\" type=\"button\" title=\"Delete conversation\" aria-label=\"Delete conversation\" data-conversation-key=\"' + this.escapeHtml(key) + '\" onclick=\"window.__adminDeleteConversation(this.getAttribute(\'data-conversation-key\'))\">' +
                 '<svg xmlns=\"http://www.w3.org/2000/svg\" fill=\"currentColor\" viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z\"/><path d=\"M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z\"/></svg>' +
@@ -3762,12 +3754,16 @@ function adminApp() {
       this.conversationsPageSize = page.pageSize;
       this.conversationsListHtml =
         '<table class="table table-sm align-middle mb-0">' +
-          '<thead><tr><th>Key</th><th>Model</th><th>Timestamp</th><th>Remote IP</th><th class="text-end">Messages</th><th class="text-end">Tokens</th><th>Title</th><th class="text-end"></th></tr></thead>' +
-          '<tbody>' + (page.rows.join('') || '<tr><td colspan="8" class="text-body-secondary">No conversation data.</td></tr>') + '</tbody>' +
+          '<thead><tr><th>Title</th><th>Timestamp</th><th class="text-end">Messages</th><th class="text-end">Tokens</th><th class="text-end"></th></tr></thead>' +
+          '<tbody>' + (page.rows.join('') || '<tr><td colspan="5" class="text-body-secondary">No conversation data.</td></tr>') + '</tbody>' +
         '</table>';
       this.conversationsPagerHtml = this.renderPager(page.totalRows, page.page, page.totalPages, page.pageSize, 'Conversations');
       window.__adminOpenConversation = (key) => this.loadConversationDetail(key);
       window.__adminDeleteConversation = (key) => this.removeConversation(key);
+      window.__adminConversationRowClick = (ev, key) => {
+        if (ev && ev.target && ev.target.closest && ev.target.closest('button')) return;
+        this.loadConversationDetail(key);
+      };
     },
     renderConversationDetail() {
       const records = this.conversationRecords || [];

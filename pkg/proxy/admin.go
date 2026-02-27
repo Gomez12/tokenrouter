@@ -4287,19 +4287,16 @@ func (h *AdminHandler) conversationsAPI(w http.ResponseWriter, r *http.Request) 
 }
 
 func conversationRecordTotalTokens(rec conversations.Record) int64 {
-	if s := strings.TrimSpace(rec.ResponsePayloadRaw); s != "" {
-		return parseTotalTokensFromRawPayload(s)
+	structured := rec.ToStructuredRecord()
+	total := 0
+	total += estimateTokensFromText(strings.TrimSpace(structured.RequestTextMarkdown))
+	total += estimateTokensFromText(strings.TrimSpace(structured.ResponseTextMarkdown))
+	total += estimateTokensFromText(strings.TrimSpace(structured.RequestSystemMarkdown))
+	total += estimateTokensFromText(strings.TrimSpace(structured.ResponseThinkMarkdown))
+	if total < 0 {
+		total = 0
 	}
-	if len(rec.ResponsePayload) > 0 {
-		p, c, t := parseUsageTokens(rec.ResponsePayload)
-		if t > 0 {
-			return int64(t)
-		}
-		if p > 0 || c > 0 {
-			return int64(p + c)
-		}
-	}
-	return 0
+	return int64(total)
 }
 
 func parseTotalTokensFromRawPayload(raw string) int64 {
