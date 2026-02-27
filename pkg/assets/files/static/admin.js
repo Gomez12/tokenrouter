@@ -134,6 +134,8 @@ function adminApp() {
     runtimeScriptFingerprints: null,
     wsFailureCount: 0,
     themeMode: 'auto',
+    tabBarCanScrollLeft: false,
+    tabBarCanScrollRight: false,
     tabContentLoaded: {},
     tabContentLoading: {},
     activeTabCacheKey: 'opp_admin_active_tab_v1',
@@ -235,6 +237,9 @@ function adminApp() {
           });
         }
       }
+      this.$nextTick(() => this.initTabScroll());
+      window.addEventListener('load', () => this.initTabScroll(), {once: true});
+      window.addEventListener('resize', () => this.updateTabScrollButtons(), {passive: true});
     },
     installUserActivityTracking() {
       if (this.userActivityTrackingInstalled) return;
@@ -703,6 +708,7 @@ function adminApp() {
       this.persistActiveTab();
       await this.ensureTabContentLoaded(tab, false);
       this.activateTabData(tab);
+      this.$nextTick(() => this.ensureActiveTabVisible());
     },
     async restoreActiveTab() {
       try {
@@ -713,11 +719,63 @@ function adminApp() {
       } catch (_) {}
       await this.ensureTabContentLoaded(this.activeTab, false);
       this.activateTabData(this.activeTab);
+      this.$nextTick(() => this.ensureActiveTabVisible());
     },
     persistActiveTab() {
       try {
         window.localStorage.setItem(this.activeTabCacheKey, this.activeTab);
       } catch (_) {}
+    },
+    initTabScroll() {
+      const el = document.getElementById('adminTabsScroll');
+      if (!el) return;
+      el.scrollLeft = 0;
+      window.requestAnimationFrame(() => this.updateTabScrollButtons());
+      window.setTimeout(() => this.updateTabScrollButtons(), 80);
+    },
+    ensureActiveTabVisible() {
+      const wrap = document.getElementById('adminTabsScroll');
+      if (!wrap) return;
+      const btn = wrap.querySelector('.nav-link.active');
+      if (!btn || typeof btn.scrollIntoView !== 'function') {
+        this.updateTabScrollButtons();
+        return;
+      }
+      try {
+        btn.scrollIntoView({block: 'nearest', inline: 'center', behavior: 'auto'});
+      } catch (_) {}
+      this.updateTabScrollButtons();
+    },
+    updateTabScrollButtons() {
+      const el = document.getElementById('adminTabsScroll');
+      if (!el) {
+        this.tabBarCanScrollLeft = false;
+        this.tabBarCanScrollRight = false;
+        return;
+      }
+      const maxScrollLeft = Math.max(0, el.scrollWidth - el.clientWidth);
+      this.tabBarCanScrollLeft = maxScrollLeft > 2 && el.scrollLeft > 2;
+      this.tabBarCanScrollRight = maxScrollLeft > 2 && el.scrollLeft < (maxScrollLeft - 2);
+    },
+    scrollTabsLeft() {
+      const el = document.getElementById('adminTabsScroll');
+      if (!el) return;
+      const maxScrollLeft = Math.max(0, el.scrollWidth - el.clientWidth);
+      const delta = Math.max(120, Math.floor(el.clientWidth * 0.6));
+      const target = Math.max(0, Math.min(maxScrollLeft, el.scrollLeft - delta));
+      if (target <= 2) this.tabBarCanScrollLeft = false;
+      el.scrollTo({left: target, behavior: 'smooth'});
+      window.setTimeout(() => this.updateTabScrollButtons(), 180);
+    },
+    scrollTabsRight() {
+      const el = document.getElementById('adminTabsScroll');
+      if (!el) return;
+      const maxScrollLeft = Math.max(0, el.scrollWidth - el.clientWidth);
+      const delta = Math.max(120, Math.floor(el.clientWidth * 0.6));
+      const target = Math.max(0, Math.min(maxScrollLeft, el.scrollLeft + delta));
+      if (target >= (maxScrollLeft - 2)) this.tabBarCanScrollRight = false;
+      el.scrollTo({left: target, behavior: 'smooth'});
+      window.setTimeout(() => this.updateTabScrollButtons(), 180);
     },
     openBenchmarkModal() {
       this.showBenchmarkModal = true;
@@ -1703,12 +1761,12 @@ function adminApp() {
       const bucketLabel = this.usageBucketLabel(bucketMs);
       const renderToken = ++this.statsRenderToken;
       this.statsSummaryHtml =
-        '<div class="row g-2">' +
-          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Requests</div><div class="fw-semibold">' + req + '</div></div></div>' +
-          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Prompt / Generated</div><div class="fw-semibold">' + prompt + ' / ' + generated + '</div></div></div>' +
-          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Avg latency ms</div><div class="fw-semibold">' + latency + '</div></div></div>' +
-          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Avg PP/s</div><div class="fw-semibold">' + pp + '</div></div></div>' +
-          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Avg TG/s</div><div class="fw-semibold">' + tg + '</div></div></div>' +
+        '<div class="admin-stats-grid">' +
+          '<div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center admin-stats-tile"><div class="small text-body-secondary">Requests</div><div class="fw-semibold">' + req + '</div></div>' +
+          '<div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center admin-stats-tile"><div class="small text-body-secondary">Prompt / Generated</div><div class="fw-semibold">' + prompt + ' / ' + generated + '</div></div>' +
+          '<div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center admin-stats-tile"><div class="small text-body-secondary">Avg latency ms</div><div class="fw-semibold">' + latency + '</div></div>' +
+          '<div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center admin-stats-tile"><div class="small text-body-secondary">Avg PP/s</div><div class="fw-semibold">' + pp + '</div></div>' +
+          '<div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center admin-stats-tile"><div class="small text-body-secondary">Avg TG/s</div><div class="fw-semibold">' + tg + '</div></div>' +
         '</div>' +
         '<div class="border rounded p-3 bg-body mt-2">' +
           '<div class="d-flex justify-content-between align-items-center mb-2">' +
