@@ -740,6 +740,8 @@ func printModelsReportHuman(w io.Writer, report modelsReport) {
 type pingPongRunStats struct {
 	CompletedTurnPairs int
 	UsedTokens         int
+	PromptTokens       int
+	CompletionTokens   int
 	StoppedByMaxTokens bool
 	Duration           time.Duration
 }
@@ -802,7 +804,7 @@ func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int,
 			if err != nil {
 				return fmt.Errorf("run %d: %w", run, err)
 			}
-			fmt.Fprintf(out, "Run %d/%d: turns=%d tokens=%d duration=%s%s\n", run, runs, stats.CompletedTurnPairs, stats.UsedTokens, stats.Duration.Round(time.Millisecond), map[bool]string{true: " stop=max-tokens", false: ""}[stats.StoppedByMaxTokens])
+			fmt.Fprintf(out, "Run %d/%d: turns=%d tokens=%d pp/s=%.1f tg/s=%.1f duration=%s%s\n", run, runs, stats.CompletedTurnPairs, stats.UsedTokens, ratePerSecond(stats.PromptTokens, stats.Duration), ratePerSecond(stats.CompletionTokens, stats.Duration), stats.Duration.Round(time.Millisecond), map[bool]string{true: " stop=max-tokens", false: ""}[stats.StoppedByMaxTokens])
 		}
 		return nil
 	}
@@ -844,7 +846,7 @@ func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int,
 			fmt.Fprintf(out, "Run %d/%d: error=%v\n", rr.index, runs, rr.err)
 			continue
 		}
-		fmt.Fprintf(out, "Run %d/%d: turns=%d tokens=%d duration=%s%s\n", rr.index, runs, rr.stats.CompletedTurnPairs, rr.stats.UsedTokens, rr.stats.Duration.Round(time.Millisecond), map[bool]string{true: " stop=max-tokens", false: ""}[rr.stats.StoppedByMaxTokens])
+		fmt.Fprintf(out, "Run %d/%d: turns=%d tokens=%d pp/s=%.1f tg/s=%.1f duration=%s%s\n", rr.index, runs, rr.stats.CompletedTurnPairs, rr.stats.UsedTokens, ratePerSecond(rr.stats.PromptTokens, rr.stats.Duration), ratePerSecond(rr.stats.CompletionTokens, rr.stats.Duration), rr.stats.Duration.Round(time.Millisecond), map[bool]string{true: " stop=max-tokens", false: ""}[rr.stats.StoppedByMaxTokens])
 	}
 	return firstErr
 }
@@ -858,6 +860,8 @@ func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB stri
 	}
 	runClient := client.withConversationID(conversationID)
 	usedTokens := 0
+	promptTokens := 0
+	completionTokens := 0
 	turns := 0
 	stopped := false
 
@@ -867,7 +871,7 @@ func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB stri
 		if verbose {
 			fmt.Fprintf(out, "Seed (%s): ", modelA)
 		}
-		seedQuestion, lastTokens, err := runClient.streamChatCompletion(modelA, []pingPongMessage{
+		seedQuestion, _, err := runClient.streamChatCompletion(modelA, []pingPongMessage{
 			{Role: "system", Content: "You produce concise, random conversation starters. Do not output reasoning. Output only the final question text."},
 			{Role: "user", Content: seedPrompt},
 		}, 0.9, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
@@ -877,8 +881,15 @@ func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB stri
 		if err != nil {
 			return pingPongRunStats{}, fmt.Errorf("seed question from %s: %w", modelA, err)
 		}
-		usedTokens += lastTokens
 		seedQuestion = compactPingPongText(seedQuestion)
+		p := estimatePromptTokenCount([]pingPongMessage{
+			{Role: "system", Content: "You produce concise, random conversation starters. Do not output reasoning. Output only the final question text."},
+			{Role: "user", Content: seedPrompt},
+		})
+		c := estimateCompletionTokenCount(seedQuestion)
+		promptTokens += p
+		completionTokens += c
+		usedTokens += p + c
 	} else if verbose {
 		fmt.Fprintf(out, "Starter: manual\n")
 		fmt.Fprintf(out, "Seed (%s): %s\n", modelA, seedQuestion)
@@ -903,20 +914,24 @@ func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB stri
 		if verbose {
 			fmt.Fprintf(out, "B[%d] (%s): ", i, modelB)
 		}
-		replyB, lastTokens, err := runClient.streamChatCompletion(modelB, convB, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+		replyB, _, err := runClient.streamChatCompletion(modelB, convB, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
 		if verbose {
 			fmt.Fprintln(out)
 		}
 		if err != nil {
 			return pingPongRunStats{}, fmt.Errorf("iteration %d model %s: %w", i, modelB, err)
 		}
-		usedTokens += lastTokens
 		replyB = compactPingPongText(replyB)
 		if replyB == "" {
 			return pingPongRunStats{}, fmt.Errorf("iteration %d model %s returned empty content", i, modelB)
 		}
 		convB = append(convB, pingPongMessage{Role: "assistant", Content: replyB})
 		convB = trimPingPongConversation(convB, 14)
+		p := estimatePromptTokenCount(convB[:len(convB)-1])
+		c := estimateCompletionTokenCount(replyB)
+		promptTokens += p
+		completionTokens += c
+		usedTokens += p + c
 
 		if maxTokens > 0 && usedTokens >= maxTokens {
 			stopped = true
@@ -926,20 +941,24 @@ func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB stri
 		if verbose {
 			fmt.Fprintf(out, "A[%d] (%s): ", i, modelA)
 		}
-		replyA, lastTokens, err := runClient.streamChatCompletion(modelA, convA, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+		replyA, _, err := runClient.streamChatCompletion(modelA, convA, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
 		if verbose {
 			fmt.Fprintln(out)
 		}
 		if err != nil {
 			return pingPongRunStats{}, fmt.Errorf("iteration %d model %s: %w", i, modelA, err)
 		}
-		usedTokens += lastTokens
 		replyA = compactPingPongText(replyA)
 		if replyA == "" {
 			return pingPongRunStats{}, fmt.Errorf("iteration %d model %s returned empty content", i, modelA)
 		}
 		convA = append(convA, pingPongMessage{Role: "assistant", Content: replyA})
 		convA = trimPingPongConversation(convA, 14)
+		p = estimatePromptTokenCount(convA[:len(convA)-1])
+		c = estimateCompletionTokenCount(replyA)
+		promptTokens += p
+		completionTokens += c
+		usedTokens += p + c
 		current = replyA
 		turns++
 	}
@@ -949,6 +968,8 @@ func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB stri
 	return pingPongRunStats{
 		CompletedTurnPairs: turns,
 		UsedTokens:         usedTokens,
+		PromptTokens:       promptTokens,
+		CompletionTokens:   completionTokens,
 		StoppedByMaxTokens: stopped,
 		Duration:           time.Since(started),
 	}, nil
@@ -1144,6 +1165,32 @@ func estimateTokenCount(messages []pingPongMessage, reply string) int {
 	}
 	// Rough heuristic used only for pingpong budget control.
 	return (totalChars + 3) / 4
+}
+
+func estimatePromptTokenCount(messages []pingPongMessage) int {
+	totalChars := 0
+	for _, m := range messages {
+		totalChars += len(strings.TrimSpace(m.Content))
+	}
+	if totalChars <= 0 {
+		return 0
+	}
+	return (totalChars + 3) / 4
+}
+
+func estimateCompletionTokenCount(reply string) int {
+	totalChars := len(strings.TrimSpace(reply))
+	if totalChars <= 0 {
+		return 0
+	}
+	return (totalChars + 3) / 4
+}
+
+func ratePerSecond(tokens int, d time.Duration) float64 {
+	if tokens <= 0 || d <= 0 {
+		return 0
+	}
+	return float64(tokens) / d.Seconds()
 }
 
 func startWaitingSpinner(w io.Writer) func() {

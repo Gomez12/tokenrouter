@@ -1608,7 +1608,8 @@ function adminApp() {
       const prompt = Number(s.prompt_tokens || 0);
       const generated = Number(s.completion_tokens || 0);
       const latency = Number(s.avg_latency_ms || 0).toFixed(1);
-      const gen = Number(s.avg_generation_tps || 0).toFixed(2);
+      const pp = Number(s.avg_prompt_tps || 0).toFixed(2);
+      const tg = Number(s.avg_generation_tps || 0).toFixed(2);
       const periodHours = Math.max(1, Number(this.statsRangeHours || 8));
       const providersAvailable = Number(s.providers_available || 0);
       const providersOnline = Number(s.providers_online || 0);
@@ -1621,10 +1622,11 @@ function adminApp() {
       const renderToken = ++this.statsRenderToken;
       this.statsSummaryHtml =
         '<div class="row g-2">' +
-          '<div class="col-3"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Requests</div><div class="fw-semibold">' + req + '</div></div></div>' +
-          '<div class="col-3"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Prompt / Generated</div><div class="fw-semibold">' + prompt + ' / ' + generated + '</div></div></div>' +
-          '<div class="col-3"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Avg latency ms</div><div class="fw-semibold">' + latency + '</div></div></div>' +
-          '<div class="col-3"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Avg gen tok/s</div><div class="fw-semibold">' + gen + '</div></div></div>' +
+          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Requests</div><div class="fw-semibold">' + req + '</div></div></div>' +
+          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Prompt / Generated</div><div class="fw-semibold">' + prompt + ' / ' + generated + '</div></div></div>' +
+          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Avg latency ms</div><div class="fw-semibold">' + latency + '</div></div></div>' +
+          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Avg PP/s</div><div class="fw-semibold">' + pp + '</div></div></div>' +
+          '<div class="col"><div class="border rounded p-2 bg-body d-flex flex-column align-items-center justify-content-center text-center" style="min-height:78px;"><div class="small text-body-secondary">Avg TG/s</div><div class="fw-semibold">' + tg + '</div></div></div>' +
         '</div>' +
         '<div class="border rounded p-3 bg-body mt-2">' +
           '<div class="d-flex justify-content-between align-items-center mb-2">' +
