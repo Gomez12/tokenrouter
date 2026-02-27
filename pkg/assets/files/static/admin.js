@@ -497,11 +497,31 @@ function adminApp() {
       this.runtimeScriptFingerprints = nextMap;
       return true;
     },
-    performReload(kind) {
+    async waitForServerReadyBeforeReload(timeoutMs) {
+      const timeout = Math.max(1000, Math.trunc(Number(timeoutMs || 0) || 30000));
+      const startedAt = Date.now();
+      let delayMs = 250;
+      while ((Date.now() - startedAt) < timeout) {
+        try {
+          const probeURL = '/admin/static/admin.js?_rt_ready_probe=' + String(Date.now());
+          const resp = await fetch(probeURL, {
+            method: 'GET',
+            cache: 'no-store',
+            credentials: 'same-origin'
+          });
+          if (resp && resp.ok) return true;
+        } catch (_) {}
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        delayMs = Math.min(1000, delayMs + 100);
+      }
+      return false;
+    },
+    async performReload(kind) {
       const reloadKind = String(kind || 'default').trim() || 'default';
       if (typeof this.stopRealtimeUpdates === 'function') {
         try { this.stopRealtimeUpdates(); } catch (_) {}
       }
+      await this.waitForServerReadyBeforeReload(45000);
       if (reloadKind === 'runtime_update') {
         try {
           const u = new URL(window.location.href);
