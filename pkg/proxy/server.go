@@ -1409,10 +1409,10 @@ func (s *Server) ensureOAuthTokenFresh(ctx context.Context, provider config.Prov
 }
 
 func (s *Server) recordUsage(providerName, incomingModel, upstreamModel string, status int, latency time.Duration, responseBody []byte) {
-	if status < 200 || status > 299 {
-		return
+	promptTokens, completionTokens, totalTokens := 0, 0, 0
+	if status >= 200 && status <= 299 {
+		promptTokens, completionTokens, totalTokens = parseUsageTokens(responseBody)
 	}
-	promptTokens, completionTokens, totalTokens := parseUsageTokens(responseBody)
 	s.recordUsageWithTokens(providerName, incomingModel, upstreamModel, status, latency, promptTokens, completionTokens, totalTokens)
 }
 
@@ -1423,7 +1423,12 @@ func (s *Server) recordUsageWithTokens(providerName, incomingModel, upstreamMode
 
 func (s *Server) recordUsageMeasured(providerName, incomingModel, upstreamModel string, status int, latency time.Duration, promptTokens int, promptCachedTokens int, completionTokens int, totalTokens int, promptTPS float64, genTPS float64, meta clientUsageMeta) {
 	if status < 200 || status > 299 {
-		return
+		promptTokens = 0
+		promptCachedTokens = 0
+		completionTokens = 0
+		totalTokens = 0
+		promptTPS = 0
+		genTPS = 0
 	}
 	s.stats.Add(UsageEvent{
 		Timestamp:      time.Now(),

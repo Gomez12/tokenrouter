@@ -5921,6 +5921,39 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 		InputPer1M          *float64 `json:"input_per_1m,omitempty"`
 		OutputPer1M         *float64 `json:"output_per_1m,omitempty"`
 		Currency            string   `json:"currency,omitempty"`
+		FailureRate         float64  `json:"failure_rate,omitempty"`
+		AvgPromptTPS        float64  `json:"avg_prompt_tps,omitempty"`
+		AvgGenerationTPS    float64  `json:"avg_generation_tps,omitempty"`
+	}
+	period := time.Hour
+	if raw := strings.TrimSpace(r.URL.Query().Get("period_seconds")); raw != "" {
+		if sec, err := strconv.Atoi(raw); err == nil && sec > 0 {
+			period = time.Duration(sec) * time.Second
+		}
+	}
+	type usageAgg struct {
+		requests int
+		failed   int
+		ppSum    float64
+		tgSum    float64
+	}
+	usageByModel := map[string]usageAgg{}
+	if h.stats != nil {
+		summary := h.stats.Summary(period)
+		for _, b := range summary.Buckets {
+			p := strings.TrimSpace(b.Provider)
+			m := strings.TrimSpace(b.Model)
+			if p == "" || m == "" || b.Requests <= 0 {
+				continue
+			}
+			key := p + "/" + m
+			a := usageByModel[key]
+			a.requests += b.Requests
+			a.failed += b.FailedRequests
+			a.ppSum += b.PromptTPSSum
+			a.tgSum += b.GenerationTPSSum
+			usageByModel[key] = a
+		}
 	}
 	displayNames := map[string]string{}
 	if popular, err := getPopularProviders(); err == nil {
@@ -6006,6 +6039,11 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 					item.Currency = "USD"
 				}
 			}
+			if agg, ok := usageByModel[provider+"/"+modelID]; ok && agg.requests > 0 {
+				item.FailureRate = float64(agg.failed) * 100.0 / float64(agg.requests)
+				item.AvgPromptTPS = agg.ppSum / float64(agg.requests)
+				item.AvgGenerationTPS = agg.tgSum / float64(agg.requests)
+			}
 			out = append(out, item)
 		}
 		if len(cards) == 0 {
@@ -6079,6 +6117,11 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 			if item.Currency == "" {
 				item.Currency = "USD"
 			}
+		}
+		if agg, ok := usageByModel[pn+"/"+modelID]; ok && agg.requests > 0 {
+			item.FailureRate = float64(agg.failed) * 100.0 / float64(agg.requests)
+			item.AvgPromptTPS = agg.ppSum / float64(agg.requests)
+			item.AvgGenerationTPS = agg.tgSum / float64(agg.requests)
 		}
 		out = append(out, item)
 	}

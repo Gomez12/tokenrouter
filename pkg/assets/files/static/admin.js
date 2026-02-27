@@ -2470,12 +2470,21 @@ function adminApp() {
         const isFree = hasInput && hasOutput && inputNum === 0 && outputNum === 0;
         const input = this.formatPrice(inputNum, m.currency);
         const output = this.formatPrice(outputNum, m.currency);
+        const failureRateNum = Number(m.failure_rate || 0);
+        const failureRate = Number.isFinite(failureRateNum) ? (failureRateNum.toFixed(1) + '%') : '-';
+        const avgPP = Number(m.avg_prompt_tps || 0);
+        const avgTG = Number(m.avg_generation_tps || 0);
+        const avgPPTG = (Number.isFinite(avgPP) && Number.isFinite(avgTG) && (avgPP > 0 || avgTG > 0))
+          ? (avgPP.toFixed(1) + '/' + avgTG.toFixed(1))
+          : '-';
         return '<tr>' +
           '<td>' + providerLabel + '</td>' +
           '<td>' + model + '</td>' +
           '<td>' + status + '</td>' +
           '<td class="text-end' + (isFree ? ' text-success fw-semibold' : '') + '">' + input + '</td>' +
           '<td class="text-end' + (isFree ? ' text-success fw-semibold' : '') + '">' + output + '</td>' +
+          '<td class="text-end">' + this.escapeHtml(avgPPTG) + '</td>' +
+          '<td class="text-end">' + this.escapeHtml(failureRate) + '</td>' +
           '</tr>';
       });
       const page = this.paginateRows(htmlRows, this.modelsPage, this.modelsPageSize);
@@ -2495,8 +2504,10 @@ function adminApp() {
           '<th>Status</th>' +
           '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortModels(\'input_per_1m\')">Input / 1M' + inputSort + '</th>' +
           '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortModels(\'output_per_1m\')">Output / 1M' + outputSort + '</th>' +
+          '<th class="text-end">Avg PP/TG</th>' +
+          '<th class="text-end">Failure Rate</th>' +
           '</tr></thead>' +
-          '<tbody>' + (tableRows || '<tr><td colspan="5" class="text-body-secondary">No models available.</td></tr>') + '</tbody>' +
+          '<tbody>' + (tableRows || '<tr><td colspan="7" class="text-body-secondary">No models available.</td></tr>') + '</tbody>' +
         '</table>' +
         this.renderModelsPager(page.totalRows, page.page, page.totalPages, page.pageSize);
     },
@@ -3747,7 +3758,8 @@ function adminApp() {
     },
     async loadModelsCatalog(firstLoad, forceRefresh) {
       if (firstLoad && this.modelsCatalog.length === 0) this.modelsInitialLoadInProgress = true;
-      const u = forceRefresh ? '/admin/api/models?refresh=1' : '/admin/api/models';
+      const sec = Math.max(1, Number(this.statsRangeHours || 8)) * 3600;
+      const u = forceRefresh ? ('/admin/api/models?refresh=1&period_seconds=' + sec) : ('/admin/api/models?period_seconds=' + sec);
       const r = await this.apiFetch(u, {headers:this.headers()});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (!r.ok) {

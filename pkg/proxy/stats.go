@@ -35,6 +35,7 @@ type UsageEvent struct {
 type StatsSummary struct {
 	PeriodSeconds         int64                            `json:"period_seconds"`
 	Requests              int                              `json:"requests"`
+	FailedRequests        int                              `json:"failed_requests,omitempty"`
 	PromptTokens          int                              `json:"prompt_tokens"`
 	PromptCachedTokens    int                              `json:"prompt_cached_tokens,omitempty"`
 	CompletionTokens      int                              `json:"completion_tokens"`
@@ -91,6 +92,7 @@ type UsageBucket struct {
 	ClientIP         string    `json:"client_ip,omitempty"`
 	APIKeyName       string    `json:"api_key_name,omitempty"`
 	Requests         int       `json:"requests"`
+	FailedRequests   int       `json:"failed_requests,omitempty"`
 	PromptTokens     int       `json:"prompt_tokens"`
 	PromptCached     int       `json:"prompt_cached_tokens,omitempty"`
 	CompletionTokens int       `json:"completion_tokens"`
@@ -147,6 +149,7 @@ func (s *StatsStore) Summary(period time.Duration) StatsSummary {
 	out := StatsSummary{
 		PeriodSeconds:         sum.PeriodSeconds,
 		Requests:              sum.Requests,
+		FailedRequests:        sum.FailedRequests,
 		PromptTokens:          sum.PromptTokens,
 		PromptCachedTokens:    sum.PromptCachedTokens,
 		CompletionTokens:      sum.CompletionTokens,
@@ -173,6 +176,7 @@ func (s *StatsStore) Summary(period time.Duration) StatsSummary {
 			ClientIP:         b.ClientIP,
 			APIKeyName:       b.APIKeyName,
 			Requests:         b.Requests,
+			FailedRequests:   b.FailedRequests,
 			PromptTokens:     b.PromptTokens,
 			PromptCached:     b.PromptCached,
 			CompletionTokens: b.CompletionTokens,

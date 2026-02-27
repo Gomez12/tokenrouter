@@ -55,13 +55,16 @@ func TestRecordUsageParsesResponsesUsageSchema(t *testing.T) {
 	}
 }
 
-func TestRecordUsageMeasuredSkipsFailedStatuses(t *testing.T) {
+func TestRecordUsageMeasuredRecordsFailedStatuses(t *testing.T) {
 	s := &Server{stats: NewStatsStore(100)}
 	s.recordUsageMeasured("openai", "openai/gpt-4.1", "gpt-4.1", 500, 100*time.Millisecond, 0, 0, 0, 0, 0, 0, clientUsageMeta{})
 
 	summary := s.stats.Summary(time.Hour)
-	if summary.Requests != 0 {
-		t.Fatalf("expected failed status to be skipped, got %d requests", summary.Requests)
+	if summary.Requests != 1 {
+		t.Fatalf("expected failed status to be tracked, got %d requests", summary.Requests)
+	}
+	if summary.FailedRequests != 1 {
+		t.Fatalf("expected failed request count 1, got %d", summary.FailedRequests)
 	}
 }
 

@@ -63,6 +63,7 @@ type Bucket struct {
 	ClientIP         string    `json:"client_ip,omitempty"`
 	APIKeyName       string    `json:"api_key_name,omitempty"`
 	Requests         int       `json:"requests"`
+	FailedRequests   int       `json:"failed_requests,omitempty"`
 	PromptTokens     int       `json:"prompt_tokens"`
 	PromptCached     int       `json:"prompt_cached_tokens,omitempty"`
 	CompletionTokens int       `json:"completion_tokens"`
@@ -75,6 +76,7 @@ type Bucket struct {
 type Summary struct {
 	PeriodSeconds         int64
 	Requests              int
+	FailedRequests        int
 	PromptTokens          int
 	PromptCachedTokens    int
 	CompletionTokens      int
@@ -289,6 +291,7 @@ func (s *Store) Summary(period time.Duration, now time.Time) (Summary, error) {
 			return
 		}
 		summary.Requests += b.Requests
+		summary.FailedRequests += b.FailedRequests
 		summary.PromptTokens += b.PromptTokens
 		summary.PromptCachedTokens += b.PromptCached
 		summary.CompletionTokens += b.CompletionTokens
@@ -335,6 +338,7 @@ func (s *Store) Summary(period time.Duration, now time.Time) (Summary, error) {
 			return
 		}
 		existing.Requests += b.Requests
+		existing.FailedRequests += b.FailedRequests
 		existing.PromptTokens += b.PromptTokens
 		existing.PromptCached += b.PromptCached
 		existing.CompletionTokens += b.CompletionTokens
@@ -864,6 +868,7 @@ func mergeBucket(dst map[string]*Bucket, b Bucket) {
 		return
 	}
 	x.Requests += b.Requests
+	x.FailedRequests += b.FailedRequests
 	x.PromptTokens += b.PromptTokens
 	x.PromptCached += b.PromptCached
 	x.CompletionTokens += b.CompletionTokens
@@ -885,6 +890,7 @@ func eventToBucket(e Event, slot time.Duration) Bucket {
 		ClientIP:         strings.TrimSpace(e.ClientIP),
 		APIKeyName:       strings.TrimSpace(e.APIKeyName),
 		Requests:         1,
+		FailedRequests:   failedRequestsFromStatus(e.StatusCode),
 		PromptTokens:     e.PromptTokens,
 		PromptCached:     e.PromptCached,
 		CompletionTokens: e.CompletionToks,
@@ -893,6 +899,13 @@ func eventToBucket(e Event, slot time.Duration) Bucket {
 		PromptTPSSum:     e.PromptTPS,
 		GenerationTPSSum: e.GenTPS,
 	}
+}
+
+func failedRequestsFromStatus(code int) int {
+	if code >= 400 {
+		return 1
+	}
+	return 0
 }
 
 func bucketKey(start time.Time, provider, model, clientType, userAgent, clientIP, apiKeyName string) string {
