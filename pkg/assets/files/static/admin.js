@@ -2653,7 +2653,7 @@ function adminApp() {
       rows.sort((a, b) => {
         const av = a[sortBy];
         const bv = b[sortBy];
-        if (sortBy === 'failure_rate' || sortBy === 'avg_prompt_tps' || sortBy === 'avg_generation_tps') {
+        if (sortBy === 'failure_rate' || sortBy === 'avg_prompt_tps' || sortBy === 'avg_generation_tps' || sortBy === 'prompt_tokens' || sortBy === 'completion_tokens') {
           return (Number(av || 0) - Number(bv || 0)) * dir;
         }
         return String(av || '').localeCompare(String(bv || '')) * dir;
@@ -2664,15 +2664,21 @@ function adminApp() {
         const iconCls = this.providerIconNeedsDarkInvert(iconName) ? ' provider-icon-invert-dark' : '';
         const providerLabel = '<span class="d-inline-flex align-items-center gap-2"><img src="' + this.providerIconSrc(iconName) + '" class="' + iconCls.trim() + '" onerror="this.onerror=null;this.src=&quot;data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==&quot;" alt="" width="16" height="16" style="object-fit:contain;" /><span>' + providerDisplay + '</span></span>';
         const model = this.escapeHtml(m.model || '-');
+        const promptTokens = Number(m.prompt_tokens || 0);
+        const completionTokens = Number(m.completion_tokens || 0);
         const failureRateNum = Number(m.failure_rate || 0);
         const failureRate = Number.isFinite(failureRateNum) ? (failureRateNum.toFixed(1) + '%') : '-';
         const avgPP = Number(m.avg_prompt_tps || 0);
         const avgTG = Number(m.avg_generation_tps || 0);
-        const avgPPTG = (Number.isFinite(avgPP) && Number.isFinite(avgTG) && (avgPP > 0 || avgTG > 0)) ? (avgPP.toFixed(1) + '/' + avgTG.toFixed(1)) : '-';
+        const avgPPText = (Number.isFinite(avgPP) && avgPP > 0) ? avgPP.toFixed(1) : '-';
+        const avgTGText = (Number.isFinite(avgTG) && avgTG > 0) ? avgTG.toFixed(1) : '-';
         return '<tr>' +
           '<td>' + providerLabel + '</td>' +
           '<td>' + model + '</td>' +
-          '<td class="text-end">' + this.escapeHtml(avgPPTG) + '</td>' +
+          '<td class="text-end">' + promptTokens + '</td>' +
+          '<td class="text-end">' + completionTokens + '</td>' +
+          '<td class="text-end">' + this.escapeHtml(avgPPText) + '</td>' +
+          '<td class="text-end">' + this.escapeHtml(avgTGText) + '</td>' +
           '<td class="text-end">' + this.escapeHtml(failureRate) + '</td>' +
           '</tr>';
       });
@@ -2683,17 +2689,23 @@ function adminApp() {
       const sortArrow = this.performanceSortAsc ? ' ▲' : ' ▼';
       const providerSort = this.performanceSortBy === 'provider' ? sortArrow : '';
       const modelSort = this.performanceSortBy === 'model' ? sortArrow : '';
-      const pptgSort = (this.performanceSortBy === 'avg_prompt_tps' || this.performanceSortBy === 'avg_generation_tps') ? sortArrow : '';
+      const ppTokSort = this.performanceSortBy === 'prompt_tokens' ? sortArrow : '';
+      const tgTokSort = this.performanceSortBy === 'completion_tokens' ? sortArrow : '';
+      const ppSort = this.performanceSortBy === 'avg_prompt_tps' ? sortArrow : '';
+      const tgSort = this.performanceSortBy === 'avg_generation_tps' ? sortArrow : '';
       const failSort = this.performanceSortBy === 'failure_rate' ? sortArrow : '';
       this.performanceTableHtml =
         '<table class="table table-sm align-middle mb-0">' +
           '<thead><tr>' +
           '<th role="button" class="text-decoration-underline" onclick="window.__adminSortPerformance(\'provider\')">Provider' + providerSort + '</th>' +
           '<th role="button" class="text-decoration-underline" onclick="window.__adminSortPerformance(\'model\')">Model' + modelSort + '</th>' +
-          '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortPerformance(\'avg_generation_tps\')">Avg PP/TG' + pptgSort + '</th>' +
+          '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortPerformance(\'prompt_tokens\')">PP Tokens' + ppTokSort + '</th>' +
+          '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortPerformance(\'completion_tokens\')">TG Tokens' + tgTokSort + '</th>' +
+          '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortPerformance(\'avg_prompt_tps\')">Avg PP/s' + ppSort + '</th>' +
+          '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortPerformance(\'avg_generation_tps\')">Avg TG/s' + tgSort + '</th>' +
           '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortPerformance(\'failure_rate\')">Failure Rate' + failSort + '</th>' +
           '</tr></thead>' +
-          '<tbody>' + (tableRows || '<tr><td colspan="4" class="text-body-secondary">No performance data.</td></tr>') + '</tbody>' +
+          '<tbody>' + (tableRows || '<tr><td colspan="7" class="text-body-secondary">No performance data.</td></tr>') + '</tbody>' +
         '</table>' +
         this.renderPerformancePager(page.totalRows, page.page, page.totalPages, page.pageSize);
     },

@@ -6176,6 +6176,8 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 		OutputPer1M         *float64 `json:"output_per_1m,omitempty"`
 		Currency            string   `json:"currency,omitempty"`
 		PerfRequests        int      `json:"perf_requests,omitempty"`
+		PromptTokens        int      `json:"prompt_tokens,omitempty"`
+		CompletionTokens    int      `json:"completion_tokens,omitempty"`
 		FailureRate         float64  `json:"failure_rate,omitempty"`
 		AvgPromptTPS        float64  `json:"avg_prompt_tps,omitempty"`
 		AvgGenerationTPS    float64  `json:"avg_generation_tps,omitempty"`
@@ -6189,6 +6191,8 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 	type usageAgg struct {
 		requests int
 		failed   int
+		prompt   int
+		gen      int
 		ppSum    float64
 		tgSum    float64
 	}
@@ -6201,10 +6205,20 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 			if p == "" || m == "" || b.Requests <= 0 {
 				continue
 			}
+			if mp, stripped, ok := splitModelPrefix(m); ok {
+				if p == "" {
+					p = strings.TrimSpace(mp)
+				}
+				if strings.EqualFold(strings.TrimSpace(mp), p) && strings.TrimSpace(stripped) != "" {
+					m = strings.TrimSpace(stripped)
+				}
+			}
 			key := p + "/" + m
 			a := usageByModel[key]
 			a.requests += b.Requests
 			a.failed += b.FailedRequests
+			a.prompt += b.PromptTokens
+			a.gen += b.CompletionTokens
 			a.ppSum += b.PromptTPSSum
 			a.tgSum += b.GenerationTPSSum
 			usageByModel[key] = a
@@ -6296,6 +6310,8 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 			}
 			if agg, ok := usageByModel[provider+"/"+modelID]; ok && agg.requests > 0 {
 				item.PerfRequests = agg.requests
+				item.PromptTokens = agg.prompt
+				item.CompletionTokens = agg.gen
 				item.FailureRate = float64(agg.failed) * 100.0 / float64(agg.requests)
 				item.AvgPromptTPS = agg.ppSum / float64(agg.requests)
 				item.AvgGenerationTPS = agg.tgSum / float64(agg.requests)
