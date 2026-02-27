@@ -246,7 +246,7 @@ func TestRunPingPongWithProvidedModels(t *testing.T) {
 	var out bytes.Buffer
 	cmd := &cobra.Command{}
 	cmd.SetOut(&out)
-	if err := runPingPong(cmd, cfgPath, "provider-a/m1,provider-b/m2", 2, "Manual starter?", "none", 10000, 1, "words"); err != nil {
+	if err := runPingPong(cmd, cfgPath, "provider-a/m1,provider-b/m2", 2, "Manual starter?", "none", 10000, 1, "words", 1); err != nil {
 		t.Fatalf("runPingPong: %v", err)
 	}
 	got := out.String()
@@ -306,7 +306,7 @@ func TestRunPingPongWithManualStarter(t *testing.T) {
 	var out bytes.Buffer
 	cmd := &cobra.Command{}
 	cmd.SetOut(&out)
-	if err := runPingPong(cmd, cfgPath, "a/m,b/m", 1, "What is one tiny win today?", "none", 10000, 1, "words"); err != nil {
+	if err := runPingPong(cmd, cfgPath, "a/m,b/m", 1, "What is one tiny win today?", "none", 10000, 1, "words", 1); err != nil {
 		t.Fatalf("runPingPong: %v", err)
 	}
 	got := out.String()

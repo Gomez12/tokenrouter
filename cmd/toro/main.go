@@ -109,11 +109,12 @@ func main() {
 	var pingPongMaxTokens int
 	var pingPongRuns int
 	var pingPongShowTokens string
+	var pingPongParallel int
 	pingPongCmd := &cobra.Command{
 		Use:   "pingpong",
 		Short: "Run a ping-pong chat loop between two models",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPingPong(cmd, pingPongConfigPath, pingPongModels, pingPongTurnPairs, pingPongStarter, pingPongReasoning, pingPongMaxTokens, pingPongRuns, pingPongShowTokens)
+			return runPingPong(cmd, pingPongConfigPath, pingPongModels, pingPongTurnPairs, pingPongStarter, pingPongReasoning, pingPongMaxTokens, pingPongRuns, pingPongShowTokens, pingPongParallel)
 		},
 	}
 	pingPongCmd.Flags().StringVar(&pingPongConfigPath, "config", config.DefaultClientConfigPath(), "Client config TOML path")
@@ -124,6 +125,7 @@ func main() {
 	pingPongCmd.Flags().IntVar(&pingPongMaxTokens, "max-tokens", 10000, "Stop conversation after this many cumulative tokens (0 disables limit)")
 	pingPongCmd.Flags().IntVar(&pingPongRuns, "runs", 1, "Number of complete ping-pong runs to execute")
 	pingPongCmd.Flags().StringVar(&pingPongShowTokens, "show-tokens", "dot", "Streaming display mode: words, dot, none")
+	pingPongCmd.Flags().IntVar(&pingPongParallel, "parallel", 4, "Number of runs to execute in parallel")
 	root.AddCommand(pingPongCmd)
 
 	var opencodeConfigPath string
@@ -735,12 +737,22 @@ func printModelsReportHuman(w io.Writer, report modelsReport) {
 	}
 }
 
-func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int, starter, reasoning string, maxTokens int, runs int, showTokens string) error {
+type pingPongRunStats struct {
+	CompletedTurnPairs int
+	UsedTokens         int
+	StoppedByMaxTokens bool
+	Duration           time.Duration
+}
+
+func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int, starter, reasoning string, maxTokens int, runs int, showTokens string, parallel int) error {
 	if iterations <= 0 {
 		return fmt.Errorf("iterations must be > 0")
 	}
 	if runs <= 0 {
 		return fmt.Errorf("runs must be > 0")
+	}
+	if parallel <= 0 {
+		return fmt.Errorf("parallel must be > 0")
 	}
 	if maxTokens < 0 {
 		return fmt.Errorf("max-tokens must be >= 0")
@@ -780,93 +792,166 @@ func runPingPong(cmd *cobra.Command, cfgPath, modelsFlag string, iterations int,
 	fmt.Fprintf(out, "Models: A=%s, B=%s\n", modelA, modelB)
 	fmt.Fprintf(out, "Turn pairs: %d\n", iterations)
 	fmt.Fprintf(out, "Runs: %d\n", runs)
+	fmt.Fprintf(out, "Parallel: %d\n", parallel)
 	if maxTokens > 0 {
 		fmt.Fprintf(out, "Max tokens: %d\n", maxTokens)
 	}
-	for run := 1; run <= runs; run++ {
-		if runs > 1 {
-			fmt.Fprintf(out, "\nRun %d/%d\n", run, runs)
-		}
-		conversationID, err := randomConversationID()
-		if err != nil {
-			return fmt.Errorf("generate conversation id: %w", err)
-		}
-		runClient := client.withConversationID(conversationID)
-		usedTokens := 0
-
-		seedQuestion := compactPingPongText(starter)
-		if seedQuestion == "" {
-			seedPrompt := "Give me a short random question. Return only the question."
-			var err error
-			fmt.Fprintf(out, "Seed (%s): ", modelA)
-			seedQuestion, lastTokens, err := runClient.streamChatCompletion(modelA, []pingPongMessage{
-				{Role: "system", Content: "You produce concise, random conversation starters. Do not output reasoning. Output only the final question text."},
-				{Role: "user", Content: seedPrompt},
-			}, 0.9, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
-			fmt.Fprintln(out)
+	if parallel == 1 {
+		for run := 1; run <= runs; run++ {
+			stats, err := runPingPongOnce(cmd, client, modelA, modelB, iterations, starter, reasoning, maxTokens, showTokens, true)
 			if err != nil {
-				return fmt.Errorf("seed question from %s: %w", modelA, err)
+				return fmt.Errorf("run %d: %w", run, err)
 			}
-			usedTokens += lastTokens
-			seedQuestion = compactPingPongText(seedQuestion)
-		} else {
-			fmt.Fprintf(out, "Starter: manual\n")
-			fmt.Fprintf(out, "Seed (%s): %s\n", modelA, seedQuestion)
+			fmt.Fprintf(out, "Run %d/%d: turns=%d tokens=%d duration=%s%s\n", run, runs, stats.CompletedTurnPairs, stats.UsedTokens, stats.Duration.Round(time.Millisecond), map[bool]string{true: " stop=max-tokens", false: ""}[stats.StoppedByMaxTokens])
 		}
-		if seedQuestion == "" {
-			return fmt.Errorf("seed question from %s was empty (provider returned no final content)", modelA)
-		}
-
-		convA := []pingPongMessage{
-			{Role: "system", Content: "You are participant A in a ping-pong conversation. Reply with one or two short sentences."},
-		}
-		convB := []pingPongMessage{
-			{Role: "system", Content: "You are participant B in a ping-pong conversation. Reply with one or two short sentences."},
-		}
-
-		current := seedQuestion
-		for i := 1; i <= iterations; i++ {
-			if maxTokens > 0 && usedTokens >= maxTokens {
-				fmt.Fprintf(out, "Stopped early: reached max token budget (%d/%d)\n", usedTokens, maxTokens)
-				break
-			}
-			convB = append(convB, pingPongMessage{Role: "user", Content: current})
-			fmt.Fprintf(out, "B[%d] (%s): ", i, modelB)
-			replyB, lastTokens, err := runClient.streamChatCompletion(modelB, convB, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
-			fmt.Fprintln(out)
-			if err != nil {
-				return fmt.Errorf("iteration %d model %s: %w", i, modelB, err)
-			}
-			usedTokens += lastTokens
-			replyB = compactPingPongText(replyB)
-			if replyB == "" {
-				return fmt.Errorf("iteration %d model %s returned empty content", i, modelB)
-			}
-			convB = append(convB, pingPongMessage{Role: "assistant", Content: replyB})
-			convB = trimPingPongConversation(convB, 14)
-
-			if maxTokens > 0 && usedTokens >= maxTokens {
-				fmt.Fprintf(out, "Stopped early: reached max token budget (%d/%d)\n", usedTokens, maxTokens)
-				break
-			}
-			convA = append(convA, pingPongMessage{Role: "user", Content: replyB})
-			fmt.Fprintf(out, "A[%d] (%s): ", i, modelA)
-			replyA, lastTokens, err := runClient.streamChatCompletion(modelA, convA, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
-			fmt.Fprintln(out)
-			if err != nil {
-				return fmt.Errorf("iteration %d model %s: %w", i, modelA, err)
-			}
-			usedTokens += lastTokens
-			replyA = compactPingPongText(replyA)
-			if replyA == "" {
-				return fmt.Errorf("iteration %d model %s returned empty content", i, modelA)
-			}
-			convA = append(convA, pingPongMessage{Role: "assistant", Content: replyA})
-			convA = trimPingPongConversation(convA, 14)
-			current = replyA
-		}
+		return nil
 	}
-	return nil
+	if parallel > runs {
+		parallel = runs
+	}
+	type runResult struct {
+		index int
+		stats pingPongRunStats
+		err   error
+	}
+	jobs := make(chan int, runs)
+	results := make(chan runResult, runs)
+	for i := 1; i <= runs; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	var wg sync.WaitGroup
+	for w := 0; w < parallel; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				stats, err := runPingPongOnce(cmd, client, modelA, modelB, iterations, starter, reasoning, maxTokens, "none", false)
+				results <- runResult{index: idx, stats: stats, err: err}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	var firstErr error
+	for rr := range results {
+		if rr.err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("run %d: %w", rr.index, rr.err)
+		}
+		if rr.err != nil {
+			fmt.Fprintf(out, "Run %d/%d: error=%v\n", rr.index, runs, rr.err)
+			continue
+		}
+		fmt.Fprintf(out, "Run %d/%d: turns=%d tokens=%d duration=%s%s\n", rr.index, runs, rr.stats.CompletedTurnPairs, rr.stats.UsedTokens, rr.stats.Duration.Round(time.Millisecond), map[bool]string{true: " stop=max-tokens", false: ""}[rr.stats.StoppedByMaxTokens])
+	}
+	return firstErr
+}
+
+func runPingPongOnce(cmd *cobra.Command, client *toroClient, modelA, modelB string, iterations int, starter, reasoning string, maxTokens int, showTokens string, verbose bool) (pingPongRunStats, error) {
+	started := time.Now()
+	out := cmd.OutOrStdout()
+	conversationID, err := randomConversationID()
+	if err != nil {
+		return pingPongRunStats{}, fmt.Errorf("generate conversation id: %w", err)
+	}
+	runClient := client.withConversationID(conversationID)
+	usedTokens := 0
+	turns := 0
+	stopped := false
+
+	seedQuestion := compactPingPongText(starter)
+	if seedQuestion == "" {
+		seedPrompt := "Give me a short random question. Return only the question."
+		if verbose {
+			fmt.Fprintf(out, "Seed (%s): ", modelA)
+		}
+		seedQuestion, lastTokens, err := runClient.streamChatCompletion(modelA, []pingPongMessage{
+			{Role: "system", Content: "You produce concise, random conversation starters. Do not output reasoning. Output only the final question text."},
+			{Role: "user", Content: seedPrompt},
+		}, 0.9, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+		if verbose {
+			fmt.Fprintln(out)
+		}
+		if err != nil {
+			return pingPongRunStats{}, fmt.Errorf("seed question from %s: %w", modelA, err)
+		}
+		usedTokens += lastTokens
+		seedQuestion = compactPingPongText(seedQuestion)
+	} else if verbose {
+		fmt.Fprintf(out, "Starter: manual\n")
+		fmt.Fprintf(out, "Seed (%s): %s\n", modelA, seedQuestion)
+	}
+	if seedQuestion == "" {
+		return pingPongRunStats{}, fmt.Errorf("seed question from %s was empty (provider returned no final content)", modelA)
+	}
+
+	convA := []pingPongMessage{
+		{Role: "system", Content: "You are participant A in a ping-pong conversation. Reply with one or two short sentences."},
+	}
+	convB := []pingPongMessage{
+		{Role: "system", Content: "You are participant B in a ping-pong conversation. Reply with one or two short sentences."},
+	}
+	current := seedQuestion
+	for i := 1; i <= iterations; i++ {
+		if maxTokens > 0 && usedTokens >= maxTokens {
+			stopped = true
+			break
+		}
+		convB = append(convB, pingPongMessage{Role: "user", Content: current})
+		if verbose {
+			fmt.Fprintf(out, "B[%d] (%s): ", i, modelB)
+		}
+		replyB, lastTokens, err := runClient.streamChatCompletion(modelB, convB, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+		if verbose {
+			fmt.Fprintln(out)
+		}
+		if err != nil {
+			return pingPongRunStats{}, fmt.Errorf("iteration %d model %s: %w", i, modelB, err)
+		}
+		usedTokens += lastTokens
+		replyB = compactPingPongText(replyB)
+		if replyB == "" {
+			return pingPongRunStats{}, fmt.Errorf("iteration %d model %s returned empty content", i, modelB)
+		}
+		convB = append(convB, pingPongMessage{Role: "assistant", Content: replyB})
+		convB = trimPingPongConversation(convB, 14)
+
+		if maxTokens > 0 && usedTokens >= maxTokens {
+			stopped = true
+			break
+		}
+		convA = append(convA, pingPongMessage{Role: "user", Content: replyB})
+		if verbose {
+			fmt.Fprintf(out, "A[%d] (%s): ", i, modelA)
+		}
+		replyA, lastTokens, err := runClient.streamChatCompletion(modelA, convA, 0.7, 256, reasoning, showTokens, out, cmd.ErrOrStderr())
+		if verbose {
+			fmt.Fprintln(out)
+		}
+		if err != nil {
+			return pingPongRunStats{}, fmt.Errorf("iteration %d model %s: %w", i, modelA, err)
+		}
+		usedTokens += lastTokens
+		replyA = compactPingPongText(replyA)
+		if replyA == "" {
+			return pingPongRunStats{}, fmt.Errorf("iteration %d model %s returned empty content", i, modelA)
+		}
+		convA = append(convA, pingPongMessage{Role: "assistant", Content: replyA})
+		convA = trimPingPongConversation(convA, 14)
+		current = replyA
+		turns++
+	}
+	if verbose && stopped {
+		fmt.Fprintf(out, "Stopped early: reached max token budget (%d/%d)\n", usedTokens, maxTokens)
+	}
+	return pingPongRunStats{
+		CompletedTurnPairs: turns,
+		UsedTokens:         usedTokens,
+		StoppedByMaxTokens: stopped,
+		Duration:           time.Since(started),
+	}, nil
 }
 
 func parsePingPongModelsFlag(raw string) (string, string, error) {
