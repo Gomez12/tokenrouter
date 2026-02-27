@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -28,7 +29,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	log "github.com/charmbracelet/log"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/klauspost/compress/zstd"
@@ -224,7 +224,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 		if httpChallenge != nil {
 			go func() {
-				log.Infof("http challenge/redirect listening on :80")
+				slog.Info("http challenge/redirect listening on :80")
 				if err := httpChallenge.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					errCh <- fmt.Errorf("http challenge server: %w", err)
 				}
@@ -232,7 +232,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 
 		go func() {
-			log.Infof("https listening on %s (mode=%s)", tlsListenAddr, strings.TrimSpace(cfg.TLS.Mode))
+			slog.Info("proxy listening", "url", listenerURL("https", tlsListenAddr), "tls_mode", strings.TrimSpace(cfg.TLS.Mode))
 			if err := httpsSrv.ListenAndServeTLS(certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("https server: %w", err)
 			}
@@ -292,11 +292,11 @@ func (s *Server) addHTTPListener(addr string) error {
 	s.httpListeners[listenAddr] = ln
 	s.listenerMu.Unlock()
 
-	log.Infof("proxy listening on %s", listenAddr)
+	slog.Info("proxy listening", "url", listenerURL("http", listenAddr))
 	go func(addr string, l net.Listener) {
 		err := s.httpServer.Serve(l)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-			log.Warn("proxy listener stopped", "addr", addr, "error", err)
+			slog.Warn("proxy listener stopped", "addr", addr, "error", err)
 		}
 		s.listenerMu.Lock()
 		if cur, ok := s.httpListeners[addr]; ok && cur == l {
@@ -305,6 +305,24 @@ func (s *Server) addHTTPListener(addr string) error {
 		s.listenerMu.Unlock()
 	}(listenAddr, ln)
 	return nil
+}
+
+func listenerURL(scheme, addr string) string {
+	listenAddr := strings.TrimSpace(addr)
+	if listenAddr == "" {
+		return scheme + "://"
+	}
+	if strings.Contains(listenAddr, "://") {
+		return listenAddr
+	}
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err == nil {
+		if strings.TrimSpace(host) == "" {
+			host = "127.0.0.1"
+		}
+		return scheme + "://" + net.JoinHostPort(host, port)
+	}
+	return scheme + "://" + listenAddr
 }
 
 func (s *Server) removeHTTPListener(addr string) error {
@@ -366,12 +384,12 @@ func (s *Server) runAccessTokenCleanupOnce() {
 	}
 	res, err := s.cleanupAccessTokens(nowUTC())
 	if err != nil {
-		log.Warn("access token cleanup failed", "error", err)
+		slog.Warn("access token cleanup failed", "error", err)
 		return
 	}
 	totalRemoved := res.ExpiredTokens + res.EmptyQuotaTokens + res.OrphanedTokens
 	if totalRemoved > 0 {
-		log.Info("access token cleanup completed",
+		slog.Info("access token cleanup completed",
 			"removed_total", totalRemoved,
 			"removed_expired", res.ExpiredTokens,
 			"removed_empty_non_reset_quota", res.EmptyQuotaTokens,
@@ -513,7 +531,7 @@ func requestDebugLogMiddleware(next http.Handler) http.Handler {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		start := time.Now()
 		next.ServeHTTP(ww, r)
-		log.Debug("http request",
+		slog.Debug("http request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", ww.Status(),
@@ -547,11 +565,11 @@ func (s *Server) waitForProxyIdle(ctx context.Context) {
 	for {
 		active := s.activeProxyRequests.Load()
 		if active <= 0 {
-			log.Infof("shutdown: proxy idle")
+			slog.Info("shutdown: proxy idle")
 			return
 		}
 		if lastLog.IsZero() || time.Since(lastLog) >= time.Second {
-			log.Infof("shutdown: waiting for %d active proxy request(s)", active)
+			slog.Info("shutdown: waiting for active proxy requests", "active", active)
 			lastLog = time.Now()
 		}
 		select {
@@ -961,7 +979,7 @@ func (s *Server) triggerProviderModelRefresh(provider config.ProviderConfig, rea
 	s.modelRefreshLast[name] = now
 	s.modelRefreshMu.Unlock()
 
-	log.Infof("triggering provider model refresh provider=%s reason=%s", name, strings.TrimSpace(reason))
+	slog.Info("triggering provider model refresh", "provider", name, "reason", strings.TrimSpace(reason))
 	go func(p config.ProviderConfig) {
 		defer func() {
 			s.modelRefreshMu.Lock()
@@ -972,14 +990,14 @@ func (s *Server) triggerProviderModelRefresh(provider config.ProviderConfig, rea
 		defer cancel()
 		cards, err := NewProviderClient(p).ListModels(ctx)
 		if err != nil {
-			log.Warnf("provider model refresh failed provider=%s err=%v", name, err)
+			slog.Warn("provider model refresh failed", "provider", name, "err", err)
 			return
 		}
 		s.mergeProviderModelsCache(name, cards)
 		if s.adminHandler != nil {
 			s.adminHandler.notifyAdminChanged("models")
 		}
-		log.Infof("provider model refresh completed provider=%s models=%d", name, len(cards))
+		slog.Info("provider model refresh completed", "provider", name, "models", len(cards))
 	}(provider)
 }
 

@@ -2,9 +2,9 @@ package cmd
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 
-	log "github.com/charmbracelet/log"
 	"github.com/lkarlslund/tokenrouter/pkg/logutil"
 	"github.com/lkarlslund/tokenrouter/pkg/version"
 	"github.com/spf13/cobra"
@@ -30,7 +30,7 @@ func init() {
 			return err
 		}
 		if os.Geteuid() == 0 {
-			log.Warn("running as root")
+			slog.Warn("running as root")
 		}
 		return nil
 	}

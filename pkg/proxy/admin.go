@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -28,7 +29,6 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/charmbracelet/log"
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	"github.com/lkarlslund/tokenrouter/pkg/assets"
@@ -312,7 +312,7 @@ func (h *AdminHandler) broadcastAdminEvent(event map[string]any) {
 
 func (h *AdminHandler) RecordConversation(in conversations.CaptureInput) bool {
 	if h == nil || h.conversations == nil {
-		log.Warn("conversation capture skipped", "reason", "store_unavailable", "endpoint", strings.TrimSpace(in.Endpoint), "provider", strings.TrimSpace(in.Provider), "model", strings.TrimSpace(in.Model), "status", in.StatusCode)
+		slog.Warn("conversation capture skipped", "reason", "store_unavailable", "endpoint", strings.TrimSpace(in.Endpoint), "provider", strings.TrimSpace(in.Provider), "model", strings.TrimSpace(in.Model), "status", in.StatusCode)
 		return false
 	}
 	rec, ok := h.conversations.Add(in)
@@ -322,10 +322,10 @@ func (h *AdminHandler) RecordConversation(in conversations.CaptureInput) bool {
 		if !settings.Enabled {
 			reason = "disabled"
 		}
-		log.Warn("conversation capture skipped", "reason", reason, "enabled", settings.Enabled, "endpoint", strings.TrimSpace(in.Endpoint), "provider", strings.TrimSpace(in.Provider), "model", strings.TrimSpace(in.Model), "status", in.StatusCode)
+		slog.Warn("conversation capture skipped", "reason", reason, "enabled", settings.Enabled, "endpoint", strings.TrimSpace(in.Endpoint), "provider", strings.TrimSpace(in.Provider), "model", strings.TrimSpace(in.Model), "status", in.StatusCode)
 		return false
 	}
-	log.Info("conversation captured", "conversation_key", rec.ConversationKey, "endpoint", strings.TrimSpace(rec.Endpoint), "provider", strings.TrimSpace(rec.Provider), "model", strings.TrimSpace(rec.Model), "status", rec.StatusCode, "latency_ms", rec.LatencyMS)
+	slog.Info("conversation captured", "conversation_key", rec.ConversationKey, "endpoint", strings.TrimSpace(rec.Endpoint), "provider", strings.TrimSpace(rec.Provider), "model", strings.TrimSpace(rec.Model), "status", rec.StatusCode, "latency_ms", rec.LatencyMS)
 	h.invalidateConversationViewCacheForKey(rec.ConversationKey)
 	h.broadcastAdminEvent(map[string]any{
 		"type":             "conversation_append",
@@ -957,7 +957,7 @@ func (h *AdminHandler) loadQuotaCacheFromDisk() {
 	var persisted persistedQuotaCacheFile
 	if err := cache.LoadJSON(h.quotaCachePath, &persisted); err != nil {
 		if !errors.Is(err, cache.ErrNotFound) {
-			log.Warn("failed to load admin quota cache", "path", h.quotaCachePath, "err", err)
+			slog.Warn("failed to load admin quota cache", "path", h.quotaCachePath, "err", err)
 		}
 		return
 	}
@@ -1014,7 +1014,7 @@ func (h *AdminHandler) persistQuotaCacheToDisk() {
 		return
 	}
 	if err := cache.SaveJSON(h.quotaCachePath, out); err != nil {
-		log.Warn("failed to persist admin quota cache", "path", h.quotaCachePath, "err", err)
+		slog.Warn("failed to persist admin quota cache", "path", h.quotaCachePath, "err", err)
 	}
 }
 
@@ -1451,7 +1451,7 @@ func (h *AdminHandler) refreshProviderQuota(p config.ProviderConfig, preset asse
 				Refreshing: false,
 			}, now, quotaRefreshError)
 			h.quotaMu.Unlock()
-			log.Warn("quota refresh panic recovered", "provider", strings.TrimSpace(p.Name))
+			slog.Warn("quota refresh panic recovered", "provider", strings.TrimSpace(p.Name))
 		}
 	}()
 	h.computeProviderQuotaAndStore(p, preset)
@@ -1465,7 +1465,7 @@ func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, pre
 	reader := quotaReaderFromPreset(preset)
 	shouldLogRefresh := !isInlineQuotaHeaderReader(reader)
 	if shouldLogRefresh {
-		log.Info("refreshing provider quota", "provider", strings.TrimSpace(p.Name), "reader", reader)
+		slog.Info("refreshing provider quota", "provider", strings.TrimSpace(p.Name), "reader", reader)
 	}
 	snap := newProviderQuotaSnapshot(now, p, preset, reader)
 	snap = h.runQuotaReader(ctx, p, preset, snap)
@@ -1498,7 +1498,7 @@ func (h *AdminHandler) computeProviderQuotaAndStore(p config.ProviderConfig, pre
 	}, now, nextDelay)
 	h.quotaMu.Unlock()
 	if shouldLogRefresh {
-		log.Info(
+		slog.Info(
 			"provider quota refresh result",
 			"provider", strings.TrimSpace(p.Name),
 			"reader", reader,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/charmbracelet/log"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -459,7 +459,7 @@ func (s *Store) compactRawTo5mLocked(now time.Time) error {
 	if len(candidates) == 0 {
 		return nil
 	}
-	log.Info("usage db compacting raw to 5m", "segments", len(candidates), "cutoff", cutoff.Format(time.RFC3339))
+	slog.Info("usage db compacting raw to 5m", "segments", len(candidates), "cutoff", cutoff.Format(time.RFC3339))
 	agg := map[string]*Bucket{}
 	for _, seg := range candidates {
 		err := scanEvents(seg.path, time.Time{}, cutoff, func(evt Event) {
@@ -476,7 +476,7 @@ func (s *Store) compactRawTo5mLocked(now time.Time) error {
 	for _, seg := range candidates {
 		_ = os.Remove(seg.path)
 	}
-	log.Info("usage db compacted raw to 5m", "segments", len(candidates), "buckets", len(agg))
+	slog.Info("usage db compacted raw to 5m", "segments", len(candidates), "buckets", len(agg))
 	return nil
 }
 
@@ -495,7 +495,7 @@ func (s *Store) compact5mTo1hLocked(now time.Time) error {
 	if len(candidates) == 0 {
 		return nil
 	}
-	log.Info("usage db compacting 5m to 1h", "segments", len(candidates), "cutoff", cutoff.Format(time.RFC3339))
+	slog.Info("usage db compacting 5m to 1h", "segments", len(candidates), "cutoff", cutoff.Format(time.RFC3339))
 	agg := map[string]*Bucket{}
 	for _, seg := range candidates {
 		err := scanBuckets(seg.path, time.Time{}, cutoff, func(b Bucket) {
@@ -514,7 +514,7 @@ func (s *Store) compact5mTo1hLocked(now time.Time) error {
 	for _, seg := range candidates {
 		_ = os.Remove(seg.path)
 	}
-	log.Info("usage db compacted 5m to 1h", "segments", len(candidates), "buckets", len(agg))
+	slog.Info("usage db compacted 5m to 1h", "segments", len(candidates), "buckets", len(agg))
 	return nil
 }
 
@@ -532,7 +532,7 @@ func (s *Store) prune1hLocked(now time.Time) error {
 		}
 	}
 	if pruned > 0 {
-		log.Info("usage db pruned 1h rollups", "segments", pruned, "cutoff", cutoff.Format(time.RFC3339))
+		slog.Info("usage db pruned 1h rollups", "segments", pruned, "cutoff", cutoff.Format(time.RFC3339))
 	}
 	return nil
 }
@@ -792,17 +792,17 @@ func (s *Store) importLegacyIfNeeded() {
 	}
 	statePath := filepath.Join(s.dir, "meta", "import-state.json")
 	if _, err := os.Stat(statePath); err == nil {
-		log.Debug("usage db legacy import skipped", "reason", "already imported")
+		slog.Debug("usage db legacy import skipped", "reason", "already imported")
 		return
 	}
 	b, err := os.ReadFile(s.legacyPath)
 	if err != nil || len(b) == 0 {
 		return
 	}
-	log.Info("usage db importing legacy stats", "path", s.legacyPath)
+	slog.Info("usage db importing legacy stats", "path", s.legacyPath)
 	var old legacyStatsFile
 	if err := json.Unmarshal(b, &old); err != nil || old.Version != 1 || len(old.Buckets) == 0 {
-		log.Warn("usage db legacy import skipped", "reason", "invalid legacy payload")
+		slog.Warn("usage db legacy import skipped", "reason", "invalid legacy payload")
 		return
 	}
 	items := make([]Bucket, 0, len(old.Buckets))
@@ -828,14 +828,14 @@ func (s *Store) importLegacyIfNeeded() {
 	}
 	_ = os.MkdirAll(filepath.Dir(statePath), 0o700)
 	if err := s.writeRollupBucketsLocked(300, items); err != nil {
-		log.Warn("usage db legacy import failed", "error", err)
+		slog.Warn("usage db legacy import failed", "error", err)
 		return
 	}
 	state := importState{Version: 1, ImportedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	if out, err := json.MarshalIndent(state, "", "  "); err == nil {
 		_ = os.WriteFile(statePath, out, 0o600)
 	}
-	log.Info("usage db legacy import completed", "buckets", len(items))
+	slog.Info("usage db legacy import completed", "buckets", len(items))
 }
 
 func mapToSortedBuckets(m map[string]*Bucket) []Bucket {
