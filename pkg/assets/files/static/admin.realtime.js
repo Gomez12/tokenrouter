@@ -147,7 +147,7 @@
       this.loadAccessTokens();
       this.loadSecuritySettings();
       this.loadTLSSettings();
-    } else if (this.activeTab === 'models') {
+    } else if (this.activeTab === 'models' || this.activeTab === 'performance') {
       this.loadModelsCatalog(false);
     } else if (this.activeTab === 'benchmark' || this.benchmarkRunning) {
       this.loadBenchmarkStatus();
@@ -185,7 +185,7 @@
       return;
     }
     if (s === 'models') {
-      if (this.activeTab === 'models') this.loadModelsCatalog(false);
+      if (this.activeTab === 'models' || this.activeTab === 'performance') this.loadModelsCatalog(false);
       return;
     }
     if (s === 'benchmark') {

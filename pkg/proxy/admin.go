@@ -6175,6 +6175,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 		InputPer1M          *float64 `json:"input_per_1m,omitempty"`
 		OutputPer1M         *float64 `json:"output_per_1m,omitempty"`
 		Currency            string   `json:"currency,omitempty"`
+		PerfRequests        int      `json:"perf_requests,omitempty"`
 		FailureRate         float64  `json:"failure_rate,omitempty"`
 		AvgPromptTPS        float64  `json:"avg_prompt_tps,omitempty"`
 		AvgGenerationTPS    float64  `json:"avg_generation_tps,omitempty"`
@@ -6294,6 +6295,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 				}
 			}
 			if agg, ok := usageByModel[provider+"/"+modelID]; ok && agg.requests > 0 {
+				item.PerfRequests = agg.requests
 				item.FailureRate = float64(agg.failed) * 100.0 / float64(agg.requests)
 				item.AvgPromptTPS = agg.ppSum / float64(agg.requests)
 				item.AvgGenerationTPS = agg.tgSum / float64(agg.requests)
@@ -6373,6 +6375,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		if agg, ok := usageByModel[pn+"/"+modelID]; ok && agg.requests > 0 {
+			item.PerfRequests = agg.requests
 			item.FailureRate = float64(agg.failed) * 100.0 / float64(agg.requests)
 			item.AvgPromptTPS = agg.ppSum / float64(agg.requests)
 			item.AvgGenerationTPS = agg.tgSum / float64(agg.requests)

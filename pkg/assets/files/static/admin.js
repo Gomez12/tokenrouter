@@ -67,6 +67,7 @@ function adminApp() {
     lastGoodQuotaByProvider: {},
     quotaSearch: '',
     statsRangeHours: '8',
+    performanceRangeHours: '8',
     statusUpdateSpeed: 'realtime',
     usageChartGroupBy: 'model',
     usageChart: null,
@@ -74,6 +75,7 @@ function adminApp() {
     accessTokensTableHtml: '',
     accessTokensPagerHtml: '',
     modelsTableHtml: '',
+    performanceTableHtml: '',
     benchmarkHtml: '<div class="small text-body-secondary">No benchmark running.</div>',
     modelsFreshnessHtml: '',
     modalStatusHtml: '',
@@ -91,8 +93,11 @@ function adminApp() {
     authMode: 'api_key',
     providerSearch: '',
     modelsSearch: '',
+    performanceSearch: '',
     modelsSortBy: 'provider',
     modelsSortAsc: true,
+    performanceSortBy: 'provider',
+    performanceSortAsc: true,
     modelsFreeOnly: false,
     providersPage: 1,
     providersPageSize: 25,
@@ -100,6 +105,8 @@ function adminApp() {
     accessPageSize: 25,
     modelsPage: 1,
     modelsPageSize: 25,
+    performancePage: 1,
+    performancePageSize: 25,
     conversationsPage: 1,
     conversationsPageSize: 25,
     logsPage: 1,
@@ -133,6 +140,7 @@ function adminApp() {
     themeCacheKey: 'opp_theme_mode_v1',
     usageChartGroupCacheKey: 'opp_usage_chart_group_v1',
     statsRangeCacheKey: 'opp_stats_range_hours_v1',
+    performanceRangeCacheKey: 'opp_performance_range_hours_v1',
     statusUpdateSpeedCacheKey: 'opp_status_update_speed_v1',
     logLevelFilterCacheKey: 'opp_log_level_filter_v1',
     accessTokens: [],
@@ -160,6 +168,7 @@ function adminApp() {
       this.restoreLocalStorageFromHandoff();
       this.captureRuntimeScriptFingerprints();
       window.__adminSortModels = (col) => this.sortModelsBy(col);
+      window.__adminSortPerformance = (col) => this.sortPerformanceBy(col);
       window.__adminProvidersFirstPage = () => this.setProvidersPage(1);
       window.__adminProvidersPrevPage = () => this.setProvidersPage(this.providersPage - 1);
       window.__adminProvidersNextPage = () => this.setProvidersPage(this.providersPage + 1);
@@ -178,6 +187,12 @@ function adminApp() {
       window.__adminModelsLastPage = () => this.setModelsPage(Number.MAX_SAFE_INTEGER);
       window.__adminSetModelsPage = (v) => this.setModelsPage(v);
       window.__adminSetModelsPageSize = (v) => this.setModelsPageSize(v);
+      window.__adminPerformanceFirstPage = () => this.setPerformancePage(1);
+      window.__adminPerformancePrevPage = () => this.setPerformancePage(this.performancePage - 1);
+      window.__adminPerformanceNextPage = () => this.setPerformancePage(this.performancePage + 1);
+      window.__adminPerformanceLastPage = () => this.setPerformancePage(Number.MAX_SAFE_INTEGER);
+      window.__adminSetPerformancePage = (v) => this.setPerformancePage(v);
+      window.__adminSetPerformancePageSize = (v) => this.setPerformancePageSize(v);
       window.__adminConversationsFirstPage = () => this.setConversationsPage(1);
       window.__adminConversationsPrevPage = () => this.setConversationsPage(this.conversationsPage - 1);
       window.__adminConversationsNextPage = () => this.setConversationsPage(this.conversationsPage + 1);
@@ -196,6 +211,7 @@ function adminApp() {
       this.restoreThemeMode();
       this.restoreUsageChartGroup();
       this.restoreStatsRangeHours();
+      this.restorePerformanceRangeHours();
       this.restoreStatusUpdateSpeed();
       this.restoreLogLevelFilter();
       this.restoreActiveTab();
@@ -625,6 +641,9 @@ function adminApp() {
       this.persistActiveTab();
       if (tab === 'models' && !this.modelsInitialized) {
         this.loadModelsCatalog(true);
+      } else if (tab === 'performance') {
+        if (!this.modelsInitialized) this.loadModelsCatalog(true);
+        else this.renderPerformanceCatalog();
       } else if (tab === 'benchmark') {
         this.loadBenchmarkStatus();
       } else if (tab === 'quota') {
@@ -648,12 +667,15 @@ function adminApp() {
     restoreActiveTab() {
       try {
         const tab = window.localStorage.getItem(this.activeTabCacheKey);
-        if (tab === 'status' || tab === 'conversations' || tab === 'log' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'network' || tab === 'models' || tab === 'benchmark') {
+        if (tab === 'status' || tab === 'conversations' || tab === 'log' || tab === 'quota' || tab === 'providers' || tab === 'access' || tab === 'network' || tab === 'models' || tab === 'performance' || tab === 'benchmark') {
           this.activeTab = tab;
         }
       } catch (_) {}
       if (this.activeTab === 'models' && !this.modelsInitialized) {
         this.loadModelsCatalog(true);
+      } else if (this.activeTab === 'performance') {
+        if (!this.modelsInitialized) this.loadModelsCatalog(true);
+        else this.renderPerformanceCatalog();
       } else if (this.activeTab === 'quota') {
         this.loadStats(false);
       } else if (this.activeTab === 'conversations') {
@@ -836,6 +858,26 @@ function adminApp() {
       this.statsRangeHours = raw;
       this.persistStatsRangeHours();
       this.loadStats(true);
+    },
+    restorePerformanceRangeHours() {
+      try {
+        const raw = String(window.localStorage.getItem(this.performanceRangeCacheKey) || '').trim();
+        if (raw === '1' || raw === '4' || raw === '8' || raw === '24' || raw === '72') {
+          this.performanceRangeHours = raw;
+        }
+      } catch (_) {}
+    },
+    persistPerformanceRangeHours() {
+      try {
+        window.localStorage.setItem(this.performanceRangeCacheKey, String(this.performanceRangeHours || '8'));
+      } catch (_) {}
+    },
+    setPerformanceRangeHours(v) {
+      const raw = String(v || '').trim();
+      if (raw !== '1' && raw !== '4' && raw !== '8' && raw !== '24' && raw !== '72') return;
+      this.performanceRangeHours = raw;
+      this.persistPerformanceRangeHours();
+      this.loadModelsCatalog(false, false);
     },
     resolvedThemeMode() {
       if (this.themeMode === 'auto') {
@@ -1099,6 +1141,17 @@ function adminApp() {
       this.modelsPage = 1;
       this.renderModelsCatalog();
     },
+    setPerformancePage(v) {
+      let n = Number(v);
+      if (!Number.isFinite(n)) n = 1;
+      this.performancePage = Math.max(1, Math.floor(n));
+      this.renderPerformanceCatalog();
+    },
+    setPerformancePageSize(v) {
+      this.performancePageSize = this.parsePageSize(v);
+      this.performancePage = 1;
+      this.renderPerformanceCatalog();
+    },
     setConversationsPage(v) {
       let n = Number(v);
       if (!Number.isFinite(n)) n = 1;
@@ -1186,6 +1239,9 @@ function adminApp() {
     },
     renderModelsPager(totalRows, page, totalPages, pageSize) {
       return this.renderPager(totalRows, page, totalPages, pageSize, 'Models');
+    },
+    renderPerformancePager(totalRows, page, totalPages, pageSize) {
+      return this.renderPager(totalRows, page, totalPages, pageSize, 'Performance');
     },
     renderAccessPager(totalRows, page, totalPages, pageSize) {
       return this.renderPager(totalRows, page, totalPages, pageSize, 'Access');
@@ -2555,21 +2611,12 @@ function adminApp() {
         const isFree = hasInput && hasOutput && inputNum === 0 && outputNum === 0;
         const input = this.formatPrice(inputNum, m.currency);
         const output = this.formatPrice(outputNum, m.currency);
-        const failureRateNum = Number(m.failure_rate || 0);
-        const failureRate = Number.isFinite(failureRateNum) ? (failureRateNum.toFixed(1) + '%') : '-';
-        const avgPP = Number(m.avg_prompt_tps || 0);
-        const avgTG = Number(m.avg_generation_tps || 0);
-        const avgPPTG = (Number.isFinite(avgPP) && Number.isFinite(avgTG) && (avgPP > 0 || avgTG > 0))
-          ? (avgPP.toFixed(1) + '/' + avgTG.toFixed(1))
-          : '-';
         return '<tr>' +
           '<td>' + providerLabel + '</td>' +
           '<td>' + model + '</td>' +
           '<td>' + status + '</td>' +
           '<td class="text-end' + (isFree ? ' text-success fw-semibold' : '') + '">' + input + '</td>' +
           '<td class="text-end' + (isFree ? ' text-success fw-semibold' : '') + '">' + output + '</td>' +
-          '<td class="text-end">' + this.escapeHtml(avgPPTG) + '</td>' +
-          '<td class="text-end">' + this.escapeHtml(failureRate) + '</td>' +
           '</tr>';
       });
       const page = this.paginateRows(htmlRows, this.modelsPage, this.modelsPageSize);
@@ -2589,12 +2636,66 @@ function adminApp() {
           '<th>Status</th>' +
           '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortModels(\'input_per_1m\')">Input / 1M' + inputSort + '</th>' +
           '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortModels(\'output_per_1m\')">Output / 1M' + outputSort + '</th>' +
-          '<th class="text-end">Avg PP/TG</th>' +
-          '<th class="text-end">Failure Rate</th>' +
           '</tr></thead>' +
-          '<tbody>' + (tableRows || '<tr><td colspan="7" class="text-body-secondary">No models available.</td></tr>') + '</tbody>' +
+          '<tbody>' + (tableRows || '<tr><td colspan="5" class="text-body-secondary">No models available.</td></tr>') + '</tbody>' +
         '</table>' +
         this.renderModelsPager(page.totalRows, page.page, page.totalPages, page.pageSize);
+    },
+    renderPerformanceCatalog() {
+      const search = this.performanceSearch.trim().toLowerCase();
+      let rows = (this.modelsCatalog || []).filter((m) => {
+        if (Number(m.perf_requests || 0) <= 0) return false;
+        if (!search) return true;
+        return String(m.provider || '').toLowerCase().includes(search) || String(m.model || '').toLowerCase().includes(search);
+      });
+      const sortBy = this.performanceSortBy;
+      const dir = this.performanceSortAsc ? 1 : -1;
+      rows.sort((a, b) => {
+        const av = a[sortBy];
+        const bv = b[sortBy];
+        if (sortBy === 'failure_rate' || sortBy === 'avg_prompt_tps' || sortBy === 'avg_generation_tps') {
+          return (Number(av || 0) - Number(bv || 0)) * dir;
+        }
+        return String(av || '').localeCompare(String(bv || '')) * dir;
+      });
+      const htmlRows = rows.map((m) => {
+        const providerDisplay = this.escapeHtml(m.provider_display_name || m.provider);
+        const iconName = this.escapeHtml(String(m.provider_type || m.provider || '').trim());
+        const iconCls = this.providerIconNeedsDarkInvert(iconName) ? ' provider-icon-invert-dark' : '';
+        const providerLabel = '<span class="d-inline-flex align-items-center gap-2"><img src="' + this.providerIconSrc(iconName) + '" class="' + iconCls.trim() + '" onerror="this.onerror=null;this.src=&quot;data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==&quot;" alt="" width="16" height="16" style="object-fit:contain;" /><span>' + providerDisplay + '</span></span>';
+        const model = this.escapeHtml(m.model || '-');
+        const failureRateNum = Number(m.failure_rate || 0);
+        const failureRate = Number.isFinite(failureRateNum) ? (failureRateNum.toFixed(1) + '%') : '-';
+        const avgPP = Number(m.avg_prompt_tps || 0);
+        const avgTG = Number(m.avg_generation_tps || 0);
+        const avgPPTG = (Number.isFinite(avgPP) && Number.isFinite(avgTG) && (avgPP > 0 || avgTG > 0)) ? (avgPP.toFixed(1) + '/' + avgTG.toFixed(1)) : '-';
+        return '<tr>' +
+          '<td>' + providerLabel + '</td>' +
+          '<td>' + model + '</td>' +
+          '<td class="text-end">' + this.escapeHtml(avgPPTG) + '</td>' +
+          '<td class="text-end">' + this.escapeHtml(failureRate) + '</td>' +
+          '</tr>';
+      });
+      const page = this.paginateRows(htmlRows, this.performancePage, this.performancePageSize);
+      this.performancePage = page.page;
+      this.performancePageSize = page.pageSize;
+      const tableRows = page.rows.join('');
+      const sortArrow = this.performanceSortAsc ? ' ▲' : ' ▼';
+      const providerSort = this.performanceSortBy === 'provider' ? sortArrow : '';
+      const modelSort = this.performanceSortBy === 'model' ? sortArrow : '';
+      const pptgSort = (this.performanceSortBy === 'avg_prompt_tps' || this.performanceSortBy === 'avg_generation_tps') ? sortArrow : '';
+      const failSort = this.performanceSortBy === 'failure_rate' ? sortArrow : '';
+      this.performanceTableHtml =
+        '<table class="table table-sm align-middle mb-0">' +
+          '<thead><tr>' +
+          '<th role="button" class="text-decoration-underline" onclick="window.__adminSortPerformance(\'provider\')">Provider' + providerSort + '</th>' +
+          '<th role="button" class="text-decoration-underline" onclick="window.__adminSortPerformance(\'model\')">Model' + modelSort + '</th>' +
+          '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortPerformance(\'avg_generation_tps\')">Avg PP/TG' + pptgSort + '</th>' +
+          '<th role="button" class="text-decoration-underline text-end" onclick="window.__adminSortPerformance(\'failure_rate\')">Failure Rate' + failSort + '</th>' +
+          '</tr></thead>' +
+          '<tbody>' + (tableRows || '<tr><td colspan="4" class="text-body-secondary">No performance data.</td></tr>') + '</tbody>' +
+        '</table>' +
+        this.renderPerformancePager(page.totalRows, page.page, page.totalPages, page.pageSize);
     },
     renderModelsFreshness(fetchedAt, pricingUpdatedAt) {
       const fetched = fetchedAt ? new Date(fetchedAt) : null;
@@ -2621,6 +2722,14 @@ function adminApp() {
         this.modelsSortAsc = true;
       }
       this.renderModelsCatalog();
+    },
+    sortPerformanceBy(col) {
+      if (this.performanceSortBy === col) this.performanceSortAsc = !this.performanceSortAsc;
+      else {
+        this.performanceSortBy = col;
+        this.performanceSortAsc = true;
+      }
+      this.renderPerformanceCatalog();
     },
     toggleFreeOnly() {
       this.modelsFreeOnly = !this.modelsFreeOnly;
@@ -3843,7 +3952,7 @@ function adminApp() {
     },
     async loadModelsCatalog(firstLoad, forceRefresh) {
       if (firstLoad && this.modelsCatalog.length === 0) this.modelsInitialLoadInProgress = true;
-      const sec = Math.max(1, Number(this.statsRangeHours || 8)) * 3600;
+      const sec = Math.max(1, Number(this.performanceRangeHours || 8)) * 3600;
       const u = forceRefresh ? ('/admin/api/models?refresh=1&period_seconds=' + sec) : ('/admin/api/models?period_seconds=' + sec);
       const r = await this.apiFetch(u, {headers:this.headers()});
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
@@ -3856,6 +3965,7 @@ function adminApp() {
       this.modelsInitialized = true;
       if (firstLoad || forceRefresh) this.modelsPage = 1;
       this.renderModelsCatalog();
+      this.renderPerformanceCatalog();
       this.renderModelsFreshness(body.fetched_at, body.pricing_cache_updated_at);
       this.persistModelsToCache();
       if (firstLoad) this.modelsInitialLoadInProgress = false;
@@ -3989,7 +4099,7 @@ function adminApp() {
       if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
       if (r.ok) this.toastSuccess('Model refresh completed.');
       else this.toastError('Model refresh failed.');
-      if (r.ok && this.activeTab === 'models') {
+      if (r.ok && (this.activeTab === 'models' || this.activeTab === 'performance')) {
         this.loadModelsCatalog(false);
       }
     }
