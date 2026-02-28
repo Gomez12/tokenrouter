@@ -1,7 +1,9 @@
 package tests
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -264,5 +266,148 @@ func TestCLIOverridesModelsFlow(t *testing.T) {
 	}
 	if !strings.Contains(sec, `"auto_enable_public_free_models":true`) {
 		t.Fatalf("expected auto_enable_public_free_models override in %s", sec)
+	}
+}
+
+func TestModelAliasProfileSwitchIntegration(t *testing.T) {
+	t.Parallel()
+
+	var localRequests int
+	providerLocal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"local-model"}]}`))
+		case "/v1/chat/completions":
+			localRequests++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-local","object":"chat.completion","created":1735689600,"model":"local-model","choices":[{"index":0,"message":{"role":"assistant","content":"local ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer providerLocal.Close()
+
+	var runpodRequests int
+	providerRunpod := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"runpod-model"}]}`))
+		case "/v1/chat/completions":
+			runpodRequests++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-runpod","object":"chat.completion","created":1735689600,"model":"runpod-model","choices":[{"index":0,"message":{"role":"assistant","content":"runpod ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer providerRunpod.Close()
+
+	addr := findFreeAddr(t)
+	cfg := config.NewDefaultServerConfig()
+	cfg.ListenAddr = "127.0.0.1:1"
+	cfg.AllowLocalhostNoAuth = true
+	cfg.AutoEnablePublicFreeModels = false
+	cfg.ActiveModelProfile = "local"
+	cfg.Providers = []config.ProviderConfig{
+		{Name: "local-provider", BaseURL: providerLocal.URL, Enabled: true, TimeoutSeconds: 2},
+		{Name: "runpod-provider", BaseURL: providerRunpod.URL, Enabled: true, TimeoutSeconds: 2},
+	}
+	cfg.ModelAliases = []config.ModelAliasConfig{
+		{
+			Name: "chat",
+			Targets: []config.ModelAliasTarget{
+				{Profile: "local", Provider: "local-provider", Model: "local-model"},
+				{Profile: "runpod", Provider: "runpod-provider", Model: "runpod-model"},
+			},
+		},
+	}
+
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "server.toml")
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	repoRoot := testRepoRoot(t)
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+
+	cmd := exec.CommandContext(
+		runCtx,
+		"go", "run", "./cmd/torod", "serve",
+		"--config", cfgPath,
+		"--listen-addr", addr,
+		"--allow-localhost-no-auth=true",
+		"--auto-enable-public-free-models=false",
+	)
+	cmd.Dir = repoRoot
+	cmd.Env = os.Environ()
+
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+	t.Cleanup(func() {
+		runCancel()
+		_ = cmd.Process.Signal(os.Interrupt)
+		done := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(io.Discard, stderrPipe)
+			_, _ = io.Copy(io.Discard, stdoutPipe)
+			_ = cmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+		}
+	})
+
+	baseURL := "http://" + addr
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer readyCancel()
+	if err := waitForReady(readyCtx, baseURL+"/healthz"); err != nil {
+		t.Fatalf("proxy health check failed: %v", err)
+	}
+
+	out := sendShortChat(t, baseURL, "chat")
+	if out != "local ok" {
+		t.Fatalf("expected local alias response, got %q", out)
+	}
+	if localRequests != 1 || runpodRequests != 0 {
+		t.Fatalf("expected local=1 runpod=0, got local=%d runpod=%d", localRequests, runpodRequests)
+	}
+
+	raw, _ := json.Marshal(map[string]string{"active_model_profile": "runpod"})
+	req, err := http.NewRequest(http.MethodPut, baseURL+"/admin/api/model-aliases/settings", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("build profile switch request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("switch active profile: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected profile switch 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+
+	out = sendShortChat(t, baseURL, "chat")
+	if out != "runpod ok" {
+		t.Fatalf("expected runpod alias response, got %q", out)
+	}
+	if localRequests != 1 || runpodRequests != 1 {
+		t.Fatalf("expected local=1 runpod=1 after switch, got local=%d runpod=%d", localRequests, runpodRequests)
 	}
 }

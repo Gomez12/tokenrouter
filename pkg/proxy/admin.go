@@ -123,16 +123,16 @@ type oauthSession struct {
 }
 
 type benchmarkRun struct {
-	ID               string                  `json:"id"`
-	StartedAt        string                  `json:"started_at"`
-	Status           string                  `json:"status"`
-	Strategy         benchmarkStrategy       `json:"strategy"`
-	Models           []benchmarkModelProgress `json:"models"`
-	TotalPrompt      int                     `json:"total_prompt_tokens"`
-	TotalCompletion  int                     `json:"total_completion_tokens"`
-	TotalTokens      int                     `json:"total_tokens"`
-	Error            string                  `json:"error,omitempty"`
-	cancel           context.CancelFunc
+	ID              string                   `json:"id"`
+	StartedAt       string                   `json:"started_at"`
+	Status          string                   `json:"status"`
+	Strategy        benchmarkStrategy        `json:"strategy"`
+	Models          []benchmarkModelProgress `json:"models"`
+	TotalPrompt     int                      `json:"total_prompt_tokens"`
+	TotalCompletion int                      `json:"total_completion_tokens"`
+	TotalTokens     int                      `json:"total_tokens"`
+	Error           string                   `json:"error,omitempty"`
+	cancel          context.CancelFunc
 }
 
 type benchmarkStrategy struct {
@@ -283,6 +283,11 @@ func (h *AdminHandler) RegisterRoutes(r chi.Router) {
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/providers/test", h.testProviderAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/providers/{name}", h.providerByNameAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Delete("/admin/api/providers/{name}", h.providerByNameAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/model-aliases", h.modelAliasesAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/model-aliases", h.modelAliasesAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/model-aliases/settings", h.modelAliasSettingsAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Put("/admin/api/model-aliases/{name}", h.modelAliasByNameAPI)
+	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Delete("/admin/api/model-aliases/{name}", h.modelAliasByNameAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Post("/admin/api/models/refresh", h.refreshModelsAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/models", h.modelsCatalogAPI)
 	r.With(h.withRuntimeInstanceHeader, h.requireAdminAPI).Get("/admin/api/models/catalog", h.modelsCatalogAPI)
@@ -5940,6 +5945,146 @@ func (h *AdminHandler) providerByNameAPI(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (h *AdminHandler) modelAliasesAPI(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, h.modelAliasesResponse())
+	case http.MethodPost:
+		var alias config.ModelAliasConfig
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&alias); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if err := h.store.Update(func(c *config.ServerConfig) error {
+			for _, existing := range c.ModelAliases {
+				if existing.Name == alias.Name {
+					return fmt.Errorf("model alias exists")
+				}
+			}
+			c.ModelAliases = append(c.ModelAliases, alias)
+			return nil
+		}); err != nil {
+			if strings.Contains(err.Error(), "active_model_profile is required when model_aliases are configured") {
+				http.Error(w, "set active_model_profile before creating model aliases", http.StatusBadRequest)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		h.notifyAdminChanged("model_aliases")
+		writeJSON(w, http.StatusCreated, h.modelAliasesResponse())
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *AdminHandler) modelAliasByNameAPI(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(chi.URLParam(r, "name"))
+	if name == "" {
+		http.Error(w, "alias name required", http.StatusBadRequest)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var alias config.ModelAliasConfig
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&alias); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		alias.Name = name
+		if err := h.store.Update(func(c *config.ServerConfig) error {
+			for i := range c.ModelAliases {
+				if c.ModelAliases[i].Name == name {
+					c.ModelAliases[i] = alias
+					return nil
+				}
+			}
+			return fmt.Errorf("model alias not found")
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		h.notifyAdminChanged("model_aliases")
+		writeJSON(w, http.StatusOK, h.modelAliasesResponse())
+	case http.MethodDelete:
+		if err := h.store.Update(func(c *config.ServerConfig) error {
+			next := make([]config.ModelAliasConfig, 0, len(c.ModelAliases))
+			found := false
+			for _, alias := range c.ModelAliases {
+				if alias.Name == name {
+					found = true
+					continue
+				}
+				next = append(next, alias)
+			}
+			if !found {
+				return fmt.Errorf("model alias not found")
+			}
+			c.ModelAliases = next
+			return nil
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		h.notifyAdminChanged("model_aliases")
+		writeJSON(w, http.StatusOK, h.modelAliasesResponse())
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *AdminHandler) modelAliasSettingsAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var payload struct {
+		ActiveModelProfile string `json:"active_model_profile"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if err := h.store.Update(func(c *config.ServerConfig) error {
+		c.ActiveModelProfile = strings.TrimSpace(payload.ActiveModelProfile)
+		return nil
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	h.notifyAdminChanged("model_aliases")
+	writeJSON(w, http.StatusOK, h.modelAliasesResponse())
+}
+
+func (h *AdminHandler) modelAliasesResponse() map[string]any {
+	cfg := h.store.Snapshot()
+	views := h.resolver.ListModelAliases()
+	type aliasItem struct {
+		Name         string                    `json:"name"`
+		Targets      []config.ModelAliasTarget `json:"targets"`
+		ActiveTarget *config.ModelAliasTarget  `json:"active_target,omitempty"`
+		Status       string                    `json:"status"`
+	}
+	items := make([]aliasItem, 0, len(views))
+	for _, view := range views {
+		item := aliasItem{
+			Name:    view.Alias.Name,
+			Targets: append([]config.ModelAliasTarget(nil), view.Alias.Targets...),
+			Status:  view.Status,
+		}
+		if view.HasTarget {
+			target := view.Target
+			item.ActiveTarget = &target
+		}
+		items = append(items, item)
+	}
+	return map[string]any{
+		"active_model_profile": cfg.ActiveModelProfile,
+		"available_profiles":   h.resolver.AvailableAliasProfiles(),
+		"data":                 items,
+	}
+}
+
 func (h *AdminHandler) refreshModelsAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -6201,7 +6346,12 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 		ProviderType        string   `json:"provider_type,omitempty"`
 		ProviderDisplayName string   `json:"provider_display_name"`
 		Model               string   `json:"model"`
+		Kind                string   `json:"kind,omitempty"`
 		Status              string   `json:"status"`
+		ActiveProfile       string   `json:"active_profile,omitempty"`
+		ResolvedProvider    string   `json:"resolved_provider,omitempty"`
+		ResolvedModel       string   `json:"resolved_model,omitempty"`
+		AliasProfiles       []string `json:"alias_profiles,omitempty"`
 		ResponseMS          int64    `json:"response_ms,omitempty"`
 		CheckedAt           string   `json:"checked_at,omitempty"`
 		InputPer1M          *float64 `json:"input_per_1m,omitempty"`
@@ -6304,6 +6454,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 				ProviderType:        providerTypeByName[provider],
 				ProviderDisplayName: provider,
 				Model:               modelID,
+				Kind:                "provider_model",
 				Status:              status,
 				ResponseMS:          providerResponseMS,
 				CheckedAt:           providerCheckedAt,
@@ -6350,6 +6501,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 				ProviderType:        providerType,
 				ProviderDisplayName: p.Name,
 				Model:               "",
+				Kind:                "provider_model",
 				Status:              status,
 				ResponseMS:          providerResponseMS,
 				CheckedAt:           providerCheckedAt,
@@ -6384,6 +6536,7 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 			ProviderType:        providerTypeByName[pn],
 			ProviderDisplayName: pn,
 			Model:               modelID,
+			Kind:                "provider_model",
 			Status:              status,
 		}
 		if h.healthChecker != nil {
@@ -6423,6 +6576,64 @@ func (h *AdminHandler) modelsCatalogAPI(w http.ResponseWriter, r *http.Request) 
 			item.FailureRate = float64(agg.failed) * 100.0 / float64(agg.requests)
 			item.AvgPromptTPS = agg.ppSum / float64(agg.requests)
 			item.AvgGenerationTPS = agg.tgSum / float64(agg.requests)
+		}
+		out = append(out, item)
+	}
+	aliasViews := h.resolver.ListModelAliases()
+	for _, view := range aliasViews {
+		item := row{
+			Model:         view.Alias.Name,
+			Kind:          "alias",
+			Status:        view.Status,
+			ActiveProfile: view.ActiveProfile,
+			AliasProfiles: append([]string(nil), view.Profiles...),
+		}
+		if view.HasTarget {
+			item.Provider = view.Target.Provider
+			item.ResolvedProvider = view.Target.Provider
+			item.ResolvedModel = view.Target.Model
+		}
+		if view.HasProvider {
+			item.Provider = view.Provider.Name
+			item.ProviderType = providerTypeOrName(view.Provider)
+			item.ResolvedProvider = view.Provider.Name
+			if h.healthChecker != nil {
+				if snap, ok := h.healthChecker.Snapshot(view.Provider.Name); ok {
+					item.ResponseMS = snap.ResponseMS
+					item.CheckedAt = snap.CheckedAt.Format(time.RFC3339)
+				}
+			}
+		}
+		if item.ProviderType == "" {
+			item.ProviderType = item.Provider
+		}
+		item.ProviderDisplayName = item.Provider
+		if item.Provider == item.ProviderType {
+			if dn, ok := displayNames[item.ProviderType]; ok {
+				item.ProviderDisplayName = dn
+			}
+		} else if dn, ok := displayNames[item.Provider]; ok {
+			item.ProviderDisplayName = dn
+		}
+		if item.ProviderDisplayName == "" {
+			item.ProviderDisplayName = "Alias"
+		}
+		if item.ResolvedProvider != "" && item.ResolvedModel != "" {
+			if entry, ok := cache.Entries[item.ResolvedProvider+"/"+item.ResolvedModel]; ok {
+				item.Currency = entry.Currency
+				in := entry.InputPer1M
+				outp := entry.OutputPer1M
+				item.InputPer1M = &in
+				item.OutputPer1M = &outp
+			}
+			if agg, ok := usageByModel[usageKey(item.ResolvedProvider, item.Model)]; ok && agg.requests > 0 {
+				item.PerfRequests = agg.requests
+				item.PromptTokens = agg.prompt
+				item.CompletionTokens = agg.gen
+				item.FailureRate = float64(agg.failed) * 100.0 / float64(agg.requests)
+				item.AvgPromptTPS = agg.ppSum / float64(agg.requests)
+				item.AvgGenerationTPS = agg.tgSum / float64(agg.requests)
+			}
 		}
 		out = append(out, item)
 	}

@@ -2,6 +2,30 @@
   <div x-show="activeTab==='models'" style="display:none;">
     <div class="card shadow-sm mb-3">
       <div class="card-body">
+        <div class="row g-2 align-items-end">
+          <div class="col-md-4">
+            <label class="form-label">Active profile</label>
+            <input class="form-control" list="model-alias-profiles" x-model="activeModelProfileInput" placeholder="local or runpod" />
+            <datalist id="model-alias-profiles">
+              <template x-for="profile in availableModelProfiles" :key="profile">
+                <option :value="profile"></option>
+              </template>
+            </datalist>
+          </div>
+          <div class="col-md-8 d-flex justify-content-md-end gap-2">
+            <button class="btn btn-outline-secondary" @click="saveActiveModelProfile()">Save Profile</button>
+            <button class="btn btn-primary" @click="openAddModelAliasModal()">Add Alias</button>
+          </div>
+        </div>
+        <div class="small text-body-secondary mt-2 mb-3">
+          Aliases route a stable model name to the provider/model configured for the active profile.
+          Set and save the active profile first before creating your first alias.
+        </div>
+        <div class="table-responsive" x-html="modelAliasesTableHtml"></div>
+      </div>
+    </div>
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
         <div class="row g-2 mb-3">
           <div class="col-md-5"><input class="form-control" placeholder="Search provider or model" x-model="modelsSearch" @input="renderModelsCatalog()" /></div>
           <div class="col-md-7 d-flex justify-content-md-end gap-2">

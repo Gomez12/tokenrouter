@@ -38,6 +38,17 @@ type ProviderConfig struct {
 	TimeoutSeconds int    `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
 }
 
+type ModelAliasTarget struct {
+	Profile  string `toml:"profile" json:"profile"`
+	Provider string `toml:"provider" json:"provider"`
+	Model    string `toml:"model" json:"model"`
+}
+
+type ModelAliasConfig struct {
+	Name    string             `toml:"name" json:"name"`
+	Targets []ModelAliasTarget `toml:"targets" json:"targets"`
+}
+
 type TLSConfig struct {
 	Enabled    bool   `toml:"enabled"`
 	Mode       string `toml:"mode"`
@@ -95,6 +106,8 @@ type ServerConfig struct {
 	AutoRemoveEmptyQuotaTokens    bool                `toml:"auto_remove_empty_quota_tokens"`
 	DefaultProvider               string              `toml:"default_provider"`
 	Providers                     []ProviderConfig    `toml:"providers"`
+	ActiveModelProfile            string              `toml:"active_model_profile,omitempty"`
+	ModelAliases                  []ModelAliasConfig  `toml:"model_aliases"`
 	Conversations                 ConversationsConfig `toml:"conversations"`
 	Logs                          LogsConfig          `toml:"logs"`
 	TLS                           TLSConfig           `toml:"tls"`
@@ -488,8 +501,27 @@ func (c *ServerConfig) Normalize() {
 			c.Providers[i].ProviderType = c.Providers[i].Name
 		}
 	}
+	c.ActiveModelProfile = strings.TrimSpace(c.ActiveModelProfile)
+	for i := range c.ModelAliases {
+		c.ModelAliases[i].Name = strings.TrimSpace(c.ModelAliases[i].Name)
+		for j := range c.ModelAliases[i].Targets {
+			c.ModelAliases[i].Targets[j].Profile = strings.TrimSpace(c.ModelAliases[i].Targets[j].Profile)
+			c.ModelAliases[i].Targets[j].Provider = strings.TrimSpace(c.ModelAliases[i].Targets[j].Provider)
+			c.ModelAliases[i].Targets[j].Model = strings.TrimSpace(c.ModelAliases[i].Targets[j].Model)
+		}
+		sort.SliceStable(c.ModelAliases[i].Targets, func(a, b int) bool {
+			if c.ModelAliases[i].Targets[a].Profile == c.ModelAliases[i].Targets[b].Profile {
+				if c.ModelAliases[i].Targets[a].Provider == c.ModelAliases[i].Targets[b].Provider {
+					return c.ModelAliases[i].Targets[a].Model < c.ModelAliases[i].Targets[b].Model
+				}
+				return c.ModelAliases[i].Targets[a].Provider < c.ModelAliases[i].Targets[b].Provider
+			}
+			return c.ModelAliases[i].Targets[a].Profile < c.ModelAliases[i].Targets[b].Profile
+		})
+	}
 
 	sort.SliceStable(c.Providers, func(i, j int) bool { return c.Providers[i].Name < c.Providers[j].Name })
+	sort.SliceStable(c.ModelAliases, func(i, j int) bool { return c.ModelAliases[i].Name < c.ModelAliases[j].Name })
 }
 
 func (c *ServerConfig) Validate() error {
@@ -582,6 +614,48 @@ func (c *ServerConfig) Validate() error {
 			return fmt.Errorf("default_provider %q not found", c.DefaultProvider)
 		}
 	}
+	aliasSeen := map[string]struct{}{}
+	profileSeen := map[string]struct{}{}
+	for _, alias := range c.ModelAliases {
+		if alias.Name == "" {
+			return errors.New("model alias name cannot be empty")
+		}
+		if strings.Contains(alias.Name, "/") {
+			return fmt.Errorf("model alias %q cannot contain /", alias.Name)
+		}
+		if _, ok := aliasSeen[alias.Name]; ok {
+			return fmt.Errorf("duplicate model alias %q", alias.Name)
+		}
+		aliasSeen[alias.Name] = struct{}{}
+		if len(alias.Targets) == 0 {
+			return fmt.Errorf("model alias %q must define at least one target", alias.Name)
+		}
+		targetProfiles := map[string]struct{}{}
+		for _, target := range alias.Targets {
+			if target.Profile == "" {
+				return fmt.Errorf("model alias %q target profile cannot be empty", alias.Name)
+			}
+			if _, ok := targetProfiles[target.Profile]; ok {
+				return fmt.Errorf("model alias %q has duplicate profile %q", alias.Name, target.Profile)
+			}
+			targetProfiles[target.Profile] = struct{}{}
+			profileSeen[target.Profile] = struct{}{}
+			if target.Provider == "" {
+				return fmt.Errorf("model alias %q target provider cannot be empty", alias.Name)
+			}
+			if target.Model == "" {
+				return fmt.Errorf("model alias %q target model cannot be empty", alias.Name)
+			}
+		}
+	}
+	if len(c.ModelAliases) > 0 {
+		if c.ActiveModelProfile == "" {
+			return errors.New("active_model_profile is required when model_aliases are configured")
+		}
+		if _, ok := profileSeen[c.ActiveModelProfile]; !ok {
+			return fmt.Errorf("active_model_profile %q not found in model_aliases", c.ActiveModelProfile)
+		}
+	}
 	return nil
 }
 
@@ -622,6 +696,7 @@ func (s *ServerConfigStore) Snapshot() ServerConfig {
 	cp := *s.cfg
 	cp.IncomingTokens = cloneIncomingTokens(s.cfg.IncomingTokens)
 	cp.Providers = append([]ProviderConfig(nil), s.cfg.Providers...)
+	cp.ModelAliases = cloneModelAliases(s.cfg.ModelAliases)
 	return cp
 }
 
@@ -631,6 +706,7 @@ func (s *ServerConfigStore) Update(mutator func(*ServerConfig) error) error {
 	cp := *s.cfg
 	cp.IncomingTokens = cloneIncomingTokens(s.cfg.IncomingTokens)
 	cp.Providers = append([]ProviderConfig(nil), s.cfg.Providers...)
+	cp.ModelAliases = cloneModelAliases(s.cfg.ModelAliases)
 	if err := mutator(&cp); err != nil {
 		return err
 	}
@@ -653,6 +729,20 @@ func cloneIncomingTokens(in []IncomingAPIToken) []IncomingAPIToken {
 	for i := range in {
 		out[i] = in[i]
 		out[i].Quota = cloneTokenQuota(in[i].Quota)
+	}
+	return out
+}
+
+func cloneModelAliases(in []ModelAliasConfig) []ModelAliasConfig {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ModelAliasConfig, len(in))
+	for i := range in {
+		out[i].Name = in[i].Name
+		if len(in[i].Targets) > 0 {
+			out[i].Targets = append([]ModelAliasTarget(nil), in[i].Targets...)
+		}
 	}
 	return out
 }

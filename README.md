@@ -93,6 +93,28 @@ Routing behavior:
 - If model is unprefixed, `default_provider` is used when configured.
 - Otherwise, TokenRouter falls back to the first enabled provider.
 
+Model aliases:
+
+- Define stable alias names in `torod.toml` and map them to different `provider/model` targets per profile.
+- Switch the global `active_model_profile` to move aliases like `chat` from `local` to `runpod` without changing clients.
+
+```toml
+active_model_profile = "local"
+
+[[model_aliases]]
+name = "chat"
+
+  [[model_aliases.targets]]
+  profile = "local"
+  provider = "ollama"
+  model = "qwen2.5:14b"
+
+  [[model_aliases.targets]]
+  profile = "runpod"
+  provider = "runpod-main"
+  model = "Qwen/Qwen2.5-14B-Instruct"
+```
+
 ## Temporary Keys for Real Workflows
 
 Use `toro` to create short-lived subordinate keys and run tools safely:

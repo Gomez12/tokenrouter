@@ -37,6 +37,11 @@ function adminApp() {
     logSaveInProgress: false,
     popularProviders: [],
     modelsCatalog: [],
+    modelAliases: [],
+    modelAliasesTableHtml: '',
+    activeModelProfile: '',
+    activeModelProfileInput: '',
+    availableModelProfiles: [],
     allowLocalhostNoAuth: false,
     allowHostDockerInternalNoAuth: false,
     allowLocalhostNoAuthEffective: false,
@@ -86,6 +91,7 @@ function adminApp() {
     showAddProviderModal: false,
     showProvidersSettingsModal: false,
     showAccessSettingsModal: false,
+    showModelAliasModal: false,
     addProviderStep: 'pick_provider',
     selectedPreset: '',
     presetInfoHtml: '',
@@ -122,6 +128,7 @@ function adminApp() {
     statsLoading: false,
     statsRenderToken: 0,
     editingProviderName: '',
+    editingModelAliasName: '',
     runtimeInstanceID: '',
     reloadingForRuntimeUpdate: false,
     reloadIdleThresholdMs: 30000,
@@ -165,6 +172,7 @@ function adminApp() {
     fallbackPoller: null,
     intervalPoller: null,
     draft: {name:'',provider_type:'',base_url:'',api_key:'',auth_token:'',refresh_token:'',token_expires_at:'',account_id:'',device_auth_url:'',device_code:'',device_auth_id:'',device_code_url:'',device_token_url:'',device_client_id:'',device_scope:'',device_grant_type:'',oauth_authorize_url:'',oauth_token_url:'',oauth_client_id:'',oauth_client_secret:'',oauth_scope:'',enabled:true,timeout_seconds:60},
+    modelAliasDraft: {name:'',targets:[{profile:'',provider:'',model:''}]},
     oauthAdvanced: false,
     init() {
       this.lastUserInteractionAt = Date.now();
@@ -222,6 +230,7 @@ function adminApp() {
       this.restoreInitialSetupDialogDismissed();
       this.loadStats(false);
       this.loadProviders();
+      this.loadModelAliases();
       this.loadAccessTokens();
       this.loadPopularProviders();
       this.loadSecuritySettings();
@@ -1323,6 +1332,142 @@ function adminApp() {
     },
     renderModelsPager(totalRows, page, totalPages, pageSize) {
       return this.renderPager(totalRows, page, totalPages, pageSize, 'Models');
+    },
+    defaultModelAliasTarget() {
+      const profile = String(this.activeModelProfileInput || this.activeModelProfile || '').trim();
+      return {profile, provider:'', model:''};
+    },
+    resetModelAliasDraft() {
+      this.modelAliasDraft = {name:'', targets:[this.defaultModelAliasTarget()]};
+      this.editingModelAliasName = '';
+      this.modalStatusHtml = '';
+    },
+    openAddModelAliasModal() {
+      this.resetModelAliasDraft();
+      this.showModelAliasModal = true;
+    },
+    openEditModelAliasModal(name) {
+      const row = (this.modelAliases || []).find((x) => String(x.name || '') === String(name || ''));
+      if (!row) return;
+      this.resetModelAliasDraft();
+      this.editingModelAliasName = String(row.name || '').trim();
+      this.modelAliasDraft.name = this.editingModelAliasName;
+      this.modelAliasDraft.targets = (Array.isArray(row.targets) ? row.targets : []).map((t) => ({
+        profile: String(t.profile || '').trim(),
+        provider: String(t.provider || '').trim(),
+        model: String(t.model || '').trim()
+      }));
+      if (this.modelAliasDraft.targets.length === 0) this.modelAliasDraft.targets = [this.defaultModelAliasTarget()];
+      this.showModelAliasModal = true;
+    },
+    closeModelAliasModal() {
+      this.showModelAliasModal = false;
+    },
+    addModelAliasTarget() {
+      if (!Array.isArray(this.modelAliasDraft.targets)) this.modelAliasDraft.targets = [];
+      this.modelAliasDraft.targets.push(this.defaultModelAliasTarget());
+    },
+    removeModelAliasTarget(idx) {
+      const i = Number(idx);
+      if (!Array.isArray(this.modelAliasDraft.targets) || !Number.isFinite(i)) return;
+      this.modelAliasDraft.targets = this.modelAliasDraft.targets.filter((_, n) => n !== i);
+      if (this.modelAliasDraft.targets.length === 0) this.modelAliasDraft.targets = [this.defaultModelAliasTarget()];
+    },
+    modelAliasProfileOptions() {
+      const seen = {};
+      const out = [];
+      const add = (value) => {
+        const v = String(value || '').trim();
+        if (!v || seen[v]) return;
+        seen[v] = true;
+        out.push(v);
+      };
+      add(this.activeModelProfile);
+      add(this.activeModelProfileInput);
+      (this.availableModelProfiles || []).forEach(add);
+      (this.modelAliases || []).forEach((alias) => {
+        (Array.isArray(alias.targets) ? alias.targets : []).forEach((target) => add(target.profile));
+      });
+      (Array.isArray(this.modelAliasDraft.targets) ? this.modelAliasDraft.targets : []).forEach((target) => add(target.profile));
+      return out.sort((a, b) => a.localeCompare(b));
+    },
+    modelAliasProviderOptions() {
+      const seen = {};
+      const out = [];
+      const add = (value) => {
+        const v = String(value || '').trim();
+        if (!v || seen[v]) return;
+        seen[v] = true;
+        out.push(v);
+      };
+      (this.providers || []).forEach((provider) => add(provider.name));
+      (this.modelsCatalog || []).forEach((row) => {
+        if (String(row.kind || '') !== 'provider_model') return;
+        add(row.provider);
+      });
+      (Array.isArray(this.modelAliasDraft.targets) ? this.modelAliasDraft.targets : []).forEach((target) => add(target.provider));
+      return out.sort((a, b) => a.localeCompare(b));
+    },
+    stripProviderPrefixFromAliasModel(providerName, modelName) {
+      const provider = String(providerName || '').trim();
+      const model = String(modelName || '').trim();
+      if (!provider || !model) return model;
+      const prefix = provider + '/';
+      if (model.startsWith(prefix)) return model.slice(prefix.length);
+      return model;
+    },
+    modelAliasModelOptions(providerName) {
+      const provider = String(providerName || '').trim();
+      const seen = {};
+      const out = [];
+      const add = (value) => {
+        const v = String(value || '').trim();
+        if (!v || seen[v]) return;
+        seen[v] = true;
+        out.push(v);
+      };
+      (this.modelsCatalog || []).forEach((row) => {
+        if (String(row.kind || '') !== 'provider_model') return;
+        const rowProvider = String(row.provider || '').trim();
+        if (provider && rowProvider !== provider) return;
+        add(this.stripProviderPrefixFromAliasModel(rowProvider, row.model));
+      });
+      (Array.isArray(this.modelAliasDraft.targets) ? this.modelAliasDraft.targets : []).forEach((target) => {
+        if (provider && String(target.provider || '').trim() !== provider) return;
+        add(String(target.model || '').trim());
+      });
+      return out.sort((a, b) => a.localeCompare(b));
+    },
+    renderModelAliasesTable() {
+      const rows = (this.modelAliases || []).map((a) => {
+        const name = this.escapeHtml(a.name || '');
+        const statusRaw = String(a.status || 'unknown').trim();
+        let status = '<span class="badge text-bg-secondary">Unknown</span>';
+        if (statusRaw === 'ok') status = '<span class="badge text-bg-success">Ready</span>';
+        else if (statusRaw === 'missing_profile') status = '<span class="badge text-bg-warning">Missing active profile target</span>';
+        else if (statusRaw === 'provider_unavailable') status = '<span class="badge text-bg-danger">Provider unavailable</span>';
+        const active = (a.active_target && typeof a.active_target === 'object') ? a.active_target : null;
+        const activeText = active
+          ? ('<div><code>' + this.escapeHtml(String(active.provider || '').trim()) + '/' + this.escapeHtml(String(active.model || '').trim()) + '</code></div><div class="small text-body-secondary">Profile: ' + this.escapeHtml(String(active.profile || '').trim()) + '</div>')
+          : '<span class="text-body-secondary">No target for the active profile</span>';
+        const count = Array.isArray(a.targets) ? a.targets.length : 0;
+        const actionName = this.escapeHtml(String(a.name || '').trim());
+        return '<tr>' +
+          '<td><code>' + name + '</code></td>' +
+          '<td>' + activeText + '</td>' +
+          '<td class="text-end">' + count + '</td>' +
+          '<td>' + status + '</td>' +
+          '<td class="text-end">' +
+            '<button class="icon-btn" type="button" title="Edit alias" aria-label="Edit alias" data-alias-name="' + actionName + '" onclick="window.__adminEditModelAlias(this.getAttribute(\'data-alias-name\'))">' + this.editActionIconSVG() + '</button>' +
+            '<button class="icon-btn icon-btn-danger" type="button" title="Delete alias" aria-label="Delete alias" data-alias-name="' + actionName + '" onclick="window.__adminRemoveModelAlias(this.getAttribute(\'data-alias-name\'))"><svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5Zm2.5.5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6Zm2 .5a.5.5 0 0 1 1 0v6a.5.5 0 0 1-1 0V6Z"/><path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 1 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1ZM4 4v9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4H4Z"/></svg></button>' +
+          '</td>' +
+        '</tr>';
+      });
+      this.modelAliasesTableHtml =
+        '<table class="table table-sm align-middle mb-0">' +
+          '<thead><tr><th>Alias</th><th>Active target</th><th class="text-end">Profiles</th><th>Status</th><th></th></tr></thead>' +
+          '<tbody>' + (rows.join('') || '<tr><td colspan="5" class="text-body-secondary">No model aliases configured.</td></tr>') + '</tbody>' +
+        '</table>';
     },
     renderPerformancePager(totalRows, page, totalPages, pageSize) {
       return this.renderPager(totalRows, page, totalPages, pageSize, 'Performance');
@@ -2659,7 +2804,10 @@ function adminApp() {
       const search = this.modelsSearch.trim().toLowerCase();
       let rows = (this.modelsCatalog || []).filter((m) => {
         if (!search) return true;
-        return String(m.provider || '').toLowerCase().includes(search) || String(m.model || '').toLowerCase().includes(search);
+        return String(m.provider || '').toLowerCase().includes(search) ||
+          String(m.model || '').toLowerCase().includes(search) ||
+          String(m.resolved_provider || '').toLowerCase().includes(search) ||
+          String(m.resolved_model || '').toLowerCase().includes(search);
       });
       if (this.modelsFreeOnly) {
         rows = rows.filter((m) => Number(m.input_per_1m) === 0 && Number(m.output_per_1m) === 0);
@@ -2679,7 +2827,13 @@ function adminApp() {
         const iconName = this.escapeHtml(String(m.provider_type || m.provider || '').trim());
         const iconCls = this.providerIconNeedsDarkInvert(iconName) ? ' provider-icon-invert-dark' : '';
         const providerLabel = '<span class="d-inline-flex align-items-center gap-2"><img src="' + this.providerIconSrc(iconName) + '" class="' + iconCls.trim() + '" onerror="this.onerror=null;this.src=&quot;data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==&quot;" alt="" width="16" height="16" style="object-fit:contain;" /><span>' + providerDisplay + '</span></span>';
-        const model = this.escapeHtml(m.model || '-');
+        let model = this.escapeHtml(m.model || '-');
+        if (String(m.kind || '') === 'alias') {
+          const resolved = String(m.resolved_provider || '').trim() && String(m.resolved_model || '').trim()
+            ? ('<div class="small text-body-secondary">Alias -> ' + this.escapeHtml(String(m.resolved_provider || '').trim()) + '/' + this.escapeHtml(String(m.resolved_model || '').trim()) + '</div>')
+            : '<div class="small text-body-secondary">Alias target unavailable</div>';
+          model = '<div><span class="badge text-bg-secondary me-2">alias</span><code>' + this.escapeHtml(m.model || '-') + '</code>' + resolved + '</div>';
+        }
         const statusRaw = String(m.status || 'unknown');
         const ageText = this.formatAge(m.checked_at);
         const responseMSValue = Number(m.response_ms || 0);
@@ -2730,7 +2884,10 @@ function adminApp() {
       let rows = (this.modelsCatalog || []).filter((m) => {
         if (Number(m.perf_requests || 0) <= 0) return false;
         if (!search) return true;
-        return String(m.provider || '').toLowerCase().includes(search) || String(m.model || '').toLowerCase().includes(search);
+        return String(m.provider || '').toLowerCase().includes(search) ||
+          String(m.model || '').toLowerCase().includes(search) ||
+          String(m.resolved_provider || '').toLowerCase().includes(search) ||
+          String(m.resolved_model || '').toLowerCase().includes(search);
       });
       const sortBy = this.performanceSortBy;
       const dir = this.performanceSortAsc ? 1 : -1;
@@ -2747,7 +2904,10 @@ function adminApp() {
         const iconName = this.escapeHtml(String(m.provider_type || m.provider || '').trim());
         const iconCls = this.providerIconNeedsDarkInvert(iconName) ? ' provider-icon-invert-dark' : '';
         const providerLabel = '<span class="d-inline-flex align-items-center gap-2"><img src="' + this.providerIconSrc(iconName) + '" class="' + iconCls.trim() + '" onerror="this.onerror=null;this.src=&quot;data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==&quot;" alt="" width="16" height="16" style="object-fit:contain;" /><span>' + providerDisplay + '</span></span>';
-        const model = this.escapeHtml(m.model || '-');
+        let model = this.escapeHtml(m.model || '-');
+        if (String(m.kind || '') === 'alias') {
+          model = '<span class="badge text-bg-secondary me-2">alias</span><code>' + this.escapeHtml(m.model || '-') + '</code>';
+        }
         const promptTokens = Number(m.prompt_tokens || 0);
         const completionTokens = Number(m.completion_tokens || 0);
         const failureRateNum = Number(m.failure_rate || 0);
@@ -3336,6 +3496,19 @@ function adminApp() {
       window.__adminRemoveProvider = (name) => this.removeProvider(name);
       window.__adminEditProvider = (name) => this.openEditProviderModal(name);
       window.__adminSortModels = (col) => this.sortModelsBy(col);
+    },
+    async loadModelAliases() {
+      const r = await this.apiFetch('/admin/api/model-aliases', {headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) return;
+      const body = await r.json().catch(() => ({}));
+      this.modelAliases = Array.isArray(body.data) ? body.data : [];
+      this.activeModelProfile = String(body.active_model_profile || '').trim();
+      this.activeModelProfileInput = this.activeModelProfile;
+      this.availableModelProfiles = Array.isArray(body.available_profiles) ? body.available_profiles.map((x) => String(x || '').trim()).filter(Boolean) : [];
+      this.renderModelAliasesTable();
+      window.__adminEditModelAlias = (name) => this.openEditModelAliasModal(name);
+      window.__adminRemoveModelAlias = (name) => this.removeModelAlias(name);
     },
     async loadAccessTokens() {
       const r = await this.apiFetch('/admin/api/access-tokens', {headers:this.headers()});
@@ -4054,6 +4227,7 @@ function adminApp() {
       }
       const body = await r.json();
       this.modelsCatalog = body.data || [];
+      this.loadModelAliases();
       this.modelsInitialized = true;
       if (firstLoad || forceRefresh) this.modelsPage = 1;
       this.renderModelsCatalog();
@@ -4068,6 +4242,7 @@ function adminApp() {
       try {
         await this.loadModelsCatalog(false, true);
         await this.loadProviders();
+        await this.loadModelAliases();
       } finally {
         this.modelsRefreshInProgress = false;
       }
@@ -4168,6 +4343,87 @@ function adminApp() {
       if (!r.ok) return;
       this.closeAddProviderModal();
       this.loadProviders();
+    },
+    buildModelAliasPayload() {
+      return {
+        name: String(this.modelAliasDraft.name || '').trim(),
+        targets: (Array.isArray(this.modelAliasDraft.targets) ? this.modelAliasDraft.targets : []).map((t) => ({
+          profile: String((t && t.profile) || '').trim(),
+          provider: String((t && t.provider) || '').trim(),
+          model: String((t && t.model) || '').trim()
+        }))
+      };
+    },
+    async saveActiveModelProfile() {
+      const profile = String(this.activeModelProfileInput || this.activeModelProfile || '').trim();
+      const r = await this.apiFetch('/admin/api/model-aliases/settings', {
+        method:'PUT',
+        headers:this.headers(),
+        body:JSON.stringify({active_model_profile: profile})
+      });
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) {
+        const txt = await r.text();
+        this.toastError(txt || 'Failed to save active model profile.');
+        return;
+      }
+      this.toastSuccess('Active model profile updated.');
+      await this.loadModelAliases();
+      await this.loadModelsCatalog(false, false);
+      await this.loadProviders();
+    },
+    async saveModelAlias() {
+      const payload = this.buildModelAliasPayload();
+      if (!payload.name) {
+        this.toastError('Alias name is required.');
+        return;
+      }
+      const activeProfile = String(this.activeModelProfileInput || this.activeModelProfile || '').trim();
+      if (!activeProfile) {
+        const hintedProfile = ((payload.targets || []).map((t) => String((t && t.profile) || '').trim()).find(Boolean)) || '';
+        if (hintedProfile) this.activeModelProfileInput = hintedProfile;
+        this.toastError(hintedProfile
+          ? ('Set the active profile to "' + hintedProfile + '" and save it before creating aliases.')
+          : 'Set the active profile above before creating your first alias.');
+        return;
+      }
+      const isEdit = String(this.editingModelAliasName || '').trim() !== '';
+      const endpoint = isEdit ? ('/admin/api/model-aliases/' + encodeURIComponent(this.editingModelAliasName)) : '/admin/api/model-aliases';
+      const method = isEdit ? 'PUT' : 'POST';
+      const r = await this.apiFetch(endpoint, {method, headers:this.headers(), body:JSON.stringify(payload)});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) {
+        const txt = await r.text();
+        this.toastError(txt || 'Failed to save model alias.');
+        return;
+      }
+      this.toastSuccess('Model alias ' + (isEdit ? 'updated' : 'created') + '.');
+      this.closeModelAliasModal();
+      await this.loadModelAliases();
+      await this.loadModelsCatalog(false, false);
+      await this.loadProviders();
+    },
+    async removeModelAlias(name) {
+      const aliasName = String(name || '').trim();
+      if (!aliasName) return;
+      this.openConfirmModal({
+        title: 'Delete Model Alias',
+        message: 'Delete model alias "' + aliasName + '"?',
+        confirmLabel: 'Delete alias'
+      }, async () => this.removeModelAliasConfirmed(aliasName));
+    },
+    async removeModelAliasConfirmed(aliasName) {
+      const r = await this.apiFetch('/admin/api/model-aliases/' + encodeURIComponent(aliasName), {method:'DELETE', headers:this.headers()});
+      if (r.status === 401) { window.location = '/admin/login?next=/admin'; return; }
+      if (!r.ok) {
+        const txt = await r.text();
+        this.toastError(txt || 'Failed to delete model alias.');
+        return;
+      }
+      this.toastSuccess('Model alias deleted.');
+      await this.loadModelAliases();
+      await this.loadModelsCatalog(false, false);
+      await this.loadProviders();
     },
     async removeProvider(name) {
       const providerName = String(name || '').trim();

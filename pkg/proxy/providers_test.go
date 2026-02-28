@@ -86,6 +86,7 @@ func TestResolveWithAutoPublicFreeProvider(t *testing.T) {
 func TestListProvidersResolvesConfiguredPresetDefaults(t *testing.T) {
 	cfg := config.NewDefaultServerConfig()
 	cfg.AutoEnablePublicFreeModels = false
+	cfg.AutoDetectLocalServers = false
 	cfg.Providers = []config.ProviderConfig{
 		{
 			Name:    "opencode-zen",
@@ -206,6 +207,7 @@ func TestResolveNormalizesModelsPrefix(t *testing.T) {
 func TestListProvidersResolvesPresetDefaultsUsingProviderType(t *testing.T) {
 	cfg := config.NewDefaultServerConfig()
 	cfg.AutoEnablePublicFreeModels = false
+	cfg.AutoDetectLocalServers = false
 	cfg.Providers = []config.ProviderConfig{
 		{
 			Name:         "openai-work",
@@ -250,6 +252,128 @@ func TestResolvePrefersOpenAIProviderForUnqualifiedGPTModel(t *testing.T) {
 	}
 	if model != "gpt-5.3-codex" {
 		t.Fatalf("expected model unchanged, got %q", model)
+	}
+}
+
+func TestResolveAliasBypassesProviderPrefixedModels(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.ActiveModelProfile = "local"
+	cfg.Providers = []config.ProviderConfig{
+		{Name: "ollama", BaseURL: "http://localhost:11434/v1", Enabled: true},
+	}
+	cfg.ModelAliases = []config.ModelAliasConfig{
+		{Name: "chat", Targets: []config.ModelAliasTarget{{Profile: "local", Provider: "ollama", Model: "qwen2.5:14b"}}},
+	}
+	cfg.Normalize()
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	p, model, err := r.Resolve("ollama/chat")
+	if err != nil {
+		t.Fatalf("resolve failed: %v", err)
+	}
+	if p.Name != "ollama" {
+		t.Fatalf("expected ollama provider, got %q", p.Name)
+	}
+	if model != "chat" {
+		t.Fatalf("expected model chat, got %q", model)
+	}
+}
+
+func TestResolveAliasUsesActiveProfileTarget(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.ActiveModelProfile = "runpod"
+	cfg.Providers = []config.ProviderConfig{
+		{Name: "ollama", BaseURL: "http://localhost:11434/v1", Enabled: true},
+		{Name: "runpod-main", BaseURL: "https://runpod.example/v1", Enabled: true},
+	}
+	cfg.ModelAliases = []config.ModelAliasConfig{
+		{
+			Name: "chat",
+			Targets: []config.ModelAliasTarget{
+				{Profile: "local", Provider: "ollama", Model: "qwen2.5:14b"},
+				{Profile: "runpod", Provider: "runpod-main", Model: "Qwen/Qwen2.5-14B-Instruct"},
+			},
+		},
+	}
+	cfg.Normalize()
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	p, model, err := r.Resolve("chat")
+	if err != nil {
+		t.Fatalf("resolve failed: %v", err)
+	}
+	if p.Name != "runpod-main" {
+		t.Fatalf("expected runpod-main provider, got %q", p.Name)
+	}
+	if model != "Qwen/Qwen2.5-14B-Instruct" {
+		t.Fatalf("expected alias model target, got %q", model)
+	}
+}
+
+func TestResolveAliasMissingActiveProfileFails(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.ActiveModelProfile = "runpod"
+	cfg.Providers = []config.ProviderConfig{
+		{Name: "ollama", BaseURL: "http://localhost:11434/v1", Enabled: true},
+	}
+	cfg.ModelAliases = []config.ModelAliasConfig{
+		{Name: "chat", Targets: []config.ModelAliasTarget{{Profile: "local", Provider: "ollama", Model: "qwen2.5:14b"}}},
+	}
+	cfg.Normalize()
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	_, _, err := r.Resolve("chat")
+	if err == nil || !strings.Contains(err.Error(), "has no target for active profile") {
+		t.Fatalf("expected missing profile error, got %v", err)
+	}
+}
+
+func TestResolveAliasUnavailableProviderFails(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.ActiveModelProfile = "runpod"
+	cfg.Providers = []config.ProviderConfig{
+		{Name: "ollama", BaseURL: "http://localhost:11434/v1", Enabled: true},
+	}
+	cfg.ModelAliases = []config.ModelAliasConfig{
+		{Name: "chat", Targets: []config.ModelAliasTarget{{Profile: "runpod", Provider: "runpod-main", Model: "Qwen/Qwen2.5-14B-Instruct"}}},
+	}
+	cfg.Normalize()
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	_, _, err := r.Resolve("chat")
+	if err == nil || !strings.Contains(err.Error(), "target provider") {
+		t.Fatalf("expected provider unavailable error, got %v", err)
+	}
+}
+
+func TestResolveNonAliasBareModelKeepsFallbackBehavior(t *testing.T) {
+	cfg := config.NewDefaultServerConfig()
+	cfg.DefaultProvider = "ollama"
+	cfg.Providers = []config.ProviderConfig{
+		{Name: "ollama", BaseURL: "http://localhost:11434/v1", Enabled: true},
+		{Name: "runpod-main", BaseURL: "https://runpod.example/v1", Enabled: true},
+	}
+	cfg.ActiveModelProfile = "local"
+	cfg.ModelAliases = []config.ModelAliasConfig{
+		{Name: "chat", Targets: []config.ModelAliasTarget{{Profile: "local", Provider: "ollama", Model: "qwen2.5:14b"}}},
+	}
+	cfg.Normalize()
+	store := config.NewServerConfigStore("/tmp/non-persistent.toml", cfg)
+	r := NewProviderResolver(store)
+
+	p, model, err := r.Resolve("plain-model")
+	if err != nil {
+		t.Fatalf("resolve failed: %v", err)
+	}
+	if p.Name != "ollama" {
+		t.Fatalf("expected default provider ollama, got %q", p.Name)
+	}
+	if model != "plain-model" {
+		t.Fatalf("expected plain-model, got %q", model)
 	}
 }
 

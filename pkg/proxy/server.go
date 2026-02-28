@@ -619,18 +619,20 @@ func (s *Server) authAnyTokenMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	models, err := s.resolver.DiscoverModels(r.Context())
+	providerModels, err := s.resolver.DiscoverProviderModels(r.Context())
 	if err != nil {
 		if cached := s.modelsCached.Load(); cached != nil {
-			models = *cached
+			providerModels = *cached
 		} else {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 	} else {
-		s.modelsCached.Store(&models)
-		s.saveModelsCacheToDisk(models)
+		s.modelsCached.Store(&providerModels)
+		s.saveModelsCacheToDisk(providerModels)
 	}
+	models := append([]ModelCard(nil), providerModels...)
+	models = append(models, s.resolver.DiscoverAliasModels()...)
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
 }
 

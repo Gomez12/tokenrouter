@@ -55,6 +55,23 @@ type ProviderResolver struct {
 	store *config.ServerConfigStore
 }
 
+const (
+	modelAliasStatusOK                  = "ok"
+	modelAliasStatusMissingProfile      = "missing_profile"
+	modelAliasStatusProviderUnavailable = "provider_unavailable"
+)
+
+type ModelAliasView struct {
+	Alias         config.ModelAliasConfig
+	ActiveProfile string
+	Profiles      []string
+	Status        string
+	Target        config.ModelAliasTarget
+	HasTarget     bool
+	Provider      config.ProviderConfig
+	HasProvider   bool
+}
+
 const autoProviderProbeTTL = 20 * time.Second
 
 var autoProviderProbeFn = probeAutoProviderOnline
@@ -664,6 +681,9 @@ func (r *ProviderResolver) Resolve(model string) (config.ProviderConfig, string,
 			}
 		}
 	}
+	if provider, aliasModel, found, err := r.resolveAliasModel(normalizedModel, providers); found || err != nil {
+		return provider, aliasModel, err
+	}
 	if preferredProvider := preferredProviderForUnqualifiedModel(normalizedModel, providers); preferredProvider != nil {
 		return *preferredProvider, normalizedModel, nil
 	}
@@ -671,7 +691,7 @@ func (r *ProviderResolver) Resolve(model string) (config.ProviderConfig, string,
 	if cfg.DefaultProvider != "" {
 		for _, p := range providers {
 			if p.Name == cfg.DefaultProvider {
-				return p, model, nil
+				return p, normalizedModel, nil
 			}
 		}
 	}
@@ -700,6 +720,16 @@ func preferredProviderForUnqualifiedModel(model string, providers []config.Provi
 }
 
 func (r *ProviderResolver) DiscoverModels(ctx context.Context) ([]ModelCard, error) {
+	providerModels, err := r.DiscoverProviderModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	models := append([]ModelCard(nil), providerModels...)
+	models = append(models, r.DiscoverAliasModels()...)
+	return models, nil
+}
+
+func (r *ProviderResolver) DiscoverProviderModels(ctx context.Context) ([]ModelCard, error) {
 	providers := r.ListProviders()
 	models := make([]ModelCard, 0)
 	for _, p := range providers {
@@ -710,4 +740,120 @@ func (r *ProviderResolver) DiscoverModels(ctx context.Context) ([]ModelCard, err
 		models = append(models, cards...)
 	}
 	return models, nil
+}
+
+func (r *ProviderResolver) DiscoverAliasModels() []ModelCard {
+	views := r.ListModelAliases()
+	out := make([]ModelCard, 0, len(views))
+	for _, view := range views {
+		if view.Status != modelAliasStatusOK || !view.HasTarget || !view.HasProvider {
+			continue
+		}
+		out = append(out, ModelCard{
+			ID:               view.Alias.Name,
+			Object:           "model",
+			Provider:         view.Provider.Name,
+			Alias:            true,
+			Profile:          view.ActiveProfile,
+			ResolvedProvider: view.Provider.Name,
+			ResolvedModel:    view.Target.Model,
+		})
+	}
+	return out
+}
+
+func (r *ProviderResolver) ListModelAliases() []ModelAliasView {
+	cfg := r.store.Snapshot()
+	providers := r.ListProviders()
+	out := make([]ModelAliasView, 0, len(cfg.ModelAliases))
+	for _, alias := range cfg.ModelAliases {
+		view := ModelAliasView{
+			Alias:         alias,
+			ActiveProfile: cfg.ActiveModelProfile,
+			Profiles:      aliasProfiles(alias),
+			Status:        modelAliasStatusMissingProfile,
+		}
+		for _, target := range alias.Targets {
+			if target.Profile != cfg.ActiveModelProfile {
+				continue
+			}
+			view.Target = target
+			view.HasTarget = true
+			view.Status = modelAliasStatusProviderUnavailable
+			for _, p := range providers {
+				if p.Name == target.Provider {
+					view.Provider = p
+					view.HasProvider = true
+					view.Status = modelAliasStatusOK
+					break
+				}
+			}
+			break
+		}
+		out = append(out, view)
+	}
+	return out
+}
+
+func (r *ProviderResolver) AvailableAliasProfiles() []string {
+	cfg := r.store.Snapshot()
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	for _, alias := range cfg.ModelAliases {
+		for _, target := range alias.Targets {
+			profile := strings.TrimSpace(target.Profile)
+			if profile == "" {
+				continue
+			}
+			if _, ok := seen[profile]; ok {
+				continue
+			}
+			seen[profile] = struct{}{}
+			out = append(out, profile)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (r *ProviderResolver) resolveAliasModel(model string, providers []config.ProviderConfig) (config.ProviderConfig, string, bool, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return config.ProviderConfig{}, "", false, nil
+	}
+	for _, view := range r.ListModelAliases() {
+		if view.Alias.Name != model {
+			continue
+		}
+		switch view.Status {
+		case modelAliasStatusMissingProfile:
+			return config.ProviderConfig{}, "", true, fmt.Errorf("model alias %q has no target for active profile %q", model, view.ActiveProfile)
+		case modelAliasStatusProviderUnavailable:
+			return config.ProviderConfig{}, "", true, fmt.Errorf("model alias %q target provider %q is not available for active profile %q", model, view.Target.Provider, view.ActiveProfile)
+		default:
+			return view.Provider, normalizeModelID(view.Target.Model), true, nil
+		}
+	}
+	return config.ProviderConfig{}, "", false, nil
+}
+
+func aliasProfiles(alias config.ModelAliasConfig) []string {
+	if len(alias.Targets) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(alias.Targets))
+	for _, target := range alias.Targets {
+		profile := strings.TrimSpace(target.Profile)
+		if profile == "" {
+			continue
+		}
+		if _, ok := seen[profile]; ok {
+			continue
+		}
+		seen[profile] = struct{}{}
+		out = append(out, profile)
+	}
+	sort.Strings(out)
+	return out
 }

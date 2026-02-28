@@ -8,6 +8,7 @@ import (
 )
 
 func TestApplyUpstreamProviderHeaders_OpenAICodex(t *testing.T) {
+	t.Setenv("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "")
 	req := httptest.NewRequest("POST", "http://example.local/v1/responses", nil)
 	provider := config.ProviderConfig{
 		BaseURL:   "https://chatgpt.com/backend-api",

@@ -188,6 +188,11 @@
       if (this.activeTab === 'models' || this.activeTab === 'performance') this.loadModelsCatalog(false);
       return;
     }
+    if (s === 'model_aliases') {
+      this.loadModelAliases();
+      if (this.activeTab === 'models' || this.activeTab === 'performance') this.loadModelsCatalog(false);
+      return;
+    }
     if (s === 'benchmark') {
       if (this.activeTab === 'benchmark' || this.benchmarkRunning) this.loadBenchmarkStatus();
       return;

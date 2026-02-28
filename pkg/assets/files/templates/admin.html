@@ -524,6 +524,73 @@
     </div>
   </div>
 
+  <div x-show="showModelAliasModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeModelAliasModal()">
+    <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeModelAliasModal()"></div>
+    <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">
+      <div class="card shadow" style="width:100%;max-width:860px;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="h5 mb-0" x-text="editingModelAliasName ? 'Edit Model Alias' : 'Add Model Alias'"></h3>
+          <button class="icon-btn" @click="closeModelAliasModal()" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="card-body">
+          <div class="row g-2 mb-3">
+            <div class="col-md-5">
+              <label class="form-label">Alias name</label>
+              <input class="form-control" x-model="modelAliasDraft.name" placeholder="chat" />
+            </div>
+          </div>
+          <div class="small text-body-secondary mb-3">
+            The current active profile is <code x-text="activeModelProfileInput || activeModelProfile || '(not set)'"></code>.
+            This must be saved before aliases can be created.
+          </div>
+          <template x-for="(target, idx) in modelAliasDraft.targets" :key="idx">
+            <div class="border rounded p-3 mb-3">
+              <div class="row g-2">
+                <div class="col-md-3">
+                  <label class="form-label">Profile</label>
+                  <select class="form-select" x-model="target.profile">
+                    <option value="">Select profile</option>
+                    <template x-for="profile in modelAliasProfileOptions()" :key="profile">
+                      <option :value="profile" x-text="profile"></option>
+                    </template>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">Provider</label>
+                  <select class="form-select" x-model="target.provider">
+                    <option value="">Select provider</option>
+                    <template x-for="provider in modelAliasProviderOptions()" :key="provider">
+                      <option :value="provider" x-text="provider"></option>
+                    </template>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">Model</label>
+                  <input class="form-control" :list="'model-alias-model-list-' + idx" x-model="target.model" placeholder="qwen2.5:14b" />
+                  <datalist :id="'model-alias-model-list-' + idx">
+                    <template x-for="model in modelAliasModelOptions(target.provider)" :key="model">
+                      <option :value="model"></option>
+                    </template>
+                  </datalist>
+                </div>
+                <div class="col-md-1 d-flex align-items-end">
+                  <button class="btn btn-outline-danger w-100" type="button" @click="removeModelAliasTarget(idx)">-</button>
+                </div>
+              </div>
+            </div>
+          </template>
+          <div class="d-flex justify-content-between align-items-center">
+            <button class="btn btn-outline-secondary" type="button" @click="addModelAliasTarget()">Add Target</button>
+            <div class="d-flex gap-2">
+              <button class="btn btn-outline-secondary" @click="closeModelAliasModal()">Cancel</button>
+              <button class="btn btn-primary" @click="saveModelAlias()">Save</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div x-show="showAddProviderModal" style="display:none;" class="position-fixed top-0 start-0 w-100 h-100" @keydown.escape.window="closeAddProviderModal()">
     <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark" style="opacity:0.5;" @click="closeAddProviderModal()"></div>
     <div class="position-relative d-flex align-items-center justify-content-center h-100 p-3">

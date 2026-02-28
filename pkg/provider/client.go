@@ -15,9 +15,13 @@ import (
 )
 
 type ModelCard struct {
-	ID       string `json:"id"`
-	Object   string `json:"object,omitempty"`
-	Provider string `json:"provider,omitempty"`
+	ID               string `json:"id"`
+	Object           string `json:"object,omitempty"`
+	Provider         string `json:"provider,omitempty"`
+	Alias            bool   `json:"alias,omitempty"`
+	Profile          string `json:"profile,omitempty"`
+	ResolvedProvider string `json:"resolved_provider,omitempty"`
+	ResolvedModel    string `json:"resolved_model,omitempty"`
 }
 
 type modelListResponse struct {
